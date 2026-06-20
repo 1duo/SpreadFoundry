@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 const FETCH_ATTEMPTS: usize = 3;
@@ -610,9 +610,8 @@ async fn load_open_interest_map(
 }
 
 async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Result<Value> {
-    if path.exists() && !force_refresh {
-        let body = fs::read_to_string(path)?;
-        return serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()));
+    if !force_refresh && let Some(json) = read_cached_json(path)? {
+        return Ok(json);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -624,7 +623,7 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
     for attempt in 1..=FETCH_ATTEMPTS {
         match fetch_json_once(&client, url).await {
             Ok(json) => {
-                fs::write(path, serde_json::to_string_pretty(&json)?)?;
+                write_cached_json(path, &json)?;
                 return Ok(json);
             }
             Err(error) => {
@@ -638,6 +637,54 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
     let error = last_error.context("ThetaData request failed without an error payload")?;
     Err(error)
         .with_context(|| format!("ThetaData request failed after {FETCH_ATTEMPTS} attempts: {url}"))
+}
+
+fn read_cached_json(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    match serde_json::from_str(&body) {
+        Ok(json) => Ok(Some(json)),
+        Err(error) => {
+            eprintln!(
+                "ignoring corrupt ThetaData cache {}: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn write_cached_json(path: &Path, json: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = cache_temp_path(path);
+    let body = serde_json::to_string_pretty(json)?;
+    let write_result = fs::write(&temp_path, body)
+        .with_context(|| format!("writing temporary cache {}", temp_path.display()))
+        .and_then(|_| {
+            fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "renaming temporary cache {} to {}",
+                    temp_path.display(),
+                    path.display()
+                )
+            })
+        });
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn cache_temp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("tmp-{}-{nanos}", std::process::id()))
 }
 
 async fn fetch_json_once(client: &reqwest::Client, url: &str) -> Result<Value> {
@@ -1463,6 +1510,39 @@ mod tests {
 
         row.implied_vol = 0.95;
         assert!(!iv_allowed(&row, &profile));
+    }
+
+    #[test]
+    fn corrupt_cache_file_is_treated_as_cache_miss() {
+        let path = unique_test_path("corrupt-cache.json");
+        fs::write(&path, "").unwrap();
+
+        assert!(read_cached_json(&path).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cached_json_write_leaves_readable_final_file() {
+        let path = unique_test_path("atomic-cache.json");
+        let json = serde_json::json!({"response": [{"ok": true}]});
+
+        write_cached_json(&path, &json).unwrap();
+
+        assert_eq!(read_cached_json(&path).unwrap(), Some(json));
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "spreadfoundry-research-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
     }
 
     fn option_day(
