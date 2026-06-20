@@ -515,11 +515,12 @@ async fn load_open_interest_map(
         match fetch_cached_json(&oi_url, &oi_path, force_refresh).await {
             Ok(oi) => out.extend(parse_oi_map(&oi)?),
             Err(error) if chunk_start < chunk_end => {
-                let mid = chunk_start + Duration::days((chunk_end - chunk_start).num_days() / 2);
-                chunks.push_front((mid + Duration::days(1), chunk_end));
-                chunks.push_front((chunk_start, mid));
+                for offset in (0..=(chunk_end - chunk_start).num_days()).rev() {
+                    let day = chunk_start + Duration::days(offset);
+                    chunks.push_front((day, day));
+                }
                 eprintln!(
-                    "splitting open-interest chunk {}..{} after error: {error:#}",
+                    "splitting open-interest chunk {}..{} into daily requests after error: {error:#}",
                     chunk_start, chunk_end
                 );
             }
