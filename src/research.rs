@@ -11,6 +11,8 @@ use std::time::Duration as StdDuration;
 use tokio::time::sleep;
 
 const FETCH_ATTEMPTS: usize = 3;
+const MIN_RANKING_TRADES: usize = 10;
+const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -107,6 +109,8 @@ pub struct ResearchMetrics {
     pub best_trade_pnl: f64,
     pub worst_trade_pnl: f64,
     pub score: f64,
+    pub ranking_eligible: bool,
+    pub required_trades: usize,
     pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
 }
@@ -978,6 +982,7 @@ fn quote_width_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
 }
 
 fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> ResearchMetrics {
+    let required_trades = required_trades_for_ranking(from, to);
     if trades.is_empty() {
         return ResearchMetrics {
             trades: 0,
@@ -996,6 +1001,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             best_trade_pnl: 0.0,
             worst_trade_pnl: 0.0,
             score: -1_000_000.0,
+            ranking_eligible: false,
+            required_trades,
             exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
         };
@@ -1029,7 +1036,12 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         .collect::<Vec<_>>();
     let max_drawdown = max_drawdown(&sorted);
     let years = ((to - from).num_days().max(1) as f64) / 365.25;
-    let score = total_pnl / total_max_loss.max(1.0) - 2.0 * max_drawdown;
+    let ranking_eligible = sorted.len() >= required_trades;
+    let score = if ranking_eligible {
+        total_pnl / total_max_loss.max(1.0) - 2.0 * max_drawdown
+    } else {
+        -1_000_000.0 + sorted.len() as f64 / required_trades as f64
+    };
     ResearchMetrics {
         trades: sorted.len(),
         total_pnl,
@@ -1057,9 +1069,16 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             .map(|trade| trade.pnl)
             .fold(f64::MAX, f64::min),
         score,
+        ranking_eligible,
+        required_trades,
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
     }
+}
+
+fn required_trades_for_ranking(from: NaiveDate, to: NaiveDate) -> usize {
+    let years = ((to - from).num_days().max(1) as f64) / 365.25;
+    MIN_RANKING_TRADES.max((years * MIN_RANKING_TRADES_PER_YEAR).ceil() as usize)
 }
 
 fn trade_chronological_order(a: &ResearchTrade, b: &ResearchTrade) -> Ordering {
@@ -1157,17 +1176,27 @@ fn research_markdown(report: &ResearchReport) -> String {
         report.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- EOD rows loaded: `{}`\n\n",
-        report.from, report.to, report.expirations_discovered, report.expirations_loaded, report.rows_loaded
+        "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
+        report.from,
+        report.to,
+        report.expirations_discovered,
+        report.expirations_loaded,
+        report.rows_loaded,
+        report
+            .profiles
+            .first()
+            .map(|result| result.metrics.required_trades)
+            .unwrap_or(MIN_RANKING_TRADES)
     ));
-    out.push_str("| Rank | Profile | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score |\n");
-    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Rank | Profile | Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for (idx, result) in report.profiles.iter().enumerate() {
         let m = &result.metrics;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} |\n",
+            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} |\n",
             idx + 1,
             result.profile.name,
+            if m.ranking_eligible { "yes" } else { "no" },
             result.candidates,
             m.trades,
             m.total_pnl,
@@ -1333,6 +1362,24 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].entry_date, entry_date);
+    }
+
+    #[test]
+    fn required_ranking_trades_scale_with_window_length() {
+        assert_eq!(
+            required_trades_for_ranking(
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 18).unwrap()
+            ),
+            10
+        );
+        assert_eq!(
+            required_trades_for_ranking(
+                NaiveDate::from_ymd_opt(2016, 12, 6).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 18).unwrap()
+            ),
+            20
+        );
     }
 
     fn option_day(
