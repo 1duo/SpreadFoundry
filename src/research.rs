@@ -39,6 +39,9 @@ pub struct ResearchProfile {
     pub min_long_oi: u32,
     pub take_profit_pct: f64,
     pub stop_loss_multiple: f64,
+    pub trend_lookback_days: Option<i64>,
+    pub min_underlying_return: Option<f64>,
+    pub min_short_otm_pct: Option<f64>,
 }
 
 impl ResearchProfile {
@@ -59,6 +62,9 @@ impl ResearchProfile {
             min_long_oi: 250,
             take_profit_pct: 0.50,
             stop_loss_multiple: 2.0,
+            trend_lookback_days: None,
+            min_underlying_return: None,
+            min_short_otm_pct: None,
         }
     }
 }
@@ -135,6 +141,8 @@ pub struct ResearchTrade {
     pub short_oi: u32,
     pub long_oi: u32,
     pub underlying_price: f64,
+    pub short_otm_pct: f64,
+    pub underlying_lookback_return: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +166,8 @@ struct Candidate {
     credit: f64,
     max_loss_per_share: f64,
     return_on_risk: f64,
+    short_otm_pct: f64,
+    underlying_lookback_return: Option<f64>,
 }
 
 pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchReport> {
@@ -183,6 +193,11 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         .map(|profile| profile.force_close_dte)
         .min()
         .unwrap_or(21);
+    let max_trend_lookback_days = profiles
+        .iter()
+        .filter_map(|profile| profile.trend_lookback_days)
+        .max()
+        .unwrap_or(0);
 
     let expirations =
         discover_expirations(&request.symbol, &raw_dir, request.force_refresh).await?;
@@ -190,7 +205,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         .iter()
         .copied()
         .filter(|expiration| {
-            let entry_start = *expiration - Duration::days(max_entry_dte);
+            let entry_start = *expiration - Duration::days(max_entry_dte + max_trend_lookback_days);
             let entry_end = *expiration - Duration::days(min_entry_dte);
             entry_start <= request.to && entry_end >= request.from
         })
@@ -205,7 +220,9 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     let fetch_concurrency = request.fetch_concurrency.max(1);
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
         let fetches = chunk.iter().copied().filter_map(|expiration| {
-            let start = request.from.max(expiration - Duration::days(max_entry_dte));
+            let start = request
+                .from
+                .max(expiration - Duration::days(max_entry_dte + max_trend_lookback_days));
             let exit_grace_end =
                 expiration - Duration::days(min_force_close_dte) + Duration::days(7);
             let end = request.to.min(exit_grace_end);
@@ -345,6 +362,42 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profile.stop_loss_multiple = stop;
         profiles.push(profile);
     }
+    let mut trend_10d = baseline.clone();
+    trend_10d.name = "trend10d_delta20_30_credit25".to_owned();
+    trend_10d.min_credit_width = 0.25;
+    trend_10d.trend_lookback_days = Some(10);
+    trend_10d.min_underlying_return = Some(0.0);
+    profiles.push(trend_10d);
+
+    let mut trend_20d = baseline.clone();
+    trend_20d.name = "trend20d_delta20_30_credit25".to_owned();
+    trend_20d.min_credit_width = 0.25;
+    trend_20d.trend_lookback_days = Some(20);
+    trend_20d.min_underlying_return = Some(0.0);
+    profiles.push(trend_20d);
+
+    let mut otm_8pct = baseline.clone();
+    otm_8pct.name = "otm8pct_delta20_30_credit25".to_owned();
+    otm_8pct.min_credit_width = 0.25;
+    otm_8pct.min_short_otm_pct = Some(0.08);
+    profiles.push(otm_8pct);
+
+    let mut trend_otm = baseline.clone();
+    trend_otm.name = "trend10d_otm8pct_delta20_30_credit25".to_owned();
+    trend_otm.min_credit_width = 0.25;
+    trend_otm.trend_lookback_days = Some(10);
+    trend_otm.min_underlying_return = Some(0.0);
+    trend_otm.min_short_otm_pct = Some(0.08);
+    profiles.push(trend_otm);
+
+    let mut lower_delta_trend = baseline.clone();
+    lower_delta_trend.name = "trend10d_delta15_25_credit20".to_owned();
+    lower_delta_trend.min_short_delta_abs = 0.15;
+    lower_delta_trend.max_short_delta_abs = 0.25;
+    lower_delta_trend.trend_lookback_days = Some(10);
+    lower_delta_trend.min_underlying_return = Some(0.0);
+    profiles.push(lower_delta_trend);
+
     profiles
 }
 
@@ -602,6 +655,7 @@ fn generate_candidates(
     let mut candidates = Vec::new();
     for (expiration, rows) in rows_by_expiration {
         let mut by_date: BTreeMap<NaiveDate, Vec<&OptionDay>> = BTreeMap::new();
+        let underlying_by_date = underlying_by_date(rows);
         for row in rows {
             let dte = (*expiration - row.date).num_days();
             if dte < profile.min_dte || dte > profile.max_dte {
@@ -619,6 +673,11 @@ fn generate_candidates(
                 {
                     continue;
                 }
+                let Some((short_otm_pct, underlying_lookback_return)) =
+                    entry_regime(short, profile, &underlying_by_date)
+                else {
+                    continue;
+                };
                 for long in &day_rows {
                     if long.strike >= short.strike
                         || long.open_interest < profile.min_long_oi
@@ -651,6 +710,8 @@ fn generate_candidates(
                         credit,
                         max_loss_per_share: max_loss,
                         return_on_risk: credit / max_loss,
+                        short_otm_pct,
+                        underlying_lookback_return,
                     });
                 }
             }
@@ -658,6 +719,60 @@ fn generate_candidates(
     }
     candidates.sort_by(candidate_chronological_order);
     candidates
+}
+
+fn underlying_by_date(rows: &[OptionDay]) -> BTreeMap<NaiveDate, f64> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        if row.underlying_price > 0.0 {
+            out.entry(row.date).or_insert(row.underlying_price);
+        }
+    }
+    out
+}
+
+fn entry_regime(
+    short: &OptionDay,
+    profile: &ResearchProfile,
+    underlying_by_date: &BTreeMap<NaiveDate, f64>,
+) -> Option<(f64, Option<f64>)> {
+    if short.underlying_price <= 0.0 {
+        return None;
+    }
+    let short_otm_pct = (short.underlying_price - short.strike) / short.underlying_price;
+    if let Some(min_short_otm_pct) = profile.min_short_otm_pct
+        && short_otm_pct < min_short_otm_pct
+    {
+        return None;
+    }
+
+    let underlying_lookback_return = if let Some(days) = profile.trend_lookback_days {
+        let lookback_return = underlying_return(short.date, days, underlying_by_date)?;
+        if let Some(min_return) = profile.min_underlying_return
+            && lookback_return < min_return
+        {
+            return None;
+        }
+        Some(lookback_return)
+    } else {
+        None
+    };
+
+    Some((short_otm_pct, underlying_lookback_return))
+}
+
+fn underlying_return(
+    date: NaiveDate,
+    lookback_days: i64,
+    underlying_by_date: &BTreeMap<NaiveDate, f64>,
+) -> Option<f64> {
+    let current = *underlying_by_date.get(&date)?;
+    let target = date - Duration::days(lookback_days);
+    let (_, prior) = underlying_by_date.range(..=target).next_back()?;
+    if *prior <= 0.0 {
+        return None;
+    }
+    Some(current / prior - 1.0)
 }
 
 fn simulate_non_overlapping(
@@ -790,6 +905,8 @@ fn build_trade(
         short_oi: candidate.short.open_interest,
         long_oi: candidate.long.open_interest,
         underlying_price: candidate.short.underlying_price,
+        short_otm_pct: candidate.short_otm_pct,
+        underlying_lookback_return: candidate.underlying_lookback_return,
     }
 }
 
@@ -1031,18 +1148,18 @@ fn research_markdown(report: &ResearchReport) -> String {
         ));
 
         out.push_str("\n## Best Profile Trades\n\n");
-        out.push_str(
-            "| Entry | Exit | Exp | Short | Long | Credit | Exit Debit | PnL | ROR | Reason |\n",
-        );
-        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Trend Ret | Credit | Exit Debit | PnL | ROR | Reason |\n");
+        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for trade in best.trades.iter().take(50) {
             out.push_str(&format!(
-                "| {} | {} | {} | {:.0}P | {:.0}P | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
+                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
                 trade.entry_date,
                 trade.exit_date,
                 trade.expiration,
                 trade.short_put,
                 trade.long_put,
+                trade.short_otm_pct * 100.0,
+                format_optional_pct(trade.underlying_lookback_return),
                 trade.entry_credit,
                 trade.exit_debit,
                 trade.pnl,
@@ -1052,6 +1169,12 @@ fn research_markdown(report: &ResearchReport) -> String {
         }
     }
     out
+}
+
+fn format_optional_pct(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 fn format_exit_reasons(reasons: &BTreeMap<String, usize>) -> String {
@@ -1082,5 +1205,52 @@ mod tests {
         assert_eq!(evenly_spaced(vec![1, 2, 3], 0), Vec::<i32>::new());
         assert_eq!(evenly_spaced(vec![1, 2, 3], 1), vec![1]);
         assert_eq!(evenly_spaced(vec![1, 2, 3], 4), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn underlying_return_uses_only_dates_at_or_before_lookback_target() {
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(), 120.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 130.0);
+
+        let ret = underlying_return(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            5,
+            &underlying,
+        )
+        .unwrap();
+
+        assert!((ret - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn entry_regime_rejects_weak_trend_and_too_close_short_strikes() {
+        let mut profile = ResearchProfile::baseline();
+        profile.trend_lookback_days = Some(10);
+        profile.min_underlying_return = Some(0.0);
+        profile.min_short_otm_pct = Some(0.08);
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 105.0);
+        let passing_short = OptionDay {
+            date: NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            strike: 95.0,
+            bid: 1.0,
+            ask: 1.1,
+            delta: -0.25,
+            underlying_price: 105.0,
+            open_interest: 1_000,
+        };
+        let close_short = OptionDay {
+            strike: 100.0,
+            ..passing_short.clone()
+        };
+
+        assert!(entry_regime(&passing_short, &profile, &underlying).is_some());
+        assert!(entry_regime(&close_short, &profile, &underlying).is_none());
+
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 110.0);
+        assert!(entry_regime(&passing_short, &profile, &underlying).is_none());
     }
 }
