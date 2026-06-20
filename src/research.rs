@@ -398,6 +398,43 @@ fn research_profiles() -> Vec<ResearchProfile> {
     lower_delta_trend.min_underlying_return = Some(0.0);
     profiles.push(lower_delta_trend);
 
+    let mut higher_credit_stop150 = baseline.clone();
+    higher_credit_stop150.name = "higher_credit_stop150_delta20_30_credit25".to_owned();
+    higher_credit_stop150.min_credit_width = 0.25;
+    higher_credit_stop150.stop_loss_multiple = 1.5;
+    profiles.push(higher_credit_stop150);
+
+    let mut higher_credit_stop125 = baseline.clone();
+    higher_credit_stop125.name = "higher_credit_stop125_delta20_30_credit25".to_owned();
+    higher_credit_stop125.min_credit_width = 0.25;
+    higher_credit_stop125.stop_loss_multiple = 1.25;
+    profiles.push(higher_credit_stop125);
+
+    let mut higher_credit_take35 = baseline.clone();
+    higher_credit_take35.name = "higher_credit_take35_delta20_30_credit25".to_owned();
+    higher_credit_take35.min_credit_width = 0.25;
+    higher_credit_take35.take_profit_pct = 0.35;
+    profiles.push(higher_credit_take35);
+
+    let mut higher_credit_exit28 = baseline.clone();
+    higher_credit_exit28.name = "higher_credit_exit28dte_delta20_30_credit25".to_owned();
+    higher_credit_exit28.min_credit_width = 0.25;
+    higher_credit_exit28.force_close_dte = 28;
+    profiles.push(higher_credit_exit28);
+
+    let mut higher_credit_delta20_25 = baseline.clone();
+    higher_credit_delta20_25.name = "higher_credit_delta20_25_credit25".to_owned();
+    higher_credit_delta20_25.max_short_delta_abs = 0.25;
+    higher_credit_delta20_25.min_credit_width = 0.25;
+    profiles.push(higher_credit_delta20_25);
+
+    let mut higher_credit_delta25_30 = baseline.clone();
+    higher_credit_delta25_30.name = "higher_credit_delta25_30_credit25".to_owned();
+    higher_credit_delta25_30.min_short_delta_abs = 0.25;
+    higher_credit_delta25_30.max_short_delta_abs = 0.30;
+    higher_credit_delta25_30.min_credit_width = 0.25;
+    profiles.push(higher_credit_delta25_30);
+
     profiles
 }
 
