@@ -47,6 +47,7 @@ pub struct ResearchProfile {
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
     pub prefer_farther_otm: bool,
+    pub stop_loss_cooldown_days: i64,
 }
 
 impl ResearchProfile {
@@ -73,6 +74,7 @@ impl ResearchProfile {
             min_short_iv: None,
             max_short_iv: None,
             prefer_farther_otm: false,
+            stop_loss_cooldown_days: 1,
         }
     }
 }
@@ -496,6 +498,23 @@ fn research_profiles() -> Vec<ResearchProfile> {
     lower_delta_otm_selector.max_short_delta_abs = 0.25;
     lower_delta_otm_selector.prefer_farther_otm = true;
     profiles.push(lower_delta_otm_selector);
+
+    let mut cooldown_10 = baseline.clone();
+    cooldown_10.name = "cooldown10_delta20_30_credit20".to_owned();
+    cooldown_10.stop_loss_cooldown_days = 10;
+    profiles.push(cooldown_10);
+
+    let mut otm_cooldown_10 = baseline.clone();
+    otm_cooldown_10.name = "select_farther_otm_cooldown10_delta20_30_credit20".to_owned();
+    otm_cooldown_10.prefer_farther_otm = true;
+    otm_cooldown_10.stop_loss_cooldown_days = 10;
+    profiles.push(otm_cooldown_10);
+
+    let mut otm_cooldown_20 = baseline.clone();
+    otm_cooldown_20.name = "select_farther_otm_cooldown20_delta20_30_credit20".to_owned();
+    otm_cooldown_20.prefer_farther_otm = true;
+    otm_cooldown_20.stop_loss_cooldown_days = 20;
+    profiles.push(otm_cooldown_20);
 
     profiles
 }
@@ -1015,13 +1034,22 @@ fn simulate_non_overlapping(
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
         for candidate in day_candidates {
             if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
-                next_entry_date = trade.exit_date + Duration::days(1);
+                next_entry_date = next_entry_date_after_trade(&trade, profile);
                 trades.push(trade);
                 break;
             }
         }
     }
     trades
+}
+
+fn next_entry_date_after_trade(trade: &ResearchTrade, profile: &ResearchProfile) -> NaiveDate {
+    let gap_days = if trade.exit_reason == "stop_loss" {
+        profile.stop_loss_cooldown_days.max(1)
+    } else {
+        1
+    };
+    trade.exit_date + Duration::days(gap_days)
 }
 
 fn build_lookup(
@@ -1681,6 +1709,51 @@ mod tests {
             candidate_quality_order(&far_lower_credit, &close_high_credit, &farther_otm),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn stop_loss_cooldown_delays_only_after_stop_losses() {
+        let exit_date = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let mut profile = ResearchProfile::baseline();
+        profile.stop_loss_cooldown_days = 10;
+
+        assert_eq!(
+            next_entry_date_after_trade(&trade_with_exit(exit_date, "stop_loss"), &profile),
+            NaiveDate::from_ymd_opt(2026, 1, 30).unwrap()
+        );
+        assert_eq!(
+            next_entry_date_after_trade(&trade_with_exit(exit_date, "take_profit"), &profile),
+            NaiveDate::from_ymd_opt(2026, 1, 21).unwrap()
+        );
+    }
+
+    fn trade_with_exit(exit_date: NaiveDate, exit_reason: &str) -> ResearchTrade {
+        ResearchTrade {
+            entry_date: exit_date - Duration::days(5),
+            exit_date,
+            expiration: exit_date + Duration::days(30),
+            dte_entry: 35,
+            days_held: 5,
+            short_put: 95.0,
+            long_put: 90.0,
+            width: 5.0,
+            entry_credit: 1.0,
+            exit_debit: 0.4,
+            max_profit: 100.0,
+            max_loss: 400.0,
+            pnl: 60.0,
+            return_on_risk: 0.15,
+            exit_reason: exit_reason.to_owned(),
+            short_delta: -0.25,
+            long_delta: -0.15,
+            short_oi: 1_000,
+            long_oi: 1_000,
+            underlying_price: 100.0,
+            short_otm_pct: 0.05,
+            underlying_lookback_return: None,
+            short_iv: 0.5,
+            long_iv: 0.5,
+        }
     }
 
     fn candidate_for_ordering(
