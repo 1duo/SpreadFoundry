@@ -86,6 +86,8 @@ pub struct ResearchMetrics {
     pub total_max_loss: f64,
     pub avg_return_on_risk: f64,
     pub median_return_on_risk: f64,
+    pub avg_entry_dte: f64,
+    pub median_entry_dte: f64,
     pub win_rate: f64,
     pub profit_factor: f64,
     pub max_drawdown: f64,
@@ -95,6 +97,7 @@ pub struct ResearchMetrics {
     pub best_trade_pnl: f64,
     pub worst_trade_pnl: f64,
     pub score: f64,
+    pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
 }
 
@@ -708,6 +711,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             total_max_loss: 0.0,
             avg_return_on_risk: 0.0,
             median_return_on_risk: 0.0,
+            avg_entry_dte: 0.0,
+            median_entry_dte: 0.0,
             win_rate: 0.0,
             profit_factor: 0.0,
             max_drawdown: 0.0,
@@ -717,6 +722,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             best_trade_pnl: 0.0,
             worst_trade_pnl: 0.0,
             score: -1_000_000.0,
+            exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
         };
     }
@@ -743,6 +749,10 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         .iter()
         .map(|trade| trade.days_held as f64)
         .collect::<Vec<_>>();
+    let entry_dtes = sorted
+        .iter()
+        .map(|trade| trade.dte_entry as f64)
+        .collect::<Vec<_>>();
     let max_drawdown = max_drawdown(&sorted);
     let years = ((to - from).num_days().max(1) as f64) / 365.25;
     let score = total_pnl / total_max_loss.max(1.0) - 2.0 * max_drawdown;
@@ -752,6 +762,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         total_max_loss,
         avg_return_on_risk: mean(&returns),
         median_return_on_risk: median(returns),
+        avg_entry_dte: mean(&entry_dtes),
+        median_entry_dte: median(entry_dtes),
         win_rate: wins as f64 / sorted.len() as f64,
         profit_factor: if gross_loss == 0.0 {
             gross_profit
@@ -771,6 +783,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             .map(|trade| trade.pnl)
             .fold(f64::MAX, f64::min),
         score,
+        exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
     }
 }
@@ -825,6 +838,14 @@ fn yearly_metrics(trades: &[ResearchTrade]) -> BTreeMap<i32, YearMetrics> {
         .collect()
 }
 
+fn exit_reasons(trades: &[ResearchTrade]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for trade in trades {
+        *counts.entry(trade.exit_reason.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
 fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
@@ -856,12 +877,12 @@ fn research_markdown(report: &ResearchReport) -> String {
         "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- EOD rows loaded: `{}`\n\n",
         report.from, report.to, report.expirations_discovered, report.expirations_loaded, report.rows_loaded
     ));
-    out.push_str("| Rank | Profile | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Hold | Trades/Yr | Score |\n");
-    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Rank | Profile | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for (idx, result) in report.profiles.iter().enumerate() {
         let m = &result.metrics;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.4} |\n",
+            "| {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} |\n",
             idx + 1,
             result.profile.name,
             result.candidates,
@@ -871,12 +892,36 @@ fn research_markdown(report: &ResearchReport) -> String {
             m.win_rate * 100.0,
             m.profit_factor,
             m.max_drawdown,
+            m.avg_entry_dte,
             m.avg_days_held,
             m.trades_per_year,
             m.score
         ));
     }
     if let Some(best) = report.profiles.first() {
+        out.push_str("\n## Best Profile Yearly\n\n");
+        out.push_str("| Year | Trades | PnL | Win Rate | Avg ROR |\n");
+        out.push_str("|---:|---:|---:|---:|---:|\n");
+        for (year, yearly) in &best.metrics.yearly {
+            out.push_str(&format!(
+                "| {} | {} | {:.2} | {:.1}% | {:.3} |\n",
+                year,
+                yearly.trades,
+                yearly.pnl,
+                yearly.win_rate * 100.0,
+                yearly.avg_return_on_risk
+            ));
+        }
+        out.push_str("\n## Best Profile Cycle\n\n");
+        out.push_str(&format!(
+            "- Average entry DTE: `{:.1}`\n- Median entry DTE: `{:.1}`\n- Average days held: `{:.1}`\n- Median days held: `{:.1}`\n- Exit reasons: `{}`\n",
+            best.metrics.avg_entry_dte,
+            best.metrics.median_entry_dte,
+            best.metrics.avg_days_held,
+            best.metrics.median_days_held,
+            format_exit_reasons(&best.metrics.exit_reasons)
+        ));
+
         out.push_str("\n## Best Profile Trades\n\n");
         out.push_str(
             "| Entry | Exit | Exp | Short | Long | Credit | Exit Debit | PnL | ROR | Reason |\n",
@@ -899,6 +944,14 @@ fn research_markdown(report: &ResearchReport) -> String {
         }
     }
     out
+}
+
+fn format_exit_reasons(reasons: &BTreeMap<String, usize>) -> String {
+    reasons
+        .iter()
+        .map(|(reason, count)| format!("{reason}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn yyyymmdd(date: NaiveDate) -> String {
