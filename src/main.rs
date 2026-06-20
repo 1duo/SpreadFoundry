@@ -71,6 +71,8 @@ enum Commands {
         to: NaiveDate,
         #[arg(long)]
         max_expirations: Option<usize>,
+        #[arg(long, default_value_t = 4)]
+        fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
     },
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
             from,
             to,
             max_expirations,
+            fetch_concurrency,
             force_refresh,
         } => {
             let report = run_nvda_research(ResearchRequest {
@@ -154,6 +157,7 @@ async fn main() -> Result<()> {
                 from,
                 to,
                 max_expirations,
+                fetch_concurrency,
                 force_refresh,
             })
             .await?;

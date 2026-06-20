@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +14,7 @@ pub struct ResearchRequest {
     pub from: NaiveDate,
     pub to: NaiveDate,
     pub max_expirations: Option<usize>,
+    pub fetch_concurrency: usize,
     pub force_refresh: bool,
 }
 
@@ -193,28 +195,32 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
 
     let mut rows_by_expiration = HashMap::new();
     let mut rows_loaded = 0;
-    for expiration in &candidate_expirations {
-        let start = request
-            .from
-            .max(*expiration - Duration::days(max_entry_dte));
-        let exit_grace_end = *expiration - Duration::days(min_force_close_dte) + Duration::days(7);
-        let end = request.to.min(exit_grace_end);
-        if start > end {
-            continue;
-        }
-        println!("loading {} {}..{}", expiration, start, end);
-        let rows = load_expiration_rows(
-            &request.symbol,
-            *expiration,
-            start,
-            end,
-            &raw_dir,
-            request.force_refresh,
-        )
-        .await?;
-        rows_loaded += rows.len();
-        if !rows.is_empty() {
-            rows_by_expiration.insert(*expiration, rows);
+    let fetch_concurrency = request.fetch_concurrency.max(1);
+    for chunk in candidate_expirations.chunks(fetch_concurrency) {
+        let fetches = chunk.iter().copied().filter_map(|expiration| {
+            let start = request.from.max(expiration - Duration::days(max_entry_dte));
+            let exit_grace_end =
+                expiration - Duration::days(min_force_close_dte) + Duration::days(7);
+            let end = request.to.min(exit_grace_end);
+            if start > end {
+                return None;
+            }
+            let symbol = request.symbol.clone();
+            let raw_dir = raw_dir.clone();
+            let force_refresh = request.force_refresh;
+            Some(async move {
+                println!("loading {} {}..{}", expiration, start, end);
+                load_expiration_rows(&symbol, expiration, start, end, &raw_dir, force_refresh)
+                    .await
+                    .map(|rows| (expiration, rows))
+            })
+        });
+        for result in join_all(fetches).await {
+            let (expiration, rows) = result?;
+            rows_loaded += rows.len();
+            if !rows.is_empty() {
+                rows_by_expiration.insert(expiration, rows);
+            }
         }
     }
 

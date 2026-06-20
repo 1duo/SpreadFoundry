@@ -18,6 +18,7 @@ cargo run -- simulate --strategy put-spread --config configs/nvda_put_spread.tom
 cargo run -- optimize --strategy put-spread --config configs/nvda_opt.toml --method grid
 cargo run -- train-ranker --config configs/nvda_ranker.toml
 cargo run -- shadow-live --symbol NVDA --strategy put-spread
+cargo run -- research-nvda --from 2024-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 ```
 
 ThetaData universe ingest requires Theta Terminal running locally:
