@@ -4,7 +4,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
@@ -497,8 +497,13 @@ async fn load_open_interest_map(
     let exp = yyyymmdd(expiration);
     let mut out = HashMap::new();
     let mut chunk_start = start;
+    let mut chunks = VecDeque::new();
     while chunk_start <= end {
         let chunk_end = end.min(chunk_start + Duration::days(6));
+        chunks.push_back((chunk_start, chunk_end));
+        chunk_start = chunk_end + Duration::days(1);
+    }
+    while let Some((chunk_start, chunk_end)) = chunks.pop_front() {
         let chunk_start_s = yyyymmdd(chunk_start);
         let chunk_end_s = yyyymmdd(chunk_end);
         let oi_path = raw_dir.join(format!(
@@ -507,9 +512,19 @@ async fn load_open_interest_map(
         let oi_url = format!(
             "http://127.0.0.1:25503/v3/option/history/open_interest?symbol={symbol}&expiration={exp}&right=put&start_date={chunk_start_s}&end_date={chunk_end_s}&format=json"
         );
-        let oi = fetch_cached_json(&oi_url, &oi_path, force_refresh).await?;
-        out.extend(parse_oi_map(&oi)?);
-        chunk_start = chunk_end + Duration::days(1);
+        match fetch_cached_json(&oi_url, &oi_path, force_refresh).await {
+            Ok(oi) => out.extend(parse_oi_map(&oi)?),
+            Err(error) if chunk_start < chunk_end => {
+                let mid = chunk_start + Duration::days((chunk_end - chunk_start).num_days() / 2);
+                chunks.push_front((mid + Duration::days(1), chunk_end));
+                chunks.push_front((chunk_start, mid));
+                eprintln!(
+                    "splitting open-interest chunk {}..{} after error: {error:#}",
+                    chunk_start, chunk_end
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(out)
 }
