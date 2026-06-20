@@ -1,0 +1,4 @@
+symbol = "NVDA"
+data_mode = "fixture"
+label_source = "runs/opt-put-spread"
+split = "chronological"
