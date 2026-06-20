@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -493,16 +493,23 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
 }
 
 async fn fetch_json_once(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let body = client
+    let response = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("requesting {url}"))?
-        .error_for_status()
-        .with_context(|| format!("ThetaData returned error for {url}"))?
+        .with_context(|| format!("requesting {url}"))?;
+    let status = response.status();
+    let body = response
         .text()
         .await
         .with_context(|| format!("reading ThetaData response for {url}"))?;
+    if !status.is_success() {
+        let trimmed = body.trim();
+        if status.as_u16() == 472 && trimmed.contains("No data found") {
+            return Ok(json!({ "response": [] }));
+        }
+        anyhow::bail!("ThetaData returned HTTP {status} for {url}: {trimmed}");
+    }
     let json: Value = serde_json::from_str(&body)
         .with_context(|| format!("ThetaData did not return JSON for {url}: {}", body.trim()))?;
     Ok(json)
