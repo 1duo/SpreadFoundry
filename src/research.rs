@@ -382,26 +382,55 @@ async fn load_expiration_rows(
     raw_dir: &Path,
     force_refresh: bool,
 ) -> Result<Vec<OptionDay>> {
-    let exp = yyyymmdd(expiration);
-    let start_s = yyyymmdd(start);
-    let end_s = yyyymmdd(end);
-    let greeks_path = raw_dir.join(format!("research_greeks_{exp}_{start_s}_{end_s}.json"));
-    let greeks_url = format!(
-        "http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol={symbol}&expiration={exp}&right=put&start_date={start_s}&end_date={end_s}&format=json"
-    );
-    let greeks = fetch_cached_json(&greeks_url, &greeks_path, force_refresh)
-        .await
-        .with_context(|| format!("loading EOD Greeks for {symbol} {expiration}"))?;
     let oi_map = load_open_interest_map(symbol, expiration, start, end, raw_dir, force_refresh)
         .await
         .with_context(|| format!("loading open interest for {symbol} {expiration}"))?;
-    let mut rows = parse_greeks_rows(&greeks, &oi_map)?;
+    let mut rows = load_greeks_rows(
+        symbol,
+        expiration,
+        start,
+        end,
+        raw_dir,
+        force_refresh,
+        &oi_map,
+    )
+    .await
+    .with_context(|| format!("loading EOD Greeks for {symbol} {expiration}"))?;
     rows.sort_by(|a, b| {
         a.date
             .cmp(&b.date)
             .then_with(|| a.strike.total_cmp(&b.strike))
     });
     Ok(rows)
+}
+
+async fn load_greeks_rows(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    raw_dir: &Path,
+    force_refresh: bool,
+    oi_map: &HashMap<(NaiveDate, String), u32>,
+) -> Result<Vec<OptionDay>> {
+    let exp = yyyymmdd(expiration);
+    let mut out = Vec::new();
+    let mut chunk_start = start;
+    while chunk_start <= end {
+        let chunk_end = end.min(chunk_start + Duration::days(6));
+        let chunk_start_s = yyyymmdd(chunk_start);
+        let chunk_end_s = yyyymmdd(chunk_end);
+        let greeks_path = raw_dir.join(format!(
+            "research_greeks_{exp}_{chunk_start_s}_{chunk_end_s}.json"
+        ));
+        let greeks_url = format!(
+            "http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol={symbol}&expiration={exp}&right=put&start_date={chunk_start_s}&end_date={chunk_end_s}&format=json"
+        );
+        let greeks = fetch_cached_json(&greeks_url, &greeks_path, force_refresh).await?;
+        out.extend(parse_greeks_rows(&greeks, oi_map)?);
+        chunk_start = chunk_end + Duration::days(1);
+    }
+    Ok(out)
 }
 
 async fn load_open_interest_map(
