@@ -516,6 +516,34 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_20.stop_loss_cooldown_days = 20;
     profiles.push(otm_cooldown_20);
 
+    let mut otm_cooldown_trend20 = baseline.clone();
+    otm_cooldown_trend20.name =
+        "select_farther_otm_cooldown10_trend20d_delta20_30_credit20".to_owned();
+    otm_cooldown_trend20.prefer_farther_otm = true;
+    otm_cooldown_trend20.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend20.trend_lookback_days = Some(20);
+    otm_cooldown_trend20.min_underlying_return = Some(0.0);
+    profiles.push(otm_cooldown_trend20);
+
+    let mut otm_cooldown_trend60 = baseline.clone();
+    otm_cooldown_trend60.name =
+        "select_farther_otm_cooldown10_trend60d_delta20_30_credit20".to_owned();
+    otm_cooldown_trend60.prefer_farther_otm = true;
+    otm_cooldown_trend60.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60.trend_lookback_days = Some(60);
+    otm_cooldown_trend60.min_underlying_return = Some(0.0);
+    profiles.push(otm_cooldown_trend60);
+
+    let mut otm_cooldown_trend60_otm8 = baseline.clone();
+    otm_cooldown_trend60_otm8.name =
+        "select_farther_otm_cooldown10_trend60d_otm8pct_delta20_30_credit20".to_owned();
+    otm_cooldown_trend60_otm8.prefer_farther_otm = true;
+    otm_cooldown_trend60_otm8.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_otm8.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_otm8.min_underlying_return = Some(0.0);
+    otm_cooldown_trend60_otm8.min_short_otm_pct = Some(0.08);
+    profiles.push(otm_cooldown_trend60_otm8);
+
     profiles
 }
 
