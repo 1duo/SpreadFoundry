@@ -205,7 +205,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         .iter()
         .copied()
         .filter(|expiration| {
-            let entry_start = *expiration - Duration::days(max_entry_dte + max_trend_lookback_days);
+            let entry_start = *expiration - Duration::days(max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
             entry_start <= request.to && entry_end >= request.from
         })
@@ -220,9 +220,8 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     let fetch_concurrency = request.fetch_concurrency.max(1);
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
         let fetches = chunk.iter().copied().filter_map(|expiration| {
-            let start = request
-                .from
-                .max(expiration - Duration::days(max_entry_dte + max_trend_lookback_days));
+            let earliest_entry = request.from.max(expiration - Duration::days(max_entry_dte));
+            let start = earliest_entry - Duration::days(max_trend_lookback_days);
             let exit_grace_end =
                 expiration - Duration::days(min_force_close_dte) + Duration::days(7);
             let end = request.to.min(exit_grace_end);
@@ -250,7 +249,8 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
 
     let mut profile_results = Vec::new();
     for profile in profiles {
-        let candidates = generate_candidates(&rows_by_expiration, &profile);
+        let candidates =
+            generate_candidates(&rows_by_expiration, &profile, request.from, request.to);
         let trades = simulate_non_overlapping(&candidates, &rows_by_expiration, &profile);
         let metrics = metrics(&trades, request.from, request.to);
         profile_results.push(ProfileResult {
@@ -651,12 +651,17 @@ fn number(row: &Value, key: &str) -> f64 {
 fn generate_candidates(
     rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
     profile: &ResearchProfile,
+    entry_from: NaiveDate,
+    entry_to: NaiveDate,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for (expiration, rows) in rows_by_expiration {
         let mut by_date: BTreeMap<NaiveDate, Vec<&OptionDay>> = BTreeMap::new();
         let underlying_by_date = underlying_by_date(rows);
         for row in rows {
+            if row.date < entry_from || row.date > entry_to {
+                continue;
+            }
             let dte = (*expiration - row.date).num_days();
             if dte < profile.min_dte || dte > profile.max_dte {
                 continue;
@@ -1252,5 +1257,47 @@ mod tests {
 
         underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 110.0);
         assert!(entry_regime(&passing_short, &profile, &underlying).is_none());
+    }
+
+    #[test]
+    fn candidate_generation_ignores_pre_window_lookback_rows() {
+        let expiration = NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
+        let pre_window = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 11).unwrap();
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            expiration,
+            vec![
+                option_day(pre_window, 95.0, 1.35, 1.40, -0.25, 105.0),
+                option_day(pre_window, 90.0, 0.25, 0.30, -0.18, 105.0),
+                option_day(entry_date, 95.0, 1.35, 1.40, -0.25, 105.0),
+                option_day(entry_date, 90.0, 0.25, 0.30, -0.18, 105.0),
+            ],
+        );
+
+        let candidates =
+            generate_candidates(&rows, &ResearchProfile::baseline(), entry_date, entry_date);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entry_date, entry_date);
+    }
+
+    fn option_day(
+        date: NaiveDate,
+        strike: f64,
+        bid: f64,
+        ask: f64,
+        delta: f64,
+        underlying_price: f64,
+    ) -> OptionDay {
+        OptionDay {
+            date,
+            strike,
+            bid,
+            ask,
+            delta,
+            underlying_price,
+            open_interest: 1_000,
+        }
     }
 }
