@@ -158,26 +158,47 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     fs::create_dir_all(&raw_dir)?;
     fs::create_dir_all(&run_dir)?;
 
+    let profiles = research_profiles();
+    let max_entry_dte = profiles
+        .iter()
+        .map(|profile| profile.max_dte)
+        .max()
+        .unwrap_or(45);
+    let min_entry_dte = profiles
+        .iter()
+        .map(|profile| profile.min_dte)
+        .min()
+        .unwrap_or(30);
+    let min_force_close_dte = profiles
+        .iter()
+        .map(|profile| profile.force_close_dte)
+        .min()
+        .unwrap_or(21);
+
     let expirations =
         discover_expirations(&request.symbol, &raw_dir, request.force_refresh).await?;
     let mut candidate_expirations = expirations
         .iter()
         .copied()
         .filter(|expiration| {
-            *expiration - Duration::days(45) <= request.to
-                && *expiration - Duration::days(21) >= request.from
+            let entry_start = *expiration - Duration::days(max_entry_dte);
+            let entry_end = *expiration - Duration::days(min_entry_dte);
+            entry_start <= request.to && entry_end >= request.from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
     if let Some(max) = request.max_expirations {
-        candidate_expirations.truncate(max);
+        candidate_expirations = evenly_spaced(candidate_expirations, max);
     }
 
     let mut rows_by_expiration = HashMap::new();
     let mut rows_loaded = 0;
     for expiration in &candidate_expirations {
-        let start = request.from.max(*expiration - Duration::days(45));
-        let end = request.to.min(*expiration - Duration::days(21));
+        let start = request
+            .from
+            .max(*expiration - Duration::days(max_entry_dte));
+        let exit_grace_end = *expiration - Duration::days(min_force_close_dte) + Duration::days(7);
+        let end = request.to.min(exit_grace_end);
         if start > end {
             continue;
         }
@@ -197,7 +218,6 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         }
     }
 
-    let profiles = research_profiles();
     let mut profile_results = Vec::new();
     for profile in profiles {
         let candidates = generate_candidates(&rows_by_expiration, &profile);
@@ -230,6 +250,26 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     fs::write(run_dir.join("report.md"), research_markdown(&report))?;
     println!("{}", run_dir.display());
     Ok(report)
+}
+
+fn evenly_spaced<T: Copy>(items: Vec<T>, max: usize) -> Vec<T> {
+    if items.len() <= max {
+        return items;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    if max == 1 {
+        return vec![items[0]];
+    }
+    let last = items.len() - 1;
+    let denominator = max - 1;
+    (0..max)
+        .map(|idx| {
+            let selected = idx * last / denominator;
+            items[selected]
+        })
+        .collect()
 }
 
 fn research_profiles() -> Vec<ResearchProfile> {
@@ -592,9 +632,6 @@ fn simulate_candidate(
 
     for (date, short) in short_rows.range((candidate.entry_date + Duration::days(1))..) {
         let dte = (candidate.expiration - *date).num_days();
-        if dte < profile.force_close_dte {
-            break;
-        }
         let Some(long) = long_rows.get(date) else {
             continue;
         };
@@ -860,4 +897,23 @@ fn research_markdown(report: &ResearchReport) -> String {
 
 fn yyyymmdd(date: NaiveDate) -> String {
     date.format("%Y%m%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_expiration_limit_samples_across_full_window() {
+        let items = (1..=10).collect::<Vec<_>>();
+
+        assert_eq!(evenly_spaced(items, 4), vec![1, 4, 7, 10]);
+    }
+
+    #[test]
+    fn max_expiration_limit_handles_edge_cases() {
+        assert_eq!(evenly_spaced(vec![1, 2, 3], 0), Vec::<i32>::new());
+        assert_eq!(evenly_spaced(vec![1, 2, 3], 1), vec![1]);
+        assert_eq!(evenly_spaced(vec![1, 2, 3], 4), vec![1, 2, 3]);
+    }
 }
