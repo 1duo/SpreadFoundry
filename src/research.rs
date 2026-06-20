@@ -585,21 +585,23 @@ async fn load_open_interest_map(
     while let Some((chunk_start, chunk_end)) = chunks.pop_front() {
         let chunk_start_s = yyyymmdd(chunk_start);
         let chunk_end_s = yyyymmdd(chunk_end);
-        let oi_path = raw_dir.join(format!(
-            "research_oi_{exp}_{chunk_start_s}_{chunk_end_s}.json"
-        ));
+        let oi_path = oi_cache_path(raw_dir, &exp, chunk_start, chunk_end);
         let oi_url = format!(
             "http://127.0.0.1:25503/v3/option/history/open_interest?symbol={symbol}&expiration={exp}&right=put&start_date={chunk_start_s}&end_date={chunk_end_s}&format=json"
         );
         match fetch_cached_json(&oi_url, &oi_path, force_refresh).await {
             Ok(oi) => out.extend(parse_oi_map(&oi)?),
             Err(error) if chunk_start < chunk_end => {
-                for offset in (0..=(chunk_end - chunk_start).num_days()).rev() {
-                    let day = chunk_start + Duration::days(offset);
-                    chunks.push_front((day, day));
-                }
+                split_oi_remainder_to_daily(
+                    &mut chunks,
+                    raw_dir,
+                    &exp,
+                    force_refresh,
+                    chunk_start,
+                    chunk_end,
+                );
                 eprintln!(
-                    "splitting open-interest chunk {}..{} into daily requests after error: {error:#}",
+                    "splitting open-interest chunk {}..{} and uncached remaining chunks into daily requests after error: {error:#}",
                     chunk_start, chunk_end
                 );
             }
@@ -607,6 +609,50 @@ async fn load_open_interest_map(
         }
     }
     Ok(out)
+}
+
+fn oi_cache_path(
+    raw_dir: &Path,
+    exp: &str,
+    chunk_start: NaiveDate,
+    chunk_end: NaiveDate,
+) -> PathBuf {
+    raw_dir.join(format!(
+        "research_oi_{exp}_{}_{}.json",
+        yyyymmdd(chunk_start),
+        yyyymmdd(chunk_end)
+    ))
+}
+
+fn split_oi_remainder_to_daily(
+    chunks: &mut VecDeque<(NaiveDate, NaiveDate)>,
+    raw_dir: &Path,
+    exp: &str,
+    force_refresh: bool,
+    failed_start: NaiveDate,
+    failed_end: NaiveDate,
+) {
+    let mut ranges = Vec::with_capacity(chunks.len() + 1);
+    ranges.push((failed_start, failed_end));
+    ranges.extend(chunks.drain(..));
+    for (start, end) in ranges.into_iter().rev() {
+        if start == end || (!force_refresh && oi_cache_path(raw_dir, exp, start, end).exists()) {
+            chunks.push_front((start, end));
+        } else {
+            push_daily_chunks_front(chunks, start, end);
+        }
+    }
+}
+
+fn push_daily_chunks_front(
+    chunks: &mut VecDeque<(NaiveDate, NaiveDate)>,
+    start: NaiveDate,
+    end: NaiveDate,
+) {
+    for offset in (0..=(end - start).num_days()).rev() {
+        let day = start + Duration::days(offset);
+        chunks.push_front((day, day));
+    }
 }
 
 async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Result<Value> {
@@ -1532,6 +1578,59 @@ mod tests {
         assert_eq!(read_cached_json(&path).unwrap(), Some(json));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oi_timeout_splits_uncached_remainder_but_keeps_cached_weeklies() {
+        let raw_dir = unique_test_path("oi-cache-dir");
+        fs::create_dir_all(&raw_dir).unwrap();
+        let exp = "20240719";
+        let cached_start = NaiveDate::from_ymd_opt(2024, 5, 8).unwrap();
+        let cached_end = NaiveDate::from_ymd_opt(2024, 5, 14).unwrap();
+        fs::write(oi_cache_path(&raw_dir, exp, cached_start, cached_end), "{}").unwrap();
+        let mut chunks = VecDeque::from([
+            (cached_start, cached_end),
+            (
+                NaiveDate::from_ymd_opt(2024, 5, 15).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 5, 21).unwrap(),
+            ),
+        ]);
+
+        split_oi_remainder_to_daily(
+            &mut chunks,
+            &raw_dir,
+            exp,
+            false,
+            NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 5, 7).unwrap(),
+        );
+
+        let chunks = chunks.into_iter().collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 15);
+        assert_eq!(
+            chunks[0],
+            (
+                NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 5, 1).unwrap()
+            )
+        );
+        assert_eq!(chunks[7], (cached_start, cached_end));
+        assert_eq!(
+            chunks[8],
+            (
+                NaiveDate::from_ymd_opt(2024, 5, 15).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 5, 15).unwrap()
+            )
+        );
+        assert_eq!(
+            chunks[14],
+            (
+                NaiveDate::from_ymd_opt(2024, 5, 21).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 5, 21).unwrap()
+            )
+        );
+
+        let _ = fs::remove_dir_all(raw_dir);
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
