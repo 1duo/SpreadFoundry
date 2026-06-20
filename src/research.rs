@@ -386,20 +386,15 @@ async fn load_expiration_rows(
     let start_s = yyyymmdd(start);
     let end_s = yyyymmdd(end);
     let greeks_path = raw_dir.join(format!("research_greeks_{exp}_{start_s}_{end_s}.json"));
-    let oi_path = raw_dir.join(format!("research_oi_{exp}_{start_s}_{end_s}.json"));
     let greeks_url = format!(
         "http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol={symbol}&expiration={exp}&right=put&start_date={start_s}&end_date={end_s}&format=json"
-    );
-    let oi_url = format!(
-        "http://127.0.0.1:25503/v3/option/history/open_interest?symbol={symbol}&expiration={exp}&right=put&start_date={start_s}&end_date={end_s}&format=json"
     );
     let greeks = fetch_cached_json(&greeks_url, &greeks_path, force_refresh)
         .await
         .with_context(|| format!("loading EOD Greeks for {symbol} {expiration}"))?;
-    let oi = fetch_cached_json(&oi_url, &oi_path, force_refresh)
+    let oi_map = load_open_interest_map(symbol, expiration, start, end, raw_dir, force_refresh)
         .await
         .with_context(|| format!("loading open interest for {symbol} {expiration}"))?;
-    let oi_map = parse_oi_map(&oi)?;
     let mut rows = parse_greeks_rows(&greeks, &oi_map)?;
     rows.sort_by(|a, b| {
         a.date
@@ -407,6 +402,34 @@ async fn load_expiration_rows(
             .then_with(|| a.strike.total_cmp(&b.strike))
     });
     Ok(rows)
+}
+
+async fn load_open_interest_map(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    raw_dir: &Path,
+    force_refresh: bool,
+) -> Result<HashMap<(NaiveDate, String), u32>> {
+    let exp = yyyymmdd(expiration);
+    let mut out = HashMap::new();
+    let mut chunk_start = start;
+    while chunk_start <= end {
+        let chunk_end = end.min(chunk_start + Duration::days(6));
+        let chunk_start_s = yyyymmdd(chunk_start);
+        let chunk_end_s = yyyymmdd(chunk_end);
+        let oi_path = raw_dir.join(format!(
+            "research_oi_{exp}_{chunk_start_s}_{chunk_end_s}.json"
+        ));
+        let oi_url = format!(
+            "http://127.0.0.1:25503/v3/option/history/open_interest?symbol={symbol}&expiration={exp}&right=put&start_date={chunk_start_s}&end_date={chunk_end_s}&format=json"
+        );
+        let oi = fetch_cached_json(&oi_url, &oi_path, force_refresh).await?;
+        out.extend(parse_oi_map(&oi)?);
+        chunk_start = chunk_end + Duration::days(1);
+    }
+    Ok(out)
 }
 
 async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Result<Value> {
