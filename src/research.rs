@@ -44,6 +44,8 @@ pub struct ResearchProfile {
     pub trend_lookback_days: Option<i64>,
     pub min_underlying_return: Option<f64>,
     pub min_short_otm_pct: Option<f64>,
+    pub min_short_iv: Option<f64>,
+    pub max_short_iv: Option<f64>,
 }
 
 impl ResearchProfile {
@@ -67,6 +69,8 @@ impl ResearchProfile {
             trend_lookback_days: None,
             min_underlying_return: None,
             min_short_otm_pct: None,
+            min_short_iv: None,
+            max_short_iv: None,
         }
     }
 }
@@ -147,6 +151,8 @@ pub struct ResearchTrade {
     pub underlying_price: f64,
     pub short_otm_pct: f64,
     pub underlying_lookback_return: Option<f64>,
+    pub short_iv: f64,
+    pub long_iv: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +162,7 @@ struct OptionDay {
     bid: f64,
     ask: f64,
     delta: f64,
+    implied_vol: f64,
     underlying_price: f64,
     open_interest: u32,
 }
@@ -172,6 +179,8 @@ struct Candidate {
     return_on_risk: f64,
     short_otm_pct: f64,
     underlying_lookback_return: Option<f64>,
+    short_iv: f64,
+    long_iv: f64,
 }
 
 pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchReport> {
@@ -439,6 +448,35 @@ fn research_profiles() -> Vec<ResearchProfile> {
     higher_credit_delta25_30.min_credit_width = 0.25;
     profiles.push(higher_credit_delta25_30);
 
+    let mut ivcap100 = baseline.clone();
+    ivcap100.name = "ivcap100_delta20_30_credit20".to_owned();
+    ivcap100.max_short_iv = Some(1.00);
+    profiles.push(ivcap100);
+
+    let mut ivcap80 = baseline.clone();
+    ivcap80.name = "ivcap80_delta20_30_credit20".to_owned();
+    ivcap80.max_short_iv = Some(0.80);
+    profiles.push(ivcap80);
+
+    let mut higher_credit_ivcap100 = baseline.clone();
+    higher_credit_ivcap100.name = "ivcap100_delta20_30_credit25".to_owned();
+    higher_credit_ivcap100.min_credit_width = 0.25;
+    higher_credit_ivcap100.max_short_iv = Some(1.00);
+    profiles.push(higher_credit_ivcap100);
+
+    let mut higher_credit_ivcap80 = baseline.clone();
+    higher_credit_ivcap80.name = "ivcap80_delta20_30_credit25".to_owned();
+    higher_credit_ivcap80.min_credit_width = 0.25;
+    higher_credit_ivcap80.max_short_iv = Some(0.80);
+    profiles.push(higher_credit_ivcap80);
+
+    let mut lower_delta_ivcap80 = baseline.clone();
+    lower_delta_ivcap80.name = "ivcap80_delta15_25_credit20".to_owned();
+    lower_delta_ivcap80.min_short_delta_abs = 0.15;
+    lower_delta_ivcap80.max_short_delta_abs = 0.25;
+    lower_delta_ivcap80.max_short_iv = Some(0.80);
+    profiles.push(lower_delta_ivcap80);
+
     profiles
 }
 
@@ -678,6 +716,7 @@ fn parse_greeks_rows(
                 bid,
                 ask,
                 delta,
+                implied_vol: number(row, "implied_vol"),
                 underlying_price: number(row, "underlying_price"),
                 open_interest: *oi_map.get(&(date, strike_key.clone())).unwrap_or(&0),
             });
@@ -732,6 +771,7 @@ fn generate_candidates(
                     || short_delta > profile.max_short_delta_abs
                     || short.open_interest < profile.min_short_oi
                     || !quote_width_allowed(short, profile)
+                    || !iv_allowed(short, profile)
                 {
                     continue;
                 }
@@ -774,6 +814,8 @@ fn generate_candidates(
                         return_on_risk: credit / max_loss,
                         short_otm_pct,
                         underlying_lookback_return,
+                        short_iv: short.implied_vol,
+                        long_iv: long.implied_vol,
                     });
                 }
             }
@@ -969,6 +1011,8 @@ fn build_trade(
         underlying_price: candidate.short.underlying_price,
         short_otm_pct: candidate.short_otm_pct,
         underlying_lookback_return: candidate.underlying_lookback_return,
+        short_iv: candidate.short_iv,
+        long_iv: candidate.long_iv,
     }
 }
 
@@ -979,6 +1023,23 @@ fn quote_width_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
     }
     let allowed = (mid * profile.max_quote_width_pct_of_mid).max(profile.max_quote_width_abs);
     (row.ask - row.bid) <= allowed
+}
+
+fn iv_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
+    if row.implied_vol <= 0.0 {
+        return profile.min_short_iv.is_none() && profile.max_short_iv.is_none();
+    }
+    if let Some(min_short_iv) = profile.min_short_iv
+        && row.implied_vol < min_short_iv
+    {
+        return false;
+    }
+    if let Some(max_short_iv) = profile.max_short_iv
+        && row.implied_vol > max_short_iv
+    {
+        return false;
+    }
+    true
 }
 
 fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> ResearchMetrics {
@@ -1235,17 +1296,18 @@ fn research_markdown(report: &ResearchReport) -> String {
         ));
 
         out.push_str("\n## Best Profile Trades\n\n");
-        out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Trend Ret | Credit | Exit Debit | PnL | ROR | Reason |\n");
-        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Short IV | Trend Ret | Credit | Exit Debit | PnL | ROR | Reason |\n");
+        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for trade in best.trades.iter().take(50) {
             out.push_str(&format!(
-                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
+                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {:.1}% | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
                 trade.entry_date,
                 trade.exit_date,
                 trade.expiration,
                 trade.short_put,
                 trade.long_put,
                 trade.short_otm_pct * 100.0,
+                trade.short_iv * 100.0,
                 format_optional_pct(trade.underlying_lookback_return),
                 trade.entry_credit,
                 trade.exit_debit,
@@ -1326,6 +1388,7 @@ mod tests {
             bid: 1.0,
             ask: 1.1,
             delta: -0.25,
+            implied_vol: 0.5,
             underlying_price: 105.0,
             open_interest: 1_000,
         };
@@ -1382,6 +1445,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iv_filter_rejects_short_leg_above_cap() {
+        let mut profile = ResearchProfile::baseline();
+        profile.max_short_iv = Some(0.8);
+        let mut row = option_day(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            95.0,
+            1.0,
+            1.1,
+            -0.25,
+            105.0,
+        );
+
+        row.implied_vol = 0.75;
+        assert!(iv_allowed(&row, &profile));
+
+        row.implied_vol = 0.95;
+        assert!(!iv_allowed(&row, &profile));
+    }
+
     fn option_day(
         date: NaiveDate,
         strike: f64,
@@ -1396,6 +1479,7 @@ mod tests {
             bid,
             ask,
             delta,
+            implied_vol: 0.5,
             underlying_price,
             open_interest: 1_000,
         }
