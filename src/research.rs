@@ -46,6 +46,7 @@ pub struct ResearchProfile {
     pub min_short_otm_pct: Option<f64>,
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
+    pub prefer_farther_otm: bool,
 }
 
 impl ResearchProfile {
@@ -71,6 +72,7 @@ impl ResearchProfile {
             min_short_otm_pct: None,
             min_short_iv: None,
             max_short_iv: None,
+            prefer_farther_otm: false,
         }
     }
 }
@@ -476,6 +478,24 @@ fn research_profiles() -> Vec<ResearchProfile> {
     lower_delta_ivcap80.max_short_delta_abs = 0.25;
     lower_delta_ivcap80.max_short_iv = Some(0.80);
     profiles.push(lower_delta_ivcap80);
+
+    let mut otm_selector = baseline.clone();
+    otm_selector.name = "select_farther_otm_delta20_30_credit20".to_owned();
+    otm_selector.prefer_farther_otm = true;
+    profiles.push(otm_selector);
+
+    let mut otm_selector_ivcap80 = baseline.clone();
+    otm_selector_ivcap80.name = "select_farther_otm_ivcap80_delta20_30_credit20".to_owned();
+    otm_selector_ivcap80.max_short_iv = Some(0.80);
+    otm_selector_ivcap80.prefer_farther_otm = true;
+    profiles.push(otm_selector_ivcap80);
+
+    let mut lower_delta_otm_selector = baseline.clone();
+    lower_delta_otm_selector.name = "select_farther_otm_delta15_25_credit20".to_owned();
+    lower_delta_otm_selector.min_short_delta_abs = 0.15;
+    lower_delta_otm_selector.max_short_delta_abs = 0.25;
+    lower_delta_otm_selector.prefer_farther_otm = true;
+    profiles.push(lower_delta_otm_selector);
 
     profiles
 }
@@ -992,7 +1012,7 @@ fn simulate_non_overlapping(
         if date < next_entry_date {
             continue;
         }
-        day_candidates.sort_by(|a, b| candidate_quality_order(a, b));
+        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
         for candidate in day_candidates {
             if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
                 next_entry_date = trade.exit_date + Duration::days(1);
@@ -1021,10 +1041,21 @@ fn build_lookup(
 fn candidate_chronological_order(a: &Candidate, b: &Candidate) -> Ordering {
     a.entry_date
         .cmp(&b.entry_date)
-        .then_with(|| candidate_quality_order(a, b))
+        .then_with(|| default_candidate_quality_order(a, b))
 }
 
-fn candidate_quality_order(a: &Candidate, b: &Candidate) -> Ordering {
+fn candidate_quality_order(a: &Candidate, b: &Candidate, profile: &ResearchProfile) -> Ordering {
+    if profile.prefer_farther_otm {
+        return b
+            .short_otm_pct
+            .total_cmp(&a.short_otm_pct)
+            .then_with(|| a.short.delta.abs().total_cmp(&b.short.delta.abs()))
+            .then_with(|| default_candidate_quality_order(a, b));
+    }
+    default_candidate_quality_order(a, b)
+}
+
+fn default_candidate_quality_order(a: &Candidate, b: &Candidate) -> Ordering {
     b.return_on_risk
         .total_cmp(&a.return_on_risk)
         .then_with(|| b.credit.total_cmp(&a.credit))
@@ -1631,6 +1662,55 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(raw_dir);
+    }
+
+    #[test]
+    fn farther_otm_selector_does_not_change_default_credit_chasing() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 11).unwrap();
+        let close_high_credit = candidate_for_ordering(date, 95.0, 90.0, 1.25, -0.30, 0.05);
+        let far_lower_credit = candidate_for_ordering(date, 90.0, 85.0, 1.05, -0.20, 0.10);
+        let baseline = ResearchProfile::baseline();
+        let mut farther_otm = ResearchProfile::baseline();
+        farther_otm.prefer_farther_otm = true;
+
+        assert_eq!(
+            candidate_quality_order(&close_high_credit, &far_lower_credit, &baseline),
+            Ordering::Less
+        );
+        assert_eq!(
+            candidate_quality_order(&far_lower_credit, &close_high_credit, &farther_otm),
+            Ordering::Less
+        );
+    }
+
+    fn candidate_for_ordering(
+        date: NaiveDate,
+        short_strike: f64,
+        long_strike: f64,
+        credit: f64,
+        short_delta: f64,
+        short_otm_pct: f64,
+    ) -> Candidate {
+        let width = short_strike - long_strike;
+        let max_loss = width - credit;
+        Candidate {
+            entry_date: date,
+            expiration: date + Duration::days(40),
+            short: OptionDay {
+                strike: short_strike,
+                delta: short_delta,
+                ..option_day(date, short_strike, 1.0, 1.1, short_delta, 100.0)
+            },
+            long: option_day(date, long_strike, 0.1, 0.2, short_delta / 2.0, 100.0),
+            width,
+            credit,
+            max_loss_per_share: max_loss,
+            return_on_risk: credit / max_loss,
+            short_otm_pct,
+            underlying_lookback_return: None,
+            short_iv: 0.5,
+            long_iv: 0.5,
+        }
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
