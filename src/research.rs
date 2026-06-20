@@ -3,6 +3,7 @@ use chrono::{Datelike, Duration, NaiveDate, Utc};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -196,7 +197,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         candidate_expirations = evenly_spaced(candidate_expirations, max);
     }
 
-    let mut rows_by_expiration = HashMap::new();
+    let mut rows_by_expiration = BTreeMap::new();
     let mut rows_loaded = 0;
     let fetch_concurrency = request.fetch_concurrency.max(1);
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
@@ -239,7 +240,12 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
             metrics,
         });
     }
-    profile_results.sort_by(|a, b| b.metrics.score.total_cmp(&a.metrics.score));
+    profile_results.sort_by(|a, b| {
+        b.metrics
+            .score
+            .total_cmp(&a.metrics.score)
+            .then_with(|| a.profile.name.cmp(&b.profile.name))
+    });
 
     let report = ResearchReport {
         run_id: run_id.clone(),
@@ -384,16 +390,20 @@ async fn load_expiration_rows(
     let oi_url = format!(
         "http://127.0.0.1:25503/v3/option/history/open_interest?symbol={symbol}&expiration={exp}&right=put&start_date={start_s}&end_date={end_s}&format=json"
     );
-    let greeks = match fetch_cached_json(&greeks_url, &greeks_path, force_refresh).await {
-        Ok(json) => json,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let oi = match fetch_cached_json(&oi_url, &oi_path, force_refresh).await {
-        Ok(json) => json,
-        Err(_) => Value::Object(Default::default()),
-    };
+    let greeks = fetch_cached_json(&greeks_url, &greeks_path, force_refresh)
+        .await
+        .with_context(|| format!("loading EOD Greeks for {symbol} {expiration}"))?;
+    let oi = fetch_cached_json(&oi_url, &oi_path, force_refresh)
+        .await
+        .with_context(|| format!("loading open interest for {symbol} {expiration}"))?;
     let oi_map = parse_oi_map(&oi)?;
-    parse_greeks_rows(&greeks, &oi_map)
+    let mut rows = parse_greeks_rows(&greeks, &oi_map)?;
+    rows.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.strike.total_cmp(&b.strike))
+    });
+    Ok(rows)
 }
 
 async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Result<Value> {
@@ -503,7 +513,7 @@ fn number(row: &Value, key: &str) -> f64 {
 }
 
 fn generate_candidates(
-    rows_by_expiration: &HashMap<NaiveDate, Vec<OptionDay>>,
+    rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
     profile: &ResearchProfile,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
@@ -563,19 +573,13 @@ fn generate_candidates(
             }
         }
     }
-    candidates.sort_by(|a, b| {
-        a.entry_date.cmp(&b.entry_date).then_with(|| {
-            b.return_on_risk
-                .total_cmp(&a.return_on_risk)
-                .then_with(|| b.credit.total_cmp(&a.credit))
-        })
-    });
+    candidates.sort_by(candidate_chronological_order);
     candidates
 }
 
 fn simulate_non_overlapping(
     candidates: &[Candidate],
-    rows_by_expiration: &HashMap<NaiveDate, Vec<OptionDay>>,
+    rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
     profile: &ResearchProfile,
 ) -> Vec<ResearchTrade> {
     let lookup = build_lookup(rows_by_expiration);
@@ -593,11 +597,7 @@ fn simulate_non_overlapping(
         if date < next_entry_date {
             continue;
         }
-        day_candidates.sort_by(|a, b| {
-            b.return_on_risk
-                .total_cmp(&a.return_on_risk)
-                .then_with(|| b.credit.total_cmp(&a.credit))
-        });
+        day_candidates.sort_by(|a, b| candidate_quality_order(a, b));
         for candidate in day_candidates {
             if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
                 next_entry_date = trade.exit_date + Duration::days(1);
@@ -610,7 +610,7 @@ fn simulate_non_overlapping(
 }
 
 fn build_lookup(
-    rows_by_expiration: &HashMap<NaiveDate, Vec<OptionDay>>,
+    rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
 ) -> HashMap<(NaiveDate, String), BTreeMap<NaiveDate, OptionDay>> {
     let mut out: HashMap<(NaiveDate, String), BTreeMap<NaiveDate, OptionDay>> = HashMap::new();
     for (expiration, rows) in rows_by_expiration {
@@ -621,6 +621,22 @@ fn build_lookup(
         }
     }
     out
+}
+
+fn candidate_chronological_order(a: &Candidate, b: &Candidate) -> Ordering {
+    a.entry_date
+        .cmp(&b.entry_date)
+        .then_with(|| candidate_quality_order(a, b))
+}
+
+fn candidate_quality_order(a: &Candidate, b: &Candidate) -> Ordering {
+    b.return_on_risk
+        .total_cmp(&a.return_on_risk)
+        .then_with(|| b.credit.total_cmp(&a.credit))
+        .then_with(|| a.expiration.cmp(&b.expiration))
+        .then_with(|| b.short.strike.total_cmp(&a.short.strike))
+        .then_with(|| b.long.strike.total_cmp(&a.long.strike))
+        .then_with(|| a.width.total_cmp(&b.width))
 }
 
 fn simulate_candidate(
@@ -727,7 +743,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         };
     }
     let mut sorted = trades.to_vec();
-    sorted.sort_by_key(|trade| trade.exit_date);
+    sorted.sort_by(trade_chronological_order);
     let total_pnl = sorted.iter().map(|trade| trade.pnl).sum::<f64>();
     let total_max_loss = sorted.iter().map(|trade| trade.max_loss).sum::<f64>();
     let wins = sorted.iter().filter(|trade| trade.pnl > 0.0).count();
@@ -786,6 +802,15 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
     }
+}
+
+fn trade_chronological_order(a: &ResearchTrade, b: &ResearchTrade) -> Ordering {
+    a.exit_date
+        .cmp(&b.exit_date)
+        .then_with(|| a.entry_date.cmp(&b.entry_date))
+        .then_with(|| a.expiration.cmp(&b.expiration))
+        .then_with(|| b.short_put.total_cmp(&a.short_put))
+        .then_with(|| b.long_put.total_cmp(&a.long_put))
 }
 
 fn max_drawdown(trades: &[ResearchTrade]) -> f64 {
