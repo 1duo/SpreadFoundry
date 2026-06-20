@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
+use tokio::time::sleep;
+
+const FETCH_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -417,6 +420,27 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(20))
         .build()?;
+    let mut last_error = None;
+    for attempt in 1..=FETCH_ATTEMPTS {
+        match fetch_json_once(&client, url).await {
+            Ok(json) => {
+                fs::write(path, serde_json::to_string_pretty(&json)?)?;
+                return Ok(json);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < FETCH_ATTEMPTS {
+                    sleep(StdDuration::from_millis(250 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    let error = last_error.context("ThetaData request failed without an error payload")?;
+    Err(error)
+        .with_context(|| format!("ThetaData request failed after {FETCH_ATTEMPTS} attempts: {url}"))
+}
+
+async fn fetch_json_once(client: &reqwest::Client, url: &str) -> Result<Value> {
     let body = client
         .get(url)
         .send()
@@ -425,10 +449,10 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
         .error_for_status()
         .with_context(|| format!("ThetaData returned error for {url}"))?
         .text()
-        .await?;
+        .await
+        .with_context(|| format!("reading ThetaData response for {url}"))?;
     let json: Value = serde_json::from_str(&body)
         .with_context(|| format!("ThetaData did not return JSON for {url}: {}", body.trim()))?;
-    fs::write(path, serde_json::to_string_pretty(&json)?)?;
     Ok(json)
 }
 
