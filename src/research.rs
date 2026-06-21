@@ -1482,19 +1482,19 @@ fn plateau_status_from_counts(
             "profile search has not reached the minimum variant coverage for plateau",
             "continue current-symbol detector and execution-strategy variants",
         )
-    } else if !enough_oos {
-        (
-            "continue_symbol_research",
-            false,
-            "out-of-sample coverage is too thin for plateau",
-            "extend current-symbol history or walk-forward coverage before expanding symbols",
-        )
     } else if !deployment_gate.best_profile_gate {
         (
             "continue_symbol_research",
             false,
             "no robust in-sample detector is available yet",
             "continue current-symbol detector search",
+        )
+    } else if !enough_oos {
+        (
+            "continue_symbol_research",
+            false,
+            "out-of-sample coverage is too thin for plateau",
+            "extend current-symbol history or walk-forward coverage before expanding symbols",
         )
     } else {
         (
@@ -5118,6 +5118,36 @@ mod tests {
             status
                 .next_action
                 .contains("five liquid single-stock symbols")
+        );
+    }
+
+    #[test]
+    fn plateau_status_prioritizes_detector_gate_before_oos_coverage() {
+        let gate = DeploymentGate {
+            status: "blocked".to_owned(),
+            pass: false,
+            best_profile_gate: false,
+            walk_forward_oos_gate: false,
+            holdout_oos_gate: false,
+        };
+
+        let status = plateau_status_from_counts(
+            PLATEAU_MIN_PROFILE_VARIANTS + 1,
+            PLATEAU_MIN_WALK_FORWARD_YEARS,
+            false,
+            &gate,
+        );
+
+        assert_eq!(status.status, "continue_symbol_research");
+        assert!(!status.expansion_ready);
+        assert_eq!(status.detector_status, "blocked");
+        assert_eq!(
+            status.reason,
+            "no robust in-sample detector is available yet"
+        );
+        assert_eq!(
+            status.next_action,
+            "continue current-symbol detector search"
         );
     }
 
