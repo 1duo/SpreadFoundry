@@ -152,9 +152,11 @@ impl ResearchProfile {
 pub struct ResearchReport {
     pub run_id: String,
     pub symbol: String,
+    pub requested_from: NaiveDate,
     pub from: NaiveDate,
     pub to: NaiveDate,
     pub expirations_discovered: usize,
+    pub expirations_skipped_before_data: usize,
     pub expirations_loaded: usize,
     pub expirations_failed: usize,
     pub expiration_load_failures: Vec<ExpirationLoadFailure>,
@@ -173,6 +175,15 @@ pub struct ResearchReport {
 pub struct ExpirationLoadFailure {
     pub expiration: NaiveDate,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExpirationLoadBounds {
+    from: NaiveDate,
+    to: NaiveDate,
+    max_entry_dte: i64,
+    min_force_close_dte: i64,
+    max_regime_lookback_days: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -555,6 +566,45 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     if let Some(max) = request.max_expirations {
         candidate_expirations = evenly_spaced(candidate_expirations, max);
     }
+    let requested_load_bounds = ExpirationLoadBounds {
+        from: request.from,
+        to: request.to,
+        max_entry_dte,
+        min_force_close_dte,
+        max_regime_lookback_days,
+    };
+    let mut research_from = request.from;
+    let expirations_skipped_before_data;
+    if let Some(first_loadable_idx) = first_expiration_with_rows(
+        &request.symbol,
+        &candidate_expirations,
+        requested_load_bounds,
+        &raw_dir,
+        request.force_refresh,
+    )
+    .await?
+    {
+        expirations_skipped_before_data = first_loadable_idx;
+        if first_loadable_idx > 0 {
+            candidate_expirations = candidate_expirations.split_off(first_loadable_idx);
+            if let Some(first_expiration) = candidate_expirations.first() {
+                research_from = request
+                    .from
+                    .max(*first_expiration - Duration::days(max_entry_dte));
+                println!(
+                    "using effective research start {} after skipping {} leading empty/unavailable expirations",
+                    research_from, expirations_skipped_before_data
+                );
+            }
+        }
+    } else {
+        expirations_skipped_before_data = candidate_expirations.len();
+        candidate_expirations.clear();
+    }
+    let effective_load_bounds = ExpirationLoadBounds {
+        from: research_from,
+        ..requested_load_bounds
+    };
 
     let mut rows_by_expiration = BTreeMap::new();
     let mut rows_loaded = 0;
@@ -562,14 +612,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     let fetch_concurrency = request.fetch_concurrency.max(1);
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
         let fetches = chunk.iter().copied().filter_map(|expiration| {
-            let earliest_entry = request.from.max(expiration - Duration::days(max_entry_dte));
-            let start = earliest_entry - Duration::days(max_regime_lookback_days);
-            let exit_grace_end =
-                expiration - Duration::days(min_force_close_dte) + Duration::days(7);
-            let end = request.to.min(exit_grace_end);
-            if start > end {
-                return None;
-            }
+            let (start, end) = expiration_load_window(expiration, effective_load_bounds)?;
             let symbol = request.symbol.clone();
             let raw_dir = raw_dir.clone();
             let force_refresh = request.force_refresh;
@@ -604,9 +647,9 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     let mut profile_results = Vec::new();
     for profile in profiles {
         let candidates =
-            generate_candidates(&rows_by_expiration, &profile, request.from, request.to);
+            generate_candidates(&rows_by_expiration, &profile, research_from, request.to);
         let trades = simulate_non_overlapping(&candidates, &rows_by_expiration, &profile);
-        let metrics = metrics(&trades, request.from, request.to);
+        let metrics = metrics(&trades, research_from, request.to);
         profile_results.push(ProfileResult {
             detector_strategy: detector_strategy_summary(&profile),
             execution_strategy: execution_strategy_summary(&profile),
@@ -616,16 +659,16 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
             metrics,
         });
     }
-    let walk_forward = walk_forward(&profile_results, request.from, request.to);
-    let rolling_walk_forward = rolling_walk_forward(&profile_results, request.from, request.to);
-    let holdout = holdout(&profile_results, request.from, request.to);
+    let walk_forward = walk_forward(&profile_results, research_from, request.to);
+    let rolling_walk_forward = rolling_walk_forward(&profile_results, research_from, request.to);
+    let holdout = holdout(&profile_results, research_from, request.to);
     let fixed_profile_walk_forward =
-        fixed_profile_walk_forward(&profile_results, request.from, request.to);
+        fixed_profile_walk_forward(&profile_results, research_from, request.to);
     profile_results.sort_by(profile_result_order);
     let latest_signal = latest_signal_for_best_profile(
         &profile_results,
         &rows_by_expiration,
-        request.from,
+        research_from,
         request.to,
     );
     let deployment_gate = deployment_gate_for(&profile_results, &walk_forward, &holdout);
@@ -635,9 +678,11 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     let report = ResearchReport {
         run_id: run_id.clone(),
         symbol: request.symbol,
-        from: request.from,
+        requested_from: request.from,
+        from: research_from,
         to: request.to,
         expirations_discovered: expirations.len(),
+        expirations_skipped_before_data,
         expirations_loaded: rows_by_expiration.len(),
         expirations_failed: expiration_load_failures.len(),
         expiration_load_failures,
@@ -659,6 +704,62 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     fs::write(run_dir.join("report.md"), research_markdown(&report))?;
     println!("{}", run_dir.display());
     Ok(report)
+}
+
+async fn first_expiration_with_rows(
+    symbol: &str,
+    expirations: &[NaiveDate],
+    bounds: ExpirationLoadBounds,
+    raw_dir: &Path,
+    force_refresh: bool,
+) -> Result<Option<usize>> {
+    let mut low = 0;
+    let mut high = expirations.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let expiration = expirations[mid];
+        let Some((start, end)) = expiration_load_window(expiration, bounds) else {
+            low = mid + 1;
+            continue;
+        };
+        let has_rows = match load_expiration_rows(
+            symbol,
+            expiration,
+            start,
+            end,
+            raw_dir,
+            force_refresh,
+        )
+        .await
+        {
+            Ok(rows) => !rows.is_empty(),
+            Err(error) if is_non_retryable_thetadata_error(&error) => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probing loadable expiration {expiration}"));
+            }
+        };
+        if has_rows {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Ok((low < expirations.len()).then_some(low))
+}
+
+fn expiration_load_window(
+    expiration: NaiveDate,
+    bounds: ExpirationLoadBounds,
+) -> Option<(NaiveDate, NaiveDate)> {
+    let earliest_entry = bounds
+        .from
+        .max(expiration - Duration::days(bounds.max_entry_dte));
+    let start = earliest_entry - Duration::days(bounds.max_regime_lookback_days);
+    let exit_grace_end =
+        expiration - Duration::days(bounds.min_force_close_dte) + Duration::days(7);
+    let end = bounds.to.min(exit_grace_end);
+    (start <= end).then_some((start, end))
 }
 
 fn expiration_load_failure_from_error(
@@ -3751,10 +3852,13 @@ fn research_markdown(report: &ResearchReport) -> String {
         report.symbol, report.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- Expirations failed: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
+        "- Requested window: `{}` to `{}`\n- Effective research window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations skipped before data: `{}`\n- Expirations loaded: `{}`\n- Expirations failed: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
+        report.requested_from,
+        report.to,
         report.from,
         report.to,
         report.expirations_discovered,
+        report.expirations_skipped_before_data,
         report.expirations_loaded,
         report.expirations_failed,
         report.rows_loaded,
@@ -4342,6 +4446,25 @@ mod tests {
     }
 
     #[test]
+    fn expiration_load_window_keeps_lookback_before_effective_start() {
+        let expiration = NaiveDate::from_ymd_opt(2020, 3, 20).unwrap();
+        let from = NaiveDate::from_ymd_opt(2020, 2, 4).unwrap();
+        let to = NaiveDate::from_ymd_opt(2020, 3, 1).unwrap();
+        let bounds = ExpirationLoadBounds {
+            from,
+            to,
+            max_entry_dte: 45,
+            min_force_close_dte: 21,
+            max_regime_lookback_days: 60,
+        };
+
+        let (start, end) = expiration_load_window(expiration, bounds).unwrap();
+
+        assert_eq!(start, NaiveDate::from_ymd_opt(2019, 12, 6).unwrap());
+        assert_eq!(end, to);
+    }
+
+    #[test]
     fn symbol_slug_is_filesystem_safe() {
         assert_eq!(symbol_slug("NVDA"), "nvda");
         assert_eq!(symbol_slug("BRK.B"), "brk-b");
@@ -4828,9 +4951,11 @@ mod tests {
         let report = ResearchReport {
             run_id: "test-run".to_owned(),
             symbol: "NVDA".to_owned(),
+            requested_from: NaiveDate::from_ymd_opt(2012, 1, 1).unwrap(),
             from,
             to,
             expirations_discovered: 1,
+            expirations_skipped_before_data: 2,
             expirations_loaded: 1,
             expirations_failed: 0,
             expiration_load_failures: Vec::new(),
@@ -4874,6 +4999,9 @@ mod tests {
         let markdown = research_markdown(&report);
 
         assert!(markdown.contains("## Research Deployment Gate"));
+        assert!(markdown.contains("Requested window: `2012-01-01` to `2022-12-31`"));
+        assert!(markdown.contains("Effective research window: `2020-01-01` to `2022-12-31`"));
+        assert!(markdown.contains("Expirations skipped before data: `2`"));
         assert!(markdown.contains("- Status: `blocked`"));
         assert!(markdown.contains("- Research deployment gate: `blocked`"));
         assert!(markdown.contains("latest signals are research candidates only"));
