@@ -646,36 +646,36 @@ fn latest_signal_for_profile(
     from: NaiveDate,
     to: NaiveDate,
 ) -> Option<ResearchSignal> {
-    let candidates = generate_candidates(rows_by_expiration, &result.profile, from, to);
-    let lookup = build_lookup(rows_by_expiration);
-    let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
-    for candidate in &candidates {
-        by_date
-            .entry(candidate.entry_date)
-            .or_default()
-            .push(candidate);
+    let entry_from = from.max(next_signal_entry_date(result, to));
+    if entry_from > to {
+        return None;
     }
+    let candidates = generate_candidates(rows_by_expiration, &result.profile, entry_from, to);
+    let latest_entry_date = candidates
+        .iter()
+        .map(|candidate| candidate.entry_date)
+        .max()?;
+    let mut day_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.entry_date == latest_entry_date)
+        .collect::<Vec<_>>();
+    day_candidates.sort_by(|a, b| candidate_quality_order(a, b, &result.profile));
+    Some(signal_from_candidate(
+        day_candidates[0],
+        &result.profile.name,
+        to,
+        "entry_candidate",
+    ))
+}
 
-    let mut next_entry_date = NaiveDate::MIN;
-    for (date, mut day_candidates) in by_date {
-        if date < next_entry_date {
-            continue;
-        }
-        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, &result.profile));
-        let candidate = day_candidates[0];
-        if let Some(trade) = simulate_candidate(candidate, &lookup, &result.profile) {
-            next_entry_date = next_entry_date_after_trade(&trade, &result.profile);
-        } else {
-            return Some(signal_from_candidate(
-                candidate,
-                &result.profile.name,
-                to,
-                "open_as_of",
-            ));
-        }
-    }
-
-    None
+fn next_signal_entry_date(result: &ProfileResult, as_of: NaiveDate) -> NaiveDate {
+    result
+        .trades
+        .iter()
+        .filter(|trade| trade.exit_date <= as_of)
+        .max_by(|a, b| trade_chronological_order(a, b))
+        .map(|trade| next_entry_date_after_trade(trade, &result.profile))
+        .unwrap_or(NaiveDate::MIN)
 }
 
 fn signal_from_candidate(
@@ -3091,7 +3091,7 @@ mod tests {
 
         let signal = latest_signal_for_profile(&result, &rows, entry_date, entry_date).unwrap();
 
-        assert_eq!(signal.status, "open_as_of");
+        assert_eq!(signal.status, "entry_candidate");
         assert_eq!(signal.as_of, entry_date);
         assert_eq!(signal.entry_date, entry_date);
         assert_eq!(signal.expiration, expiration);
@@ -3099,6 +3099,41 @@ mod tests {
         assert_eq!(signal.long_put, 90.0);
         assert!((signal.entry_credit - 1.05).abs() < 1e-9);
         assert!((signal.max_loss - 395.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn latest_signal_starts_after_last_closed_trade() {
+        let stale_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let latest_date = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let stale_expiration = stale_date + Duration::days(40);
+        let latest_expiration = latest_date + Duration::days(40);
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            stale_expiration,
+            vec![
+                option_day(stale_date, 95.0, 1.20, 1.25, -0.25, 105.0),
+                option_day(stale_date, 90.0, 0.10, 0.15, -0.15, 105.0),
+            ],
+        );
+        rows.insert(
+            latest_expiration,
+            vec![
+                option_day(latest_date, 94.0, 1.25, 1.30, -0.24, 106.0),
+                option_day(latest_date, 89.0, 0.10, 0.15, -0.15, 106.0),
+            ],
+        );
+        let closed_trade = trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 12).unwrap(),
+            50.0,
+        );
+        let result = profile_result("baseline", vec![closed_trade], stale_date, latest_date);
+
+        let signal = latest_signal_for_profile(&result, &rows, stale_date, latest_date).unwrap();
+
+        assert_eq!(signal.entry_date, latest_date);
+        assert_eq!(signal.expiration, latest_expiration);
+        assert_eq!(signal.short_put, 94.0);
     }
 
     #[test]
