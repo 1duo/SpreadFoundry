@@ -86,6 +86,8 @@ enum Commands {
         fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
+        #[arg(long, default_value_t = false)]
+        expand_on_plateau: bool,
     },
     ResearchSymbol {
         #[arg(long)]
@@ -100,6 +102,8 @@ enum Commands {
         fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
+        #[arg(long, default_value_t = false)]
+        expand_on_plateau: bool,
     },
     ResearchUniverse {
         #[arg(
@@ -289,26 +293,18 @@ async fn main() -> Result<()> {
             max_expirations,
             fetch_concurrency,
             force_refresh,
+            expand_on_plateau,
         } => {
-            let report = run_symbol_research(ResearchRequest {
+            research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: "NVDA".to_owned(),
                 from,
                 to,
                 max_expirations,
                 fetch_concurrency,
                 force_refresh,
+                expand_on_plateau,
             })
-            .await?;
-            if let Some(best) = report.profiles.first() {
-                println!(
-                    "best={} trades={} pnl={:.2} score={:.4}",
-                    best.profile.name,
-                    best.metrics.trades,
-                    best.metrics.total_pnl,
-                    best.metrics.score
-                );
-            }
-            Ok(())
+            .await
         }
         Commands::ResearchSymbol {
             symbol,
@@ -317,26 +313,18 @@ async fn main() -> Result<()> {
             max_expirations,
             fetch_concurrency,
             force_refresh,
+            expand_on_plateau,
         } => {
-            let report = run_symbol_research(ResearchRequest {
+            research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: symbol.to_uppercase(),
                 from,
                 to,
                 max_expirations,
                 fetch_concurrency,
                 force_refresh,
+                expand_on_plateau,
             })
-            .await?;
-            if let Some(best) = report.profiles.first() {
-                println!(
-                    "best={} trades={} pnl={:.2} score={:.4}",
-                    best.profile.name,
-                    best.metrics.trades,
-                    best.metrics.total_pnl,
-                    best.metrics.score
-                );
-            }
-            Ok(())
+            .await
         }
         Commands::ResearchUniverse {
             symbols,
@@ -361,6 +349,81 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+#[derive(Debug)]
+struct ResearchCommandArgs {
+    symbol: String,
+    from: NaiveDate,
+    to: NaiveDate,
+    max_expirations: Option<usize>,
+    fetch_concurrency: usize,
+    force_refresh: bool,
+    expand_on_plateau: bool,
+}
+
+async fn research_symbol_and_optional_universe(args: ResearchCommandArgs) -> Result<()> {
+    let ResearchCommandArgs {
+        symbol,
+        from,
+        to,
+        max_expirations,
+        fetch_concurrency,
+        force_refresh,
+        expand_on_plateau,
+    } = args;
+    let report = run_symbol_research(ResearchRequest {
+        symbol,
+        from,
+        to,
+        max_expirations,
+        fetch_concurrency,
+        force_refresh,
+    })
+    .await?;
+    if let Some(best) = report.profiles.first() {
+        println!(
+            "best={} trades={} pnl={:.2} score={:.4}",
+            best.profile.name, best.metrics.trades, best.metrics.total_pnl, best.metrics.score
+        );
+    }
+
+    if !expand_on_plateau {
+        return Ok(());
+    }
+
+    let Some(plateau_run) =
+        automatic_expansion_plateau_run(&report.run_id, report.plateau_status.expansion_ready)
+    else {
+        println!(
+            "plateau expansion locked: status={} reason={}",
+            report.plateau_status.status, report.plateau_status.reason
+        );
+        return Ok(());
+    };
+
+    println!(
+        "plateau reached; researching universe {}",
+        DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV
+    );
+    research_universe(UniverseResearchArgs {
+        symbols: DEFAULT_PLATEAU_UNIVERSE_SYMBOLS
+            .iter()
+            .map(|symbol| (*symbol).to_owned())
+            .collect(),
+        plateau_run: Some(plateau_run),
+        from: report.requested_from,
+        to: report.to,
+        max_expirations,
+        fetch_concurrency,
+        force_refresh,
+        allow_pre_plateau: false,
+    })
+    .await
+}
+
+fn automatic_expansion_plateau_run(run_id: &str, expansion_ready: bool) -> Option<PathBuf> {
+    expansion_ready.then(|| PathBuf::from("runs").join(run_id).join("research.json"))
 }
 
 async fn ingest_theta(
@@ -1145,6 +1208,45 @@ mod tests {
         assert_eq!(checked, Some(run_dir.join("research.json")));
 
         fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn research_symbol_accepts_expand_on_plateau_flag() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "research-symbol",
+            "--symbol",
+            "nvda",
+            "--to",
+            "2026-06-21",
+            "--expand-on-plateau",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResearchSymbol {
+                symbol,
+                expand_on_plateau,
+                ..
+            } => {
+                assert_eq!(symbol, "nvda");
+                assert!(expand_on_plateau);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automatic_expansion_uses_plateau_research_json_only_when_ready() {
+        assert_eq!(automatic_expansion_plateau_run("nvda-test", false), None);
+        assert_eq!(
+            automatic_expansion_plateau_run("nvda-test", true),
+            Some(
+                PathBuf::from("runs")
+                    .join("nvda-test")
+                    .join("research.json")
+            )
+        );
     }
 
     #[test]
