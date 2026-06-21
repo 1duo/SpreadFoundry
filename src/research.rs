@@ -96,6 +96,7 @@ pub struct ResearchReport {
     pub expirations_discovered: usize,
     pub expirations_loaded: usize,
     pub rows_loaded: usize,
+    pub latest_signal: Option<ResearchSignal>,
     pub walk_forward: WalkForwardResult,
     pub holdout: HoldoutResult,
     pub profiles: Vec<ProfileResult>,
@@ -260,6 +261,32 @@ pub struct ResearchTrade {
     pub long_iv: f64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchSignal {
+    pub as_of: NaiveDate,
+    pub status: String,
+    pub profile_name: String,
+    pub entry_date: NaiveDate,
+    pub expiration: NaiveDate,
+    pub dte_entry: i64,
+    pub short_put: f64,
+    pub long_put: f64,
+    pub width: f64,
+    pub entry_credit: f64,
+    pub max_profit: f64,
+    pub max_loss: f64,
+    pub return_on_risk: f64,
+    pub short_delta: f64,
+    pub long_delta: f64,
+    pub short_oi: u32,
+    pub long_oi: u32,
+    pub underlying_price: f64,
+    pub short_otm_pct: f64,
+    pub underlying_lookback_return: Option<f64>,
+    pub short_iv: f64,
+    pub long_iv: f64,
+}
+
 #[derive(Clone, Debug)]
 struct OptionDay {
     date: NaiveDate,
@@ -381,6 +408,12 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     let walk_forward = walk_forward(&profile_results, request.from, request.to);
     let holdout = holdout(&profile_results, request.from, request.to);
     profile_results.sort_by(profile_result_order);
+    let latest_signal = latest_signal_for_best_profile(
+        &profile_results,
+        &rows_by_expiration,
+        request.from,
+        request.to,
+    );
 
     let report = ResearchReport {
         run_id: run_id.clone(),
@@ -390,6 +423,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         expirations_discovered: expirations.len(),
         expirations_loaded: rows_by_expiration.len(),
         rows_loaded,
+        latest_signal,
         walk_forward,
         holdout,
         profiles: profile_results,
@@ -594,6 +628,86 @@ fn filter_trades_by_entry_date(
         .filter(|trade| trade.entry_date >= from && trade.entry_date <= to)
         .cloned()
         .collect()
+}
+
+fn latest_signal_for_best_profile(
+    profile_results: &[ProfileResult],
+    rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Option<ResearchSignal> {
+    let best = profile_results.first()?;
+    latest_signal_for_profile(best, rows_by_expiration, from, to)
+}
+
+fn latest_signal_for_profile(
+    result: &ProfileResult,
+    rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Option<ResearchSignal> {
+    let candidates = generate_candidates(rows_by_expiration, &result.profile, from, to);
+    let lookup = build_lookup(rows_by_expiration);
+    let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
+    for candidate in &candidates {
+        by_date
+            .entry(candidate.entry_date)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut next_entry_date = NaiveDate::MIN;
+    for (date, mut day_candidates) in by_date {
+        if date < next_entry_date {
+            continue;
+        }
+        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, &result.profile));
+        let candidate = day_candidates[0];
+        if let Some(trade) = simulate_candidate(candidate, &lookup, &result.profile) {
+            next_entry_date = next_entry_date_after_trade(&trade, &result.profile);
+        } else {
+            return Some(signal_from_candidate(
+                candidate,
+                &result.profile.name,
+                to,
+                "open_as_of",
+            ));
+        }
+    }
+
+    None
+}
+
+fn signal_from_candidate(
+    candidate: &Candidate,
+    profile_name: &str,
+    as_of: NaiveDate,
+    status: &str,
+) -> ResearchSignal {
+    ResearchSignal {
+        as_of,
+        status: status.to_owned(),
+        profile_name: profile_name.to_owned(),
+        entry_date: candidate.entry_date,
+        expiration: candidate.expiration,
+        dte_entry: (candidate.expiration - candidate.entry_date).num_days(),
+        short_put: candidate.short.strike,
+        long_put: candidate.long.strike,
+        width: candidate.width,
+        entry_credit: candidate.credit,
+        max_profit: candidate.credit * 100.0,
+        max_loss: candidate.max_loss_per_share * 100.0,
+        return_on_risk: candidate.return_on_risk,
+        short_delta: candidate.short.delta,
+        long_delta: candidate.long.delta,
+        short_oi: candidate.short.open_interest,
+        long_oi: candidate.long.open_interest,
+        underlying_price: candidate.short.underlying_price,
+        short_otm_pct: candidate.short_otm_pct,
+        underlying_lookback_return: candidate.underlying_lookback_return,
+        short_iv: candidate.short_iv,
+        long_iv: candidate.long_iv,
+    }
 }
 
 fn train_metrics_summary(metrics: &ResearchMetrics) -> WalkForwardTrainMetrics {
@@ -2206,6 +2320,37 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
+
+    if let Some(signal) = &report.latest_signal {
+        out.push_str("## Latest Signal\n\n");
+        out.push_str(&format!(
+            "- As of: `{}`\n- Status: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n\n",
+            signal.as_of,
+            signal.status,
+            signal.profile_name,
+            signal.entry_date,
+            signal.expiration,
+            signal.dte_entry,
+            signal.short_put,
+            signal.long_put,
+            signal.width,
+            signal.entry_credit,
+            signal.max_profit,
+            signal.max_loss,
+            signal.return_on_risk,
+            signal.underlying_price,
+            signal.short_otm_pct * 100.0,
+            signal.short_delta,
+            signal.short_iv * 100.0,
+            format_optional_pct(signal.underlying_lookback_return)
+        ));
+    } else {
+        out.push_str("## Latest Signal\n\n");
+        out.push_str(
+            "- No open-as-of signal for the best ranked profile inside this data window.\n\n",
+        );
+    }
+
     let wf = &report.walk_forward;
     let active_years = wf.years.iter().filter(|year| year.active).count();
     out.push_str("## Walk-Forward Selector\n\n");
@@ -2928,6 +3073,32 @@ mod tests {
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.metrics.total_pnl, 40.0);
         assert!(result.train_metrics.robust_ranking_eligible);
+    }
+
+    #[test]
+    fn latest_signal_reports_candidate_without_future_exit_rows() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let expiration = entry_date + Duration::days(40);
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            expiration,
+            vec![
+                option_day(entry_date, 95.0, 1.20, 1.25, -0.25, 105.0),
+                option_day(entry_date, 90.0, 0.10, 0.15, -0.15, 105.0),
+            ],
+        );
+        let result = profile_result("baseline", Vec::new(), entry_date, entry_date);
+
+        let signal = latest_signal_for_profile(&result, &rows, entry_date, entry_date).unwrap();
+
+        assert_eq!(signal.status, "open_as_of");
+        assert_eq!(signal.as_of, entry_date);
+        assert_eq!(signal.entry_date, entry_date);
+        assert_eq!(signal.expiration, expiration);
+        assert_eq!(signal.short_put, 95.0);
+        assert_eq!(signal.long_put, 90.0);
+        assert!((signal.entry_credit - 1.05).abs() < 1e-9);
+        assert!((signal.max_loss - 395.0).abs() < 1e-9);
     }
 
     #[test]
