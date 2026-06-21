@@ -173,9 +173,12 @@ struct GridParams {
 #[derive(Debug, Serialize)]
 struct UniverseResearchSummary {
     run_id: String,
+    run_status: String,
     from: NaiveDate,
     to: NaiveDate,
     symbols: Vec<String>,
+    symbols_requested: usize,
+    symbols_completed: usize,
     plateau_run: Option<String>,
     max_expirations: Option<usize>,
     fetch_concurrency: usize,
@@ -641,33 +644,16 @@ async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
         .unwrap_or("universe-research")
         .to_owned();
     let expansion_seed = expansion_seed_for_symbols(&symbols);
-    let mut results = Vec::new();
-    for symbol in &symbols {
-        println!("researching {symbol}");
-        let request = ResearchRequest {
-            symbol: symbol.clone(),
-            from,
-            to,
-            max_expirations,
-            fetch_concurrency,
-            force_refresh,
-        };
-        match run_symbol_research(request).await {
-            Ok(report) => results.push(universe_symbol_summary(&report, &expansion_seed)),
-            Err(err) => {
-                eprintln!("research failed for {symbol}: {err:#}");
-                results.push(universe_symbol_error_summary(symbol, &expansion_seed, &err));
-            }
-        }
-    }
-    rank_universe_results(&mut results);
-
-    let summary = UniverseResearchSummary {
+    let plateau_run = plateau_run.as_ref().map(|path| path.display().to_string());
+    let mut summary = UniverseResearchSummary {
         run_id,
+        run_status: "running".to_owned(),
         from,
         to,
+        symbols_requested: symbols.len(),
+        symbols_completed: 0,
         symbols,
-        plateau_run: plateau_run.as_ref().map(|path| path.display().to_string()),
+        plateau_run,
         max_expirations,
         fetch_concurrency,
         force_refresh,
@@ -678,14 +664,49 @@ async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
         detector_score_basis: UNIVERSE_DETECTOR_SCORE_BASIS.to_owned(),
         execution_score_basis: UNIVERSE_EXECUTION_SCORE_BASIS.to_owned(),
         expansion_seed,
-        results,
+        results: Vec::new(),
     };
+    write_universe_summary(&run_dir, &summary)?;
+
+    for symbol in summary.symbols.clone() {
+        println!("researching {symbol}");
+        let request = ResearchRequest {
+            symbol: symbol.clone(),
+            from,
+            to,
+            max_expirations,
+            fetch_concurrency,
+            force_refresh,
+        };
+        match run_symbol_research(request).await {
+            Ok(report) => summary
+                .results
+                .push(universe_symbol_summary(&report, &summary.expansion_seed)),
+            Err(err) => {
+                eprintln!("research failed for {symbol}: {err:#}");
+                summary.results.push(universe_symbol_error_summary(
+                    &symbol,
+                    &summary.expansion_seed,
+                    &err,
+                ));
+            }
+        }
+        rank_universe_results(&mut summary.results);
+        summary.symbols_completed = summary.results.len();
+        write_universe_summary(&run_dir, &summary)?;
+    }
+    summary.run_status = "complete".to_owned();
+    write_universe_summary(&run_dir, &summary)?;
+    println!("wrote {}", run_dir.display());
+    Ok(())
+}
+
+fn write_universe_summary(run_dir: &Path, summary: &UniverseResearchSummary) -> Result<()> {
     fs::write(
         run_dir.join("summary.json"),
-        serde_json::to_string_pretty(&summary)?,
+        serde_json::to_string_pretty(summary)?,
     )?;
-    fs::write(run_dir.join("report.md"), universe_markdown(&summary))?;
-    println!("wrote {}", run_dir.display());
+    fs::write(run_dir.join("report.md"), universe_markdown(summary))?;
     Ok(())
 }
 
@@ -1185,10 +1206,13 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Max expirations per symbol: `{}`\n- Fetch concurrency: `{}`\n- Force refresh: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Seed score basis: {}\n- Research method: {}\n\n",
+        "- Status: `{}`\n- Window: `{}` to `{}`\n- Symbols: `{}`\n- Symbols completed: `{}/{}`\n- Plateau run: `{}`\n- Max expirations per symbol: `{}`\n- Fetch concurrency: `{}`\n- Force refresh: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Seed score basis: {}\n- Research method: {}\n\n",
+        summary.run_status,
         summary.from,
         summary.to,
         summary.symbols.join(", "),
+        summary.symbols_completed,
+        summary.symbols_requested,
         summary.plateau_run.as_deref().unwrap_or("not provided"),
         optional_usize(summary.max_expirations),
         summary.fetch_concurrency,
@@ -1539,9 +1563,12 @@ mod tests {
         rank_universe_results(&mut results);
         let summary = UniverseResearchSummary {
             run_id: "universe-test".to_owned(),
+            run_status: "running".to_owned(),
             from: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
             to: NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
             symbols: vec!["TSLA".to_owned()],
+            symbols_requested: 1,
+            symbols_completed: 1,
             plateau_run: Some("runs/nvda/research.json".to_owned()),
             max_expirations: Some(24),
             fetch_concurrency: 8,
@@ -1559,6 +1586,8 @@ mod tests {
         let markdown = universe_markdown(&summary);
 
         assert!(markdown.contains("Strategy: `put_credit_spread`"));
+        assert!(markdown.contains("Status: `running`"));
+        assert!(markdown.contains("Symbols completed: `1/1`"));
         assert!(markdown.contains("Max expirations per symbol: `24`"));
         assert!(markdown.contains("Fetch concurrency: `8`"));
         assert!(markdown.contains("same Rust put-credit-spread profile grid"));
