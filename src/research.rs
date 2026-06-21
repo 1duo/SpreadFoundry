@@ -2924,12 +2924,42 @@ fn research_markdown(report: &ResearchReport) -> String {
             .unwrap_or(MIN_RANKING_TRADES)
     ));
 
+    let best_profile_gate = report
+        .profiles
+        .first()
+        .is_some_and(|result| deployable_training_profile(&result.metrics));
+    let walk_forward_gate = out_of_sample_gate_passes(&report.walk_forward.metrics);
+    let holdout_gate = report.holdout.active && out_of_sample_gate_passes(&report.holdout.metrics);
+    let deployment_gate = best_profile_gate && walk_forward_gate && holdout_gate;
+    out.push_str("## Research Deployment Gate\n\n");
+    out.push_str(&format!(
+        "- Status: `{}`\n- Best-profile robust gate: `{}`\n- Walk-forward OOS gate: `{}` (trades `{}`, PnL `{:.2}`, score `{:.4}`)\n- Holdout OOS gate: `{}` (trades `{}`, PnL `{:.2}`, score `{:.4}`)\n",
+        format_gate(deployment_gate),
+        format_gate(best_profile_gate),
+        format_gate(walk_forward_gate),
+        report.walk_forward.metrics.trades,
+        report.walk_forward.metrics.total_pnl,
+        report.walk_forward.metrics.score,
+        format_gate(holdout_gate),
+        report.holdout.metrics.trades,
+        report.holdout.metrics.total_pnl,
+        report.holdout.metrics.score
+    ));
+    if !deployment_gate {
+        out.push_str(
+            "- Interpretation: latest signals are research candidates only until out-of-sample gates are positive.\n\n",
+        );
+    } else {
+        out.push('\n');
+    }
+
     if let Some(signal) = &report.latest_signal {
         out.push_str("## Latest Signal\n\n");
         out.push_str(&format!(
-            "- As of: `{}`\n- Status: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n- Recent drawdown: `{}`\n- Realized vol: `{}`\n\n",
+            "- As of: `{}`\n- Status: `{}`\n- Research deployment gate: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n- Recent drawdown: `{}`\n- Realized vol: `{}`\n\n",
             signal.as_of,
             signal.status,
+            format_gate(deployment_gate),
             signal.profile_name,
             signal.entry_date,
             signal.expiration,
@@ -3163,6 +3193,14 @@ fn format_optional_pct(value: Option<f64>) -> String {
 fn format_optional_year_pnl(year: Option<i32>, pnl: f64) -> String {
     year.map(|year| format!("{year} ({pnl:.2})"))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn out_of_sample_gate_passes(metrics: &ResearchMetrics) -> bool {
+    metrics.ranking_eligible && metrics.total_pnl > 0.0 && metrics.score > 0.0
+}
+
+fn format_gate(passes: bool) -> &'static str {
+    if passes { "pass" } else { "blocked" }
 }
 
 fn format_exit_reasons(reasons: &BTreeMap<String, usize>) -> String {
@@ -3533,6 +3571,75 @@ mod tests {
         assert!(metrics.robust_ranking_eligible);
         assert!(metrics.robust_score < 0.0);
         assert!(!deployable_training_profile(&metrics));
+    }
+
+    #[test]
+    fn out_of_sample_gate_requires_positive_score() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let passing = metrics(&training_trades(40.0), from, to);
+
+        assert!(out_of_sample_gate_passes(&passing));
+
+        let mut blocked = passing.clone();
+        blocked.score = -0.01;
+        assert!(!out_of_sample_gate_passes(&blocked));
+
+        blocked = passing.clone();
+        blocked.total_pnl = -1.0;
+        assert!(!out_of_sample_gate_passes(&blocked));
+
+        blocked = passing;
+        blocked.ranking_eligible = false;
+        assert!(!out_of_sample_gate_passes(&blocked));
+    }
+
+    #[test]
+    fn research_markdown_marks_signal_research_only_when_oos_gate_fails() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let best = profile_result("best", training_trades(40.0), from, to);
+        assert!(deployable_training_profile(&best.metrics));
+
+        let passing_oos = metrics(&training_trades(40.0), from, to);
+        let mut blocked_oos = passing_oos.clone();
+        blocked_oos.score = -0.01;
+        let report = ResearchReport {
+            run_id: "test-run".to_owned(),
+            symbol: "NVDA".to_owned(),
+            from,
+            to,
+            expirations_discovered: 1,
+            expirations_loaded: 1,
+            rows_loaded: 2,
+            latest_signal: Some(test_signal(to, "best")),
+            walk_forward: WalkForwardResult {
+                min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
+                years: Vec::new(),
+                selected_profile_counts: BTreeMap::new(),
+                trades: Vec::new(),
+                metrics: blocked_oos,
+            },
+            holdout: HoldoutResult {
+                train_from: from,
+                train_to: from,
+                test_from: from,
+                test_to: to,
+                active: true,
+                selected_profile: "best".to_owned(),
+                train_metrics: train_metrics_summary(&best.metrics),
+                trades: Vec::new(),
+                metrics: passing_oos,
+            },
+            profiles: vec![best],
+        };
+
+        let markdown = research_markdown(&report);
+
+        assert!(markdown.contains("## Research Deployment Gate"));
+        assert!(markdown.contains("- Status: `blocked`"));
+        assert!(markdown.contains("- Research deployment gate: `blocked`"));
+        assert!(markdown.contains("latest signals are research candidates only"));
     }
 
     #[test]
@@ -4553,6 +4660,35 @@ mod tests {
             candidates: trades.len(),
             trades,
             metrics,
+        }
+    }
+
+    fn test_signal(as_of: NaiveDate, profile_name: &str) -> ResearchSignal {
+        ResearchSignal {
+            as_of,
+            status: "entry_candidate".to_owned(),
+            profile_name: profile_name.to_owned(),
+            entry_date: as_of,
+            expiration: as_of + Duration::days(40),
+            dte_entry: 40,
+            short_put: 95.0,
+            long_put: 90.0,
+            width: 5.0,
+            entry_credit: 1.05,
+            max_profit: 105.0,
+            max_loss: 395.0,
+            return_on_risk: 105.0 / 395.0,
+            short_delta: -0.25,
+            long_delta: -0.15,
+            short_oi: 1_000,
+            long_oi: 1_000,
+            underlying_price: 105.0,
+            short_otm_pct: 10.0 / 105.0,
+            underlying_lookback_return: Some(0.12),
+            underlying_recent_drawdown: Some(0.02),
+            underlying_realized_vol: None,
+            short_iv: 0.40,
+            long_iv: 0.41,
         }
     }
 
