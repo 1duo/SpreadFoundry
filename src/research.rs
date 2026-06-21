@@ -4074,6 +4074,17 @@ fn research_markdown(report: &ResearchReport) -> String {
         plateau.reason,
         plateau.next_action
     ));
+
+    out.push_str("## Planned Universe Expansion\n\n");
+    out.push_str(&format!(
+        "- Trigger: plateau status must be `plateau_expand_universe` with `expansion_ready=true`.\n- Default top-five symbols: `{}`\n- Method: run the same Rust put-spread research grid per symbol, with detector filters and execution rules reported as separate strategies.\n- Current state: `{}`\n\n",
+        DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV,
+        if plateau.expansion_ready {
+            "unlocked"
+        } else {
+            "locked"
+        }
+    ));
     if let Some(command) = plateau_expansion_command(report) {
         out.push_str(&format!("- Universe research command: `{}`\n\n", command));
     }
@@ -5202,6 +5213,8 @@ mod tests {
         assert!(markdown.contains("## Research Deployment Gate"));
         assert!(markdown.contains("## Out-of-Sample Failure Summary"));
         assert!(markdown.contains("## Detector Robustness Gap"));
+        assert!(markdown.contains("## Planned Universe Expansion"));
+        assert!(markdown.contains("Current state: `locked`"));
         assert!(markdown.contains("Required deployable robust score"));
         assert!(markdown.contains("Weakest chronological period"));
         assert!(markdown.contains("## Best Profile Failure Anatomy"));

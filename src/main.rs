@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses five non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
+const UNIVERSE_DETECTOR_SCORE_BASIS: &str =
+    "Best in-sample detector robust score after chronological and annual stability checks.";
+const UNIVERSE_EXECUTION_SCORE_BASIS: &str =
+    "Conservative minimum of walk-forward, holdout when active, and best fixed-profile OOS scores.";
 
 #[derive(Parser, Debug)]
 #[command(name = "spreadfoundry")]
@@ -171,6 +175,8 @@ struct UniverseResearchSummary {
     strategy: String,
     selection_basis: String,
     research_method: String,
+    detector_score_basis: String,
+    execution_score_basis: String,
     expansion_seed: Vec<UniverseSeedSymbol>,
     results: Vec<UniverseSymbolSummary>,
 }
@@ -204,6 +210,8 @@ struct UniverseSymbolSummary {
     best_profile: String,
     best_detector: String,
     best_execution: String,
+    detector_score: f64,
+    execution_oos_score: f64,
     trades: usize,
     total_pnl: f64,
     score: f64,
@@ -574,6 +582,8 @@ async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
         strategy: "put_credit_spread".to_owned(),
         selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
         research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
+        detector_score_basis: UNIVERSE_DETECTOR_SCORE_BASIS.to_owned(),
+        execution_score_basis: UNIVERSE_EXECUTION_SCORE_BASIS.to_owned(),
         expansion_seed,
         results,
     };
@@ -707,6 +717,10 @@ fn universe_symbol_summary(
 ) -> UniverseSymbolSummary {
     let best = report.profiles.first();
     let best_fixed = report.fixed_profile_walk_forward.first();
+    let detector_score = best
+        .map(|result| result.metrics.robust_score)
+        .unwrap_or_default();
+    let execution_oos_score = conservative_execution_oos_score(report);
     let (research_status, error_message) =
         universe_research_outcome(report.expirations_loaded, report.rows_loaded);
     let fixed_profile_oos_passes = report
@@ -746,6 +760,8 @@ fn universe_symbol_summary(
         best_execution: best
             .map(|result| result.execution_strategy.name.clone())
             .unwrap_or_default(),
+        detector_score,
+        execution_oos_score,
         trades: best.map(|result| result.metrics.trades).unwrap_or_default(),
         total_pnl: best
             .map(|result| result.metrics.total_pnl)
@@ -787,6 +803,17 @@ fn universe_symbol_summary(
             .as_ref()
             .map(|signal| signal.status.clone()),
     }
+}
+
+fn conservative_execution_oos_score(report: &ResearchReport) -> f64 {
+    let mut score = report.walk_forward.metrics.score;
+    if report.holdout.active {
+        score = score.min(report.holdout.metrics.score);
+    }
+    if let Some(best_fixed) = report.fixed_profile_walk_forward.first() {
+        score = score.min(best_fixed.metrics.score);
+    }
+    score
 }
 
 fn universe_research_outcome(
@@ -832,6 +859,8 @@ fn universe_symbol_error_summary(
         best_profile: String::new(),
         best_detector: String::new(),
         best_execution: String::new(),
+        detector_score: 0.0,
+        execution_oos_score: 0.0,
         trades: 0,
         total_pnl: 0.0,
         score: 0.0,
@@ -925,6 +954,10 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     out.push_str("## Research Protocol\n\n");
     out.push_str("- Detector search: each symbol gets its own DTE, delta, credit, width, liquidity, IV, trend, drawdown, and realized-volatility filters selected only from that symbol's historical training data.\n");
     out.push_str("- Execution strategy search: take-profit, stop-loss, force-close DTE, cooldown, and spread-selection rules are scored separately from detector filters under conservative bid/ask fills.\n");
+    out.push_str(&format!(
+        "- Detector score: {}\n- Execution OOS score: {}\n",
+        summary.detector_score_basis, summary.execution_score_basis
+    ));
     out.push_str("- Promotion rule: seed order never promotes a symbol; fixed-profile OOS passes, walk-forward evidence, holdout evidence, and deployment gates drive the suitability ranking.\n\n");
 
     out.push_str("## Expansion Seed\n\n");
@@ -939,13 +972,13 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     out.push('\n');
 
     out.push_str("## Symbol Suitability Ranking\n\n");
-    out.push_str("| Rank | Seed Rank | Symbol | Research | Error | Report | Deployment | Plateau | Detector Status | Execution Status | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
+    out.push_str("| Rank | Seed Rank | Symbol | Research | Error | Report | Deployment | Plateau | Detector Status | Execution Status | Detector Score | Execution OOS Score | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
     out.push_str(
-        "|---:|---:|---|---|---|---|---|---|---|---|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "|---:|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     for result in &summary.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
             result.suitability_rank,
             result
                 .seed_rank
@@ -963,6 +996,8 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
             result.plateau_status,
             result.detector_status,
             result.execution_strategy_status,
+            result.detector_score,
+            result.execution_oos_score,
             result.fixed_profile_oos_passes,
             result.best_fixed_profile,
             result.best_fixed_detector,
@@ -1167,6 +1202,8 @@ mod tests {
             strategy: "put_credit_spread".to_owned(),
             selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
             research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
+            detector_score_basis: UNIVERSE_DETECTOR_SCORE_BASIS.to_owned(),
+            execution_score_basis: UNIVERSE_EXECUTION_SCORE_BASIS.to_owned(),
             expansion_seed: Vec::new(),
             results,
         };
@@ -1180,6 +1217,8 @@ mod tests {
         assert!(markdown.contains("Execution strategy search: take-profit"));
         assert!(markdown.contains("## Symbol Suitability Ranking"));
         assert!(markdown.contains("Detector Status"));
+        assert!(markdown.contains("Detector Score"));
+        assert!(markdown.contains("Execution OOS Score"));
         assert!(markdown.contains("Best Fixed Detector"));
         assert!(markdown.contains("put_spread_detector_test"));
         assert!(markdown.contains("put_spread_execution_test"));
@@ -1298,6 +1337,8 @@ mod tests {
             best_profile: "best_profile".to_owned(),
             best_detector: "put_spread_detector_test".to_owned(),
             best_execution: "put_spread_execution_test".to_owned(),
+            detector_score: input.robust_score,
+            execution_oos_score: input.walk_forward_score.min(input.holdout_score),
             trades: 10,
             total_pnl: 100.0,
             score: 0.1,
