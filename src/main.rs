@@ -91,7 +91,11 @@ enum Commands {
         force_refresh: bool,
     },
     ResearchUniverse {
-        #[arg(long, value_delimiter = ',', default_value = "TSLA,AAPL,AMZN,AMD,META")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "TSLA,AAPL,AMZN,META,MSFT"
+        )]
         symbols: Vec<String>,
         #[arg(long)]
         plateau_run: Option<PathBuf>,
