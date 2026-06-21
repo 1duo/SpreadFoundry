@@ -750,7 +750,8 @@ fn select_walk_forward_profile<'a>(
     let mut scored = profile_results
         .iter()
         .map(|result| {
-            let train_trades = filter_trades_by_entry_date(&result.trades, train_from, train_to);
+            let train_trades =
+                filter_closed_trades_by_entry_date(&result.trades, train_from, train_to);
             WalkForwardSelection {
                 result,
                 metrics: metrics(&train_trades, train_from, train_to),
@@ -775,6 +776,18 @@ fn filter_trades_by_entry_date(
     trades
         .iter()
         .filter(|trade| trade.entry_date >= from && trade.entry_date <= to)
+        .cloned()
+        .collect()
+}
+
+fn filter_closed_trades_by_entry_date(
+    trades: &[ResearchTrade],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<ResearchTrade> {
+    trades
+        .iter()
+        .filter(|trade| trade.entry_date >= from && trade.entry_date <= to && trade.exit_date <= to)
         .cloned()
         .collect()
 }
@@ -4553,6 +4566,44 @@ mod tests {
         assert!(!result.years[0].train_metrics.robust_ranking_eligible);
         assert_eq!(result.years[0].test_metrics.trades, 0);
         assert!(result.trades.is_empty());
+    }
+
+    #[test]
+    fn walk_forward_training_selection_ignores_unclosed_cutoff_trades() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let train_to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let to = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+
+        let closed_trades = training_trades(40.0);
+        let mut leaky_trades = Vec::new();
+        for month in 1..=10 {
+            leaky_trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2020, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2020, month, 8).unwrap(),
+                10.0,
+            ));
+        }
+        for month in 1..=9 {
+            leaky_trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2022, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2022, month, 8).unwrap(),
+                10.0,
+            ));
+        }
+        leaky_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2022, 12, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 1, 10).unwrap(),
+            5_000.0,
+        ));
+        let results = vec![
+            profile_result("leaky_cutoff", leaky_trades, from, to),
+            profile_result("closed_train", closed_trades, from, to),
+        ];
+
+        let selection = select_walk_forward_profile(&results, from, train_to).unwrap();
+
+        assert_eq!(selection.result.profile.name, "closed_train");
+        assert!(selection.metrics.robust_ranking_eligible);
     }
 
     #[test]
