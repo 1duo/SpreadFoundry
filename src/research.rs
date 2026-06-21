@@ -2467,6 +2467,132 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (
+        name,
+        stop_loss_cooldown_days,
+        risk_cooldown_days,
+        min_dte,
+        max_dte,
+        min_delta,
+        max_delta,
+        min_credit_width,
+    ) in [
+        (
+            "aggr_stopcool1_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            1,
+            0,
+            30,
+            45,
+            0.20,
+            0.30,
+            0.20,
+        ),
+        (
+            "aggr_stopcool3_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            3,
+            0,
+            30,
+            45,
+            0.20,
+            0.30,
+            0.20,
+        ),
+        (
+            "aggr_stopcool5_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            5,
+            0,
+            30,
+            45,
+            0.20,
+            0.30,
+            0.20,
+        ),
+        (
+            "aggr_stopcool10_riskcool30dd5_5d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            10,
+            5,
+            30,
+            45,
+            0.20,
+            0.30,
+            0.20,
+        ),
+        (
+            "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+            10,
+            20,
+            30,
+            45,
+            0.25,
+            0.35,
+            0.20,
+        ),
+        (
+            "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_35_credit20",
+            10,
+            20,
+            30,
+            45,
+            0.20,
+            0.35,
+            0.20,
+        ),
+        (
+            "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit15",
+            10,
+            20,
+            30,
+            45,
+            0.20,
+            0.30,
+            0.15,
+        ),
+        (
+            "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_dte21_35_delta20_30_credit20",
+            10,
+            20,
+            21,
+            35,
+            0.20,
+            0.30,
+            0.20,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = stop_loss_cooldown_days;
+        profile.min_dte = min_dte;
+        profile.max_dte = max_dte;
+        profile.min_short_delta_abs = min_delta;
+        profile.max_short_delta_abs = max_delta;
+        profile.min_credit_width = min_credit_width;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.10);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: 0.13,
+            min_underlying_drawdown: 0.03,
+            max_underlying_drawdown: 0.06,
+        });
+        if risk_cooldown_days > 0 {
+            profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+                min_underlying_return: 0.30,
+                max_underlying_drawdown: 0.05,
+            });
+            profile.risk_regime_cooldown_days = risk_cooldown_days;
+        }
+        profiles.push(profile);
+    }
+
     for (name, stop_loss_multiple, take_profit_pct) in [
         (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -6451,6 +6577,149 @@ mod tests {
                 })
             );
             assert_eq!(profile.risk_regime_cooldown_days, cooldown_days);
+        }
+    }
+
+    #[test]
+    fn aggressive_current_best_ablation_profiles_keep_shared_risk_gates() {
+        let profiles = research_profiles();
+        for (
+            name,
+            stop_loss_cooldown_days,
+            risk_cooldown_days,
+            min_dte,
+            max_dte,
+            min_delta,
+            max_delta,
+            min_credit_width,
+        ) in [
+            (
+                "aggr_stopcool1_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                1,
+                0,
+                30,
+                45,
+                0.20,
+                0.30,
+                0.20,
+            ),
+            (
+                "aggr_stopcool3_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                3,
+                0,
+                30,
+                45,
+                0.20,
+                0.30,
+                0.20,
+            ),
+            (
+                "aggr_stopcool5_noriskcool_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                5,
+                0,
+                30,
+                45,
+                0.20,
+                0.30,
+                0.20,
+            ),
+            (
+                "aggr_stopcool10_riskcool30dd5_5d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                10,
+                5,
+                30,
+                45,
+                0.20,
+                0.30,
+                0.20,
+            ),
+            (
+                "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+                10,
+                20,
+                30,
+                45,
+                0.25,
+                0.35,
+                0.20,
+            ),
+            (
+                "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_35_credit20",
+                10,
+                20,
+                30,
+                45,
+                0.20,
+                0.35,
+                0.20,
+            ),
+            (
+                "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit15",
+                10,
+                20,
+                30,
+                45,
+                0.20,
+                0.30,
+                0.15,
+            ),
+            (
+                "aggr_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_dte21_35_delta20_30_credit20",
+                10,
+                20,
+                21,
+                35,
+                0.20,
+                0.30,
+                0.20,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.stop_loss_cooldown_days, stop_loss_cooldown_days);
+            assert_eq!(profile.min_dte, min_dte);
+            assert_eq!(profile.max_dte, max_dte);
+            assert_eq!(profile.min_short_delta_abs, min_delta);
+            assert_eq!(profile.max_short_delta_abs, max_delta);
+            assert_eq!(profile.min_credit_width, min_credit_width);
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.10));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(
+                profile.weak_trend_pullback_guard,
+                Some(WeakTrendPullbackGuard {
+                    max_underlying_return: 0.13,
+                    min_underlying_drawdown: 0.03,
+                    max_underlying_drawdown: 0.06,
+                })
+            );
+            if risk_cooldown_days > 0 {
+                assert_eq!(
+                    profile.risk_regime_cooldown_guard,
+                    Some(TrendDrawdownGuard {
+                        min_underlying_return: 0.30,
+                        max_underlying_drawdown: 0.05,
+                    })
+                );
+                assert_eq!(profile.risk_regime_cooldown_days, risk_cooldown_days);
+            } else {
+                assert_eq!(profile.risk_regime_cooldown_guard, None);
+                assert_eq!(profile.risk_regime_cooldown_days, 0);
+            }
         }
     }
 
