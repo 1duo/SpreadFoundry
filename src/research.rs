@@ -720,6 +720,9 @@ fn latest_signal_for_best_profile(
     to: NaiveDate,
 ) -> Option<ResearchSignal> {
     let best = profile_results.first()?;
+    if !deployable_training_profile(&best.metrics) {
+        return None;
+    }
     latest_signal_for_profile(best, rows_by_expiration, from, to)
 }
 
@@ -2532,7 +2535,7 @@ fn research_markdown(report: &ResearchReport) -> String {
     } else {
         out.push_str("## Latest Signal\n\n");
         out.push_str(
-            "- No current entry candidate for the best ranked profile inside this data window.\n\n",
+            "- No deployable current entry signal for the best ranked profile inside this data window.\n\n",
         );
     }
 
@@ -3449,6 +3452,24 @@ mod tests {
         assert_eq!(signal.long_put, 90.0);
         assert!((signal.entry_credit - 1.05).abs() < 1e-9);
         assert!((signal.max_loss - 395.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn latest_best_profile_signal_requires_deployable_metrics() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let expiration = entry_date + Duration::days(40);
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            expiration,
+            vec![
+                option_day(entry_date, 95.0, 1.20, 1.25, -0.25, 105.0),
+                option_day(entry_date, 90.0, 0.10, 0.15, -0.15, 105.0),
+            ],
+        );
+        let result = profile_result("baseline", Vec::new(), entry_date, entry_date);
+
+        assert!(latest_signal_for_profile(&result, &rows, entry_date, entry_date).is_some());
+        assert!(latest_signal_for_best_profile(&[result], &rows, entry_date, entry_date).is_none());
     }
 
     #[test]
