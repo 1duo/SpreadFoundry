@@ -4436,6 +4436,46 @@ fn research_markdown(report: &ResearchReport) -> String {
             format_exit_reasons(&best.metrics.exit_reasons)
         ));
 
+        out.push_str("\n## Best Profile Failure Anatomy\n\n");
+        let winning_trades = best
+            .trades
+            .iter()
+            .filter(|trade| trade.pnl > 0.0)
+            .collect::<Vec<_>>();
+        let losing_trades = best
+            .trades
+            .iter()
+            .filter(|trade| trade.pnl <= 0.0)
+            .collect::<Vec<_>>();
+        out.push_str("| Bucket | Trades | Avg PnL | Avg ROR | Avg OTM% | Avg Short IV | Avg Trend Ret | Avg Recent DD | Avg Credit |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        out.push_str(&trade_feature_summary_row("Winners", &winning_trades));
+        out.push_str(&trade_feature_summary_row("Losers", &losing_trades));
+
+        let mut worst_trades = losing_trades;
+        worst_trades.sort_by(|a, b| a.pnl.total_cmp(&b.pnl));
+        out.push_str("\n| Entry | Exit | Exp | Short | Long | OTM% | Short IV | Trend Ret | Recent DD | Credit | Exit Debit | PnL | ROR | Reason |\n");
+        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        for trade in worst_trades.iter().take(10) {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {:.1}% | {} | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
+                trade.entry_date,
+                trade.exit_date,
+                trade.expiration,
+                trade.short_put,
+                trade.long_put,
+                trade.short_otm_pct * 100.0,
+                trade.short_iv * 100.0,
+                format_optional_pct(trade.underlying_lookback_return),
+                format_optional_pct(trade.underlying_recent_drawdown),
+                trade.entry_credit,
+                trade.exit_debit,
+                trade.pnl,
+                trade.return_on_risk,
+                trade.exit_reason
+            ));
+        }
+
         out.push_str("\n## Best Profile Trades\n\n");
         out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Short IV | Trend Ret | Recent DD | Realized Vol | Credit | Exit Debit | PnL | ROR | Reason |\n");
         out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
@@ -4461,6 +4501,60 @@ fn research_markdown(report: &ResearchReport) -> String {
         }
     }
     out
+}
+
+fn trade_feature_summary_row(label: &str, trades: &[&ResearchTrade]) -> String {
+    format!(
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        label,
+        trades.len(),
+        format_optional_number(avg_trade_value(trades, |trade| Some(trade.pnl)), 2),
+        format_optional_number(
+            avg_trade_value(trades, |trade| Some(trade.return_on_risk)),
+            3
+        ),
+        format_optional_percent(
+            avg_trade_value(trades, |trade| Some(trade.short_otm_pct)),
+            1
+        ),
+        format_optional_percent(avg_trade_value(trades, |trade| Some(trade.short_iv)), 1),
+        format_optional_percent(
+            avg_trade_value(trades, |trade| trade.underlying_lookback_return),
+            1
+        ),
+        format_optional_percent(
+            avg_trade_value(trades, |trade| trade.underlying_recent_drawdown),
+            1
+        ),
+        format_optional_number(avg_trade_value(trades, |trade| Some(trade.entry_credit)), 2)
+    )
+}
+
+fn avg_trade_value<F>(trades: &[&ResearchTrade], value: F) -> Option<f64>
+where
+    F: Fn(&ResearchTrade) -> Option<f64>,
+{
+    let values = trades
+        .iter()
+        .filter_map(|trade| value(trade))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn format_optional_number(value: Option<f64>, precision: usize) -> String {
+    value
+        .map(|value| format!("{value:.precision$}"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_optional_percent(value: Option<f64>, precision: usize) -> String {
+    value
+        .map(|value| format!("{:.precision$}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 fn format_optional_pct(value: Option<f64>) -> String {
@@ -5102,6 +5196,9 @@ mod tests {
         assert!(markdown.contains("## Detector Robustness Gap"));
         assert!(markdown.contains("Required deployable robust score"));
         assert!(markdown.contains("Weakest chronological period"));
+        assert!(markdown.contains("## Best Profile Failure Anatomy"));
+        assert!(markdown.contains("| Winners |"));
+        assert!(markdown.contains("| Losers |"));
         assert!(markdown.contains("Inactive walk-forward years from weak train edge: `0`"));
         assert!(markdown.contains("Holdout active: `yes`"));
         assert!(markdown.contains("Requested window: `2012-01-01` to `2022-12-31`"));
