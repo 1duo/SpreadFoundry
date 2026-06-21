@@ -126,8 +126,22 @@ pub struct ResearchMetrics {
     pub required_trades: usize,
     pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
+    pub annual_stability: AnnualStabilityMetrics,
     pub chronological: Vec<PeriodMetrics>,
     pub cost_stress: Vec<CostStressMetrics>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnualStabilityMetrics {
+    pub active_years: usize,
+    pub positive_years: usize,
+    pub negative_years: usize,
+    pub positive_year_rate: f64,
+    pub worst_year: Option<i32>,
+    pub worst_year_pnl: f64,
+    pub worst_year_avg_return_on_risk: f64,
+    pub best_year: Option<i32>,
+    pub best_year_pnl: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1438,6 +1452,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             required_trades,
             exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
+            annual_stability: annual_stability_metrics(&BTreeMap::new()),
             chronological: chronological_period_metrics(&[], from, to),
             cost_stress: cost_stress_metrics(&[]),
         };
@@ -1481,6 +1496,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
     let robust_score = robust_score(score, &chronological);
     let robust_ranking_eligible =
         robust_ranking_eligible(ranking_eligible, total_pnl, &chronological);
+    let yearly = yearly_metrics(&sorted);
+    let annual_stability = annual_stability_metrics(&yearly);
     ResearchMetrics {
         trades: sorted.len(),
         total_pnl,
@@ -1513,7 +1530,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         robust_ranking_eligible,
         required_trades,
         exit_reasons: exit_reasons(&sorted),
-        yearly: yearly_metrics(&sorted),
+        yearly,
+        annual_stability,
         chronological,
         cost_stress: cost_stress_metrics(&sorted),
     }
@@ -1784,6 +1802,45 @@ fn yearly_metrics(trades: &[ResearchTrade]) -> BTreeMap<i32, YearMetrics> {
         .collect()
 }
 
+fn annual_stability_metrics(yearly: &BTreeMap<i32, YearMetrics>) -> AnnualStabilityMetrics {
+    if yearly.is_empty() {
+        return AnnualStabilityMetrics {
+            active_years: 0,
+            positive_years: 0,
+            negative_years: 0,
+            positive_year_rate: 0.0,
+            worst_year: None,
+            worst_year_pnl: 0.0,
+            worst_year_avg_return_on_risk: 0.0,
+            best_year: None,
+            best_year_pnl: 0.0,
+        };
+    }
+
+    let positive_years = yearly.values().filter(|year| year.pnl > 0.0).count();
+    let negative_years = yearly.values().filter(|year| year.pnl < 0.0).count();
+    let (worst_year, worst_metrics) = yearly
+        .iter()
+        .min_by(|(_, a), (_, b)| a.pnl.total_cmp(&b.pnl))
+        .expect("non-empty yearly metrics");
+    let (best_year, best_metrics) = yearly
+        .iter()
+        .max_by(|(_, a), (_, b)| a.pnl.total_cmp(&b.pnl))
+        .expect("non-empty yearly metrics");
+
+    AnnualStabilityMetrics {
+        active_years: yearly.len(),
+        positive_years,
+        negative_years,
+        positive_year_rate: positive_years as f64 / yearly.len() as f64,
+        worst_year: Some(*worst_year),
+        worst_year_pnl: worst_metrics.pnl,
+        worst_year_avg_return_on_risk: worst_metrics.avg_return_on_risk,
+        best_year: Some(*best_year),
+        best_year_pnl: best_metrics.pnl,
+    }
+}
+
 fn exit_reasons(trades: &[ResearchTrade]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for trade in trades {
@@ -1832,14 +1889,15 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
-    out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
+    out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Positive Years | Worst Year | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
     out.push_str(
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
     );
     for (idx, result) in report.profiles.iter().enumerate() {
         let m = &result.metrics;
+        let annual = &m.annual_stability;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} | {:.4} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {}/{} ({:.1}%) | {} | {:.1} | {:.1} | {:.1} | {:.4} | {:.4} |\n",
             idx + 1,
             result.profile.name,
             if m.ranking_eligible { "yes" } else { "no" },
@@ -1855,6 +1913,10 @@ fn research_markdown(report: &ResearchReport) -> String {
             m.win_rate * 100.0,
             m.profit_factor,
             m.max_drawdown,
+            annual.positive_years,
+            annual.active_years,
+            annual.positive_year_rate * 100.0,
+            format_optional_year_pnl(annual.worst_year, annual.worst_year_pnl),
             m.avg_entry_dte,
             m.avg_days_held,
             m.trades_per_year,
@@ -1955,6 +2017,11 @@ fn research_markdown(report: &ResearchReport) -> String {
 fn format_optional_pct(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_optional_year_pnl(year: Option<i32>, pnl: f64) -> String {
+    year.map(|year| format!("{year} ({pnl:.2})"))
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
@@ -2162,6 +2229,51 @@ mod tests {
         assert_eq!(stress.total_pnl, 5.0);
         assert_eq!(stress.win_rate, 0.5);
         assert!(stress.profit_factor > 0.0);
+    }
+
+    #[test]
+    fn annual_stability_tracks_positive_and_worst_years() {
+        let yearly = BTreeMap::from([
+            (
+                2020,
+                YearMetrics {
+                    trades: 3,
+                    pnl: 120.0,
+                    win_rate: 1.0,
+                    avg_return_on_risk: 0.10,
+                },
+            ),
+            (
+                2021,
+                YearMetrics {
+                    trades: 2,
+                    pnl: -40.0,
+                    win_rate: 0.5,
+                    avg_return_on_risk: -0.05,
+                },
+            ),
+            (
+                2022,
+                YearMetrics {
+                    trades: 1,
+                    pnl: 0.0,
+                    win_rate: 0.0,
+                    avg_return_on_risk: 0.0,
+                },
+            ),
+        ]);
+
+        let stability = annual_stability_metrics(&yearly);
+
+        assert_eq!(stability.active_years, 3);
+        assert_eq!(stability.positive_years, 1);
+        assert_eq!(stability.negative_years, 1);
+        assert_eq!(stability.positive_year_rate, 1.0 / 3.0);
+        assert_eq!(stability.worst_year, Some(2021));
+        assert_eq!(stability.worst_year_pnl, -40.0);
+        assert_eq!(stability.worst_year_avg_return_on_risk, -0.05);
+        assert_eq!(stability.best_year, Some(2020));
+        assert_eq!(stability.best_year_pnl, 120.0);
     }
 
     #[test]
