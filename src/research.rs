@@ -2347,7 +2347,7 @@ fn research_markdown(report: &ResearchReport) -> String {
     } else {
         out.push_str("## Latest Signal\n\n");
         out.push_str(
-            "- No open-as-of signal for the best ranked profile inside this data window.\n\n",
+            "- No current entry candidate for the best ranked profile inside this data window.\n\n",
         );
     }
 
