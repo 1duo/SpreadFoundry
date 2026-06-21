@@ -97,6 +97,7 @@ pub struct ResearchReport {
     pub expirations_loaded: usize,
     pub rows_loaded: usize,
     pub walk_forward: WalkForwardResult,
+    pub holdout: HoldoutResult,
     pub profiles: Vec<ProfileResult>,
 }
 
@@ -138,6 +139,19 @@ pub struct WalkForwardTrainMetrics {
     pub robust_score: f64,
     pub ranking_eligible: bool,
     pub robust_ranking_eligible: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HoldoutResult {
+    pub train_from: NaiveDate,
+    pub train_to: NaiveDate,
+    pub test_from: NaiveDate,
+    pub test_to: NaiveDate,
+    pub active: bool,
+    pub selected_profile: String,
+    pub train_metrics: WalkForwardTrainMetrics,
+    pub trades: Vec<ResearchTrade>,
+    pub metrics: ResearchMetrics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -365,6 +379,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         });
     }
     let walk_forward = walk_forward(&profile_results, request.from, request.to);
+    let holdout = holdout(&profile_results, request.from, request.to);
     profile_results.sort_by(profile_result_order);
 
     let report = ResearchReport {
@@ -376,6 +391,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         expirations_loaded: rows_by_expiration.len(),
         rows_loaded,
         walk_forward,
+        holdout,
         profiles: profile_results,
     };
 
@@ -491,6 +507,48 @@ fn walk_forward(
         years,
         selected_profile_counts,
         metrics: metrics(&trades, metrics_from, to),
+        trades,
+    }
+}
+
+fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) -> HoldoutResult {
+    let days = (to - from).num_days();
+    let train_to = if days >= 2 {
+        from + Duration::days(days / 2)
+    } else {
+        from
+    };
+    let test_from = (train_to + Duration::days(1)).min(to);
+    let Some(selection) = select_walk_forward_profile(profile_results, from, train_to) else {
+        return HoldoutResult {
+            train_from: from,
+            train_to,
+            test_from,
+            test_to: to,
+            active: false,
+            selected_profile: String::new(),
+            train_metrics: train_metrics_summary(&metrics(&[], from, train_to)),
+            trades: Vec::new(),
+            metrics: metrics(&[], test_from, to),
+        };
+    };
+
+    let active = selection.metrics.robust_ranking_eligible;
+    let mut trades = if active {
+        filter_trades_by_entry_date(&selection.result.trades, test_from, to)
+    } else {
+        Vec::new()
+    };
+    trades.sort_by(trade_chronological_order);
+    HoldoutResult {
+        train_from: from,
+        train_to,
+        test_from,
+        test_to: to,
+        active,
+        selected_profile: selection.result.profile.name.clone(),
+        train_metrics: train_metrics_summary(&selection.metrics),
+        metrics: metrics(&trades, test_from, to),
         trades,
     }
 }
@@ -2193,6 +2251,32 @@ fn research_markdown(report: &ResearchReport) -> String {
     }
     out.push('\n');
 
+    let holdout = &report.holdout;
+    out.push_str("## Half-Window Holdout Selector\n\n");
+    out.push_str(&format!(
+        "- Train window: `{}` to `{}`\n- Test window: `{}` to `{}`\n- Active: `{}`\n- Selected profile: `{}`\n- Train robust eligible: `{}`\n- Train trades: `{}`\n- Train PnL: `{:.2}`\n- Train robust score: `{:.4}`\n- Test trades: `{}`\n- Test PnL: `{:.2}`\n- Test win rate: `{:.1}%`\n- Test profit factor: `{:.2}`\n- Test max DD: `{:.3}`\n- Test score: `{:.4}`\n\n",
+        holdout.train_from,
+        holdout.train_to,
+        holdout.test_from,
+        holdout.test_to,
+        if holdout.active { "yes" } else { "no" },
+        holdout.selected_profile,
+        if holdout.train_metrics.robust_ranking_eligible {
+            "yes"
+        } else {
+            "no"
+        },
+        holdout.train_metrics.trades,
+        holdout.train_metrics.total_pnl,
+        holdout.train_metrics.robust_score,
+        holdout.metrics.trades,
+        holdout.metrics.total_pnl,
+        holdout.metrics.win_rate * 100.0,
+        holdout.metrics.profit_factor,
+        holdout.metrics.max_drawdown,
+        holdout.metrics.score
+    ));
+
     out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Positive Years | Worst Year | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
     out.push_str(
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
@@ -2814,6 +2898,36 @@ mod tests {
         assert!(!result.years[0].train_metrics.robust_ranking_eligible);
         assert_eq!(result.years[0].test_metrics.trades, 0);
         assert!(result.trades.is_empty());
+    }
+
+    #[test]
+    fn holdout_selects_profile_from_training_window_only() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let mut better_train = training_trades(50.0);
+        better_train.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 8).unwrap(),
+            40.0,
+        ));
+        let mut worse_train = training_trades(1.0);
+        worse_train.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 8).unwrap(),
+            400.0,
+        ));
+        let results = vec![
+            profile_result("better_train", better_train, from, to),
+            profile_result("worse_train", worse_train, from, to),
+        ];
+
+        let result = holdout(&results, from, to);
+
+        assert!(result.active);
+        assert_eq!(result.selected_profile, "better_train");
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.metrics.total_pnl, 40.0);
+        assert!(result.train_metrics.robust_ranking_eligible);
     }
 
     #[test]
