@@ -3911,6 +3911,42 @@ fn research_markdown(report: &ResearchReport) -> String {
         out.push('\n');
     }
 
+    let inactive_train_edge_years = report
+        .walk_forward
+        .years
+        .iter()
+        .filter(|year| !year.active && !year.train_metrics.robust_score_gate)
+        .count();
+    let inactive_recent_activity_years = report
+        .walk_forward
+        .years
+        .iter()
+        .filter(|year| !year.active && !year.train_metrics.recent_activity_gate)
+        .count();
+    let active_zero_trade_years = report
+        .walk_forward
+        .years
+        .iter()
+        .filter(|year| year.active && year.test_metrics.trades == 0)
+        .count();
+    let active_negative_pnl_years = report
+        .walk_forward
+        .years
+        .iter()
+        .filter(|year| year.active && year.test_metrics.total_pnl < 0.0)
+        .count();
+    out.push_str("## Out-of-Sample Failure Summary\n\n");
+    out.push_str(&format!(
+        "- Inactive walk-forward years from weak train edge: `{}`\n- Inactive walk-forward years from stale train activity: `{}`\n- Active walk-forward years with zero OOS trades: `{}`\n- Active walk-forward years with negative OOS PnL: `{}`\n- Holdout active: `{}`\n- Holdout train edge gate: `{}`\n- Holdout recent activity gate: `{}`\n\n",
+        inactive_train_edge_years,
+        inactive_recent_activity_years,
+        active_zero_trade_years,
+        active_negative_pnl_years,
+        if report.holdout.active { "yes" } else { "no" },
+        format_gate(report.holdout.train_metrics.robust_score_gate),
+        format_gate(report.holdout.train_metrics.recent_activity_gate)
+    ));
+
     if let Some(best) = report.profiles.first() {
         let baseline_name = ResearchProfile::baseline().name;
         if let Some(baseline) = report
@@ -4999,6 +5035,9 @@ mod tests {
         let markdown = research_markdown(&report);
 
         assert!(markdown.contains("## Research Deployment Gate"));
+        assert!(markdown.contains("## Out-of-Sample Failure Summary"));
+        assert!(markdown.contains("Inactive walk-forward years from weak train edge: `0`"));
+        assert!(markdown.contains("Holdout active: `yes`"));
         assert!(markdown.contains("Requested window: `2012-01-01` to `2022-12-31`"));
         assert!(markdown.contains("Effective research window: `2020-01-01` to `2022-12-31`"));
         assert!(markdown.contains("Expirations skipped before data: `2`"));
