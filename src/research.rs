@@ -586,6 +586,32 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_trend60_min5_ivcap45_width15.max_width = 15.0;
     profiles.push(otm_cooldown_trend60_min5_ivcap45_width15);
 
+    let mut otm_cooldown_trend60_min5_ivcap45_width15_stop175 = baseline.clone();
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.name =
+        "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_stop175_delta20_30_credit20"
+            .to_owned();
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.prefer_farther_otm = true;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.min_underlying_return = Some(0.05);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.max_short_iv = Some(0.45);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.max_width = 15.0;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop175.stop_loss_multiple = 1.75;
+    profiles.push(otm_cooldown_trend60_min5_ivcap45_width15_stop175);
+
+    let mut otm_cooldown_trend60_min5_ivcap45_width15_stop150 = baseline.clone();
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.name =
+        "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_stop150_delta20_30_credit20"
+            .to_owned();
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.prefer_farther_otm = true;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.min_underlying_return = Some(0.05);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.max_short_iv = Some(0.45);
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.max_width = 15.0;
+    otm_cooldown_trend60_min5_ivcap45_width15_stop150.stop_loss_multiple = 1.50;
+    profiles.push(otm_cooldown_trend60_min5_ivcap45_width15_stop150);
+
     let mut otm_cooldown_trend60_min5_ivcap45_width10 = baseline.clone();
     otm_cooldown_trend60_min5_ivcap45_width10.name =
         "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width10_delta20_30_credit20"
