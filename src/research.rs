@@ -121,6 +121,23 @@ pub struct ResearchMetrics {
     pub required_trades: usize,
     pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
+    pub chronological: Vec<PeriodMetrics>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeriodMetrics {
+    pub name: String,
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub trades: usize,
+    pub total_pnl: f64,
+    pub avg_return_on_risk: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub max_drawdown: f64,
+    pub score: f64,
+    pub ranking_eligible: bool,
+    pub required_trades: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1346,6 +1363,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             required_trades,
             exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
+            chronological: chronological_period_metrics(&[], from, to),
         };
     }
     let mut sorted = trades.to_vec();
@@ -1414,6 +1432,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         required_trades,
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
+        chronological: chronological_period_metrics(&sorted, from, to),
     }
 }
 
@@ -1451,6 +1470,106 @@ fn max_drawdown(trades: &[ResearchTrade]) -> f64 {
         }
     }
     drawdown / risk
+}
+
+fn chronological_period_metrics(
+    trades: &[ResearchTrade],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<PeriodMetrics> {
+    let days = (to - from).num_days();
+    if days < 2 {
+        return vec![period_metrics("full_window", trades, from, to)];
+    }
+    let split = from + Duration::days(days / 2);
+    let periods = [
+        ("first_half", from, split),
+        ("second_half", split + Duration::days(1), to),
+    ];
+
+    periods
+        .into_iter()
+        .filter(|(_, start, end)| start <= end)
+        .map(|(name, start, end)| {
+            let period_trades = trades
+                .iter()
+                .filter(|trade| trade.entry_date >= start && trade.entry_date <= end)
+                .cloned()
+                .collect::<Vec<_>>();
+            period_metrics(name, &period_trades, start, end)
+        })
+        .collect()
+}
+
+fn period_metrics(
+    name: &str,
+    trades: &[ResearchTrade],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> PeriodMetrics {
+    let mut sorted = trades.to_vec();
+    sorted.sort_by(trade_chronological_order);
+    let required_trades = required_trades_for_ranking(from, to);
+    if sorted.is_empty() {
+        return PeriodMetrics {
+            name: name.to_owned(),
+            from,
+            to,
+            trades: 0,
+            total_pnl: 0.0,
+            avg_return_on_risk: 0.0,
+            win_rate: 0.0,
+            profit_factor: 0.0,
+            max_drawdown: 0.0,
+            score: -1_000_000.0,
+            ranking_eligible: false,
+            required_trades,
+        };
+    }
+
+    let total_pnl = sorted.iter().map(|trade| trade.pnl).sum::<f64>();
+    let total_max_loss = sorted.iter().map(|trade| trade.max_loss).sum::<f64>();
+    let wins = sorted.iter().filter(|trade| trade.pnl > 0.0).count();
+    let gross_profit = sorted
+        .iter()
+        .filter(|trade| trade.pnl > 0.0)
+        .map(|trade| trade.pnl)
+        .sum::<f64>();
+    let gross_loss = sorted
+        .iter()
+        .filter(|trade| trade.pnl < 0.0)
+        .map(|trade| trade.pnl.abs())
+        .sum::<f64>();
+    let returns = sorted
+        .iter()
+        .map(|trade| trade.return_on_risk)
+        .collect::<Vec<_>>();
+    let max_drawdown = max_drawdown(&sorted);
+    let ranking_eligible = sorted.len() >= required_trades;
+    let score = if ranking_eligible {
+        total_pnl / total_max_loss.max(1.0) - 2.0 * max_drawdown
+    } else {
+        -1_000_000.0 + sorted.len() as f64 / required_trades as f64
+    };
+
+    PeriodMetrics {
+        name: name.to_owned(),
+        from,
+        to,
+        trades: sorted.len(),
+        total_pnl,
+        avg_return_on_risk: mean(&returns),
+        win_rate: wins as f64 / sorted.len() as f64,
+        profit_factor: if gross_loss == 0.0 {
+            gross_profit
+        } else {
+            gross_profit / gross_loss
+        },
+        max_drawdown,
+        score,
+        ranking_eligible,
+        required_trades,
+    }
 }
 
 fn yearly_metrics(trades: &[ResearchTrade]) -> BTreeMap<i32, YearMetrics> {
@@ -1550,6 +1669,28 @@ fn research_markdown(report: &ResearchReport) -> String {
             m.trades_per_year,
             m.score
         ));
+    }
+    out.push_str("\n## Chronological Robustness\n\n");
+    out.push_str("| Profile | Period | Window | Eligible | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Score |\n");
+    out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for result in report.profiles.iter().take(10) {
+        for period in &result.metrics.chronological {
+            out.push_str(&format!(
+                "| {} | {} | {} to {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} |\n",
+                result.profile.name,
+                period.name,
+                period.from,
+                period.to,
+                if period.ranking_eligible { "yes" } else { "no" },
+                period.trades,
+                period.total_pnl,
+                period.avg_return_on_risk,
+                period.win_rate * 100.0,
+                period.profit_factor,
+                period.max_drawdown,
+                period.score
+            ));
+        }
     }
     if let Some(best) = report.profiles.first() {
         out.push_str("\n## Best Profile Yearly\n\n");
@@ -1726,6 +1867,32 @@ mod tests {
     }
 
     #[test]
+    fn chronological_period_metrics_split_by_entry_date() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2021, 12, 31).unwrap();
+        let early = trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2020, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2020, 2, 10).unwrap(),
+            75.0,
+        );
+        let late = trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2021, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2021, 8, 10).unwrap(),
+            -25.0,
+        );
+
+        let periods = chronological_period_metrics(&[late, early], from, to);
+
+        assert_eq!(periods.len(), 2);
+        assert_eq!(periods[0].name, "first_half");
+        assert_eq!(periods[0].trades, 1);
+        assert_eq!(periods[0].total_pnl, 75.0);
+        assert_eq!(periods[1].name, "second_half");
+        assert_eq!(periods[1].trades, 1);
+        assert_eq!(periods[1].total_pnl, -25.0);
+    }
+
+    #[test]
     fn iv_filter_rejects_short_leg_above_cap() {
         let mut profile = ResearchProfile::baseline();
         profile.max_short_iv = Some(0.8);
@@ -1853,6 +2020,21 @@ mod tests {
             next_entry_date_after_trade(&trade_with_exit(exit_date, "take_profit"), &profile),
             NaiveDate::from_ymd_opt(2026, 1, 21).unwrap()
         );
+    }
+
+    fn trade_with_entry_exit(
+        entry_date: NaiveDate,
+        exit_date: NaiveDate,
+        pnl: f64,
+    ) -> ResearchTrade {
+        let max_loss = 400.0;
+        let mut trade = trade_with_exit(exit_date, "period_test");
+        trade.entry_date = entry_date;
+        trade.days_held = (exit_date - entry_date).num_days();
+        trade.pnl = pnl;
+        trade.return_on_risk = pnl / max_loss;
+        trade.max_loss = max_loss;
+        trade
     }
 
     fn trade_with_exit(exit_date: NaiveDate, exit_reason: &str) -> ResearchTrade {
