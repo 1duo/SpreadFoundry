@@ -1145,7 +1145,9 @@ fn walk_forward_with_mode(
         if ranked_selections.is_empty() {
             continue;
         }
-        let selection = &ranked_selections[0];
+        let selection_idx = selected_walk_forward_profile_index(&ranked_selections, train_to)
+            .expect("ranked_selections is non-empty");
+        let selection = &ranked_selections[selection_idx];
 
         let active = deployable_training_selection(selection, train_to);
         let mut accepted = Vec::new();
@@ -1384,9 +1386,24 @@ fn select_walk_forward_profile<'a>(
     train_from: NaiveDate,
     train_to: NaiveDate,
 ) -> Option<WalkForwardSelection<'a>> {
-    rank_walk_forward_profiles(profile_results, train_from, train_to)
-        .into_iter()
-        .next()
+    let mut ranked_selections = rank_walk_forward_profiles(profile_results, train_from, train_to);
+    let selection_idx = selected_walk_forward_profile_index(&ranked_selections, train_to)?;
+    Some(ranked_selections.remove(selection_idx))
+}
+
+fn selected_walk_forward_profile_index(
+    ranked_selections: &[WalkForwardSelection<'_>],
+    train_to: NaiveDate,
+) -> Option<usize> {
+    if ranked_selections.is_empty() {
+        return None;
+    }
+    Some(
+        ranked_selections
+            .iter()
+            .position(|selection| deployable_training_selection(selection, train_to))
+            .unwrap_or(0),
+    )
 }
 
 fn rank_walk_forward_profiles<'a>(
@@ -6444,6 +6461,40 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap())
         );
         assert_eq!(stale_year.test_metrics.trades, 0);
+    }
+
+    #[test]
+    fn walk_forward_selects_best_deployable_profile_over_stale_top_rank() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let stale_high_score = training_trades(100.0);
+        let mut deployable_lower_score = training_trades(40.0);
+        deployable_lower_score.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        deployable_lower_score.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            80.0,
+        ));
+        let results = vec![
+            profile_result("stale_high_score", stale_high_score, from, to),
+            profile_result("deployable_lower_score", deployable_lower_score, from, to),
+        ];
+
+        let result = walk_forward(&results, from, to);
+        let test_year = result
+            .years
+            .iter()
+            .find(|year| year.test_year == 2024)
+            .unwrap();
+
+        assert!(test_year.active);
+        assert_eq!(test_year.selected_profile, "deployable_lower_score");
+        assert_eq!(test_year.test_metrics.trades, 1);
+        assert_eq!(test_year.test_metrics.total_pnl, 80.0);
     }
 
     #[test]
