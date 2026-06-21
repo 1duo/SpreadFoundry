@@ -807,6 +807,32 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_trend60_min5_ivcap45_width15.max_width = 15.0;
     profiles.push(otm_cooldown_trend60_min5_ivcap45_width15);
 
+    for (name, min_short_delta_abs) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta23_30_credit20",
+            0.23,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta24_30_credit20",
+            0.24,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta26_30_credit20",
+            0.26,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.min_short_delta_abs = min_short_delta_abs;
+        profiles.push(profile);
+    }
+
     for (name, max_short_iv) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_ivcap42_width15_delta20_30_credit20",
@@ -2597,6 +2623,38 @@ mod tests {
         }
         assert_eq!(iv42.max_short_iv, Some(0.42));
         assert_eq!(iv40.max_short_iv, Some(0.40));
+    }
+
+    #[test]
+    fn higher_delta_floor_profiles_keep_current_best_entry_gates() {
+        let profiles = research_profiles();
+        for (name, min_delta) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta23_30_credit20",
+                0.23,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta24_30_credit20",
+                0.24,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_delta26_30_credit20",
+                0.26,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.min_short_delta_abs, min_delta);
+            assert_eq!(profile.max_short_delta_abs, 0.30);
+        }
     }
 
     #[test]
