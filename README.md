@@ -26,7 +26,7 @@ cargo run -- research-universe --plateau-run runs/<nvda-run>/research.json --fro
 `research-universe` is plateau-gated when `--plateau-run` is supplied. Its default expansion seed is five liquid non-NVDA single stocks for put credit spread research:
 
 ```text
-TSLA,AAPL,AMD,AMZN,MSFT
+TSLA,AMD,META,AMZN,AAPL
 ```
 
 Each universe artifact includes the seed rationale plus separate detector and execution strategy summaries per symbol.
