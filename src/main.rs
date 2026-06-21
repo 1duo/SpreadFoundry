@@ -182,6 +182,17 @@ struct UniverseSymbolSummary {
     latest_signal_status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PlateauRunGate {
+    plateau_status: PlateauRunStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlateauRunStatus {
+    status: String,
+    expansion_ready: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -466,12 +477,12 @@ async fn research_universe(
 
     let plateau_run = if let Some(path) = plateau_run {
         let report_path = research_report_path(&path);
-        let report = read_research_report(&report_path)?;
-        if !report.plateau_status.expansion_ready {
+        let plateau_status = read_plateau_run_gate(&report_path)?;
+        if !plateau_status.expansion_ready {
             anyhow::bail!(
                 "plateau run {} is not expansion-ready; status={}",
                 report_path.display(),
-                report.plateau_status.status
+                plateau_status.status
             );
         }
         Some(report_path)
@@ -540,9 +551,14 @@ fn research_report_path(path: &Path) -> PathBuf {
     }
 }
 
-fn read_research_report(path: &Path) -> Result<ResearchReport> {
+fn read_plateau_run_gate(path: &Path) -> Result<PlateauRunStatus> {
     let body = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))
+    parse_plateau_run_gate(&body).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn parse_plateau_run_gate(body: &str) -> Result<PlateauRunStatus> {
+    let gate: PlateauRunGate = serde_json::from_str(body)?;
+    Ok(gate.plateau_status)
 }
 
 fn universe_symbol_summary(report: &ResearchReport) -> UniverseSymbolSummary {
@@ -674,5 +690,16 @@ mod tests {
             ]),
             vec!["TSLA".to_owned(), "AAPL".to_owned()]
         );
+    }
+
+    #[test]
+    fn plateau_gate_parses_minimal_research_json() {
+        let status = parse_plateau_run_gate(
+            r#"{"plateau_status":{"status":"plateau_expand_universe","expansion_ready":true}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.status, "plateau_expand_universe");
+        assert!(status.expansion_ready);
     }
 }
