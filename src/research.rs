@@ -119,6 +119,7 @@ pub struct ResearchMetrics {
     pub score: f64,
     pub robust_score: f64,
     pub ranking_eligible: bool,
+    pub robust_ranking_eligible: bool,
     pub required_trades: usize,
     pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
@@ -297,8 +298,9 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     }
     profile_results.sort_by(|a, b| {
         b.metrics
-            .robust_score
-            .total_cmp(&a.metrics.robust_score)
+            .robust_ranking_eligible
+            .cmp(&a.metrics.robust_ranking_eligible)
+            .then_with(|| b.metrics.robust_score.total_cmp(&a.metrics.robust_score))
             .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
             .then_with(|| a.profile.name.cmp(&b.profile.name))
     });
@@ -1363,6 +1365,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             score: -1_000_000.0,
             robust_score: -1_000_000.0,
             ranking_eligible: false,
+            robust_ranking_eligible: false,
             required_trades,
             exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
@@ -1406,6 +1409,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
     };
     let chronological = chronological_period_metrics(&sorted, from, to);
     let robust_score = robust_score(score, &chronological);
+    let robust_ranking_eligible =
+        robust_ranking_eligible(ranking_eligible, total_pnl, &chronological);
     ResearchMetrics {
         trades: sorted.len(),
         total_pnl,
@@ -1435,6 +1440,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         score,
         robust_score,
         ranking_eligible,
+        robust_ranking_eligible,
         required_trades,
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
@@ -1483,6 +1489,18 @@ fn robust_score(score: f64, periods: &[PeriodMetrics]) -> f64 {
         .iter()
         .map(|period| period.score)
         .fold(score, f64::min)
+}
+
+fn robust_ranking_eligible(
+    ranking_eligible: bool,
+    total_pnl: f64,
+    periods: &[PeriodMetrics],
+) -> bool {
+    ranking_eligible
+        && total_pnl > 0.0
+        && periods
+            .iter()
+            .all(|period| period.ranking_eligible && period.total_pnl > 0.0)
 }
 
 fn chronological_period_metrics(
@@ -1661,15 +1679,22 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
-    out.push_str("| Rank | Profile | Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
-    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
+    out.push_str(
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    );
     for (idx, result) in report.profiles.iter().enumerate() {
         let m = &result.metrics;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} | {:.4} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} | {:.4} |\n",
             idx + 1,
             result.profile.name,
             if m.ranking_eligible { "yes" } else { "no" },
+            if m.robust_ranking_eligible {
+                "yes"
+            } else {
+                "no"
+            },
             result.candidates,
             m.trades,
             m.total_pnl,
@@ -1917,6 +1942,29 @@ mod tests {
 
         assert_eq!(robust_score(0.04, &periods), -0.05);
         assert_eq!(robust_score(-0.10, &periods), -0.10);
+    }
+
+    #[test]
+    fn robust_ranking_requires_positive_eligible_periods() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2020, 12, 31).unwrap();
+        let mut periods = vec![
+            test_period_metrics("first_half", from, to, 0.12),
+            test_period_metrics("second_half", from, to, -0.05),
+        ];
+        periods[0].total_pnl = 50.0;
+        periods[1].total_pnl = 25.0;
+
+        assert!(robust_ranking_eligible(true, 75.0, &periods));
+
+        periods[1].total_pnl = -25.0;
+        assert!(!robust_ranking_eligible(true, 25.0, &periods));
+
+        periods[1].total_pnl = 25.0;
+        periods[1].ranking_eligible = false;
+        assert!(!robust_ranking_eligible(true, 75.0, &periods));
+        assert!(!robust_ranking_eligible(false, 75.0, &periods));
+        assert!(!robust_ranking_eligible(true, -1.0, &periods));
     }
 
     #[test]
