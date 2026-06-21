@@ -162,6 +162,7 @@ pub struct ResearchReport {
     pub walk_forward: WalkForwardResult,
     pub rolling_walk_forward: WalkForwardResult,
     pub holdout: HoldoutResult,
+    pub fixed_profile_walk_forward: Vec<FixedProfileWalkForwardResult>,
     pub profiles: Vec<ProfileResult>,
 }
 
@@ -289,6 +290,29 @@ pub struct HoldoutResult {
     pub train_metrics: WalkForwardTrainMetrics,
     pub trades: Vec<ResearchTrade>,
     pub metrics: ResearchMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FixedProfileWalkForwardResult {
+    pub profile: ResearchProfile,
+    pub detector_strategy: DetectorStrategySummary,
+    pub execution_strategy: ExecutionStrategySummary,
+    pub active_years: usize,
+    pub years: Vec<FixedProfileWalkForwardYear>,
+    pub trades: Vec<ResearchTrade>,
+    pub metrics: ResearchMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FixedProfileWalkForwardYear {
+    pub test_year: i32,
+    pub train_from: NaiveDate,
+    pub train_to: NaiveDate,
+    pub test_from: NaiveDate,
+    pub test_to: NaiveDate,
+    pub active: bool,
+    pub train_metrics: WalkForwardTrainMetrics,
+    pub test_metrics: PeriodMetrics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -571,6 +595,8 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     let walk_forward = walk_forward(&profile_results, request.from, request.to);
     let rolling_walk_forward = rolling_walk_forward(&profile_results, request.from, request.to);
     let holdout = holdout(&profile_results, request.from, request.to);
+    let fixed_profile_walk_forward =
+        fixed_profile_walk_forward(&profile_results, request.from, request.to);
     profile_results.sort_by(profile_result_order);
     let latest_signal = latest_signal_for_best_profile(
         &profile_results,
@@ -596,6 +622,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         walk_forward,
         rolling_walk_forward,
         holdout,
+        fixed_profile_walk_forward,
         profiles: profile_results,
     };
 
@@ -1059,6 +1086,111 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
         metrics: metrics(&trades, test_from, to),
         trades,
     }
+}
+
+fn fixed_profile_walk_forward(
+    profile_results: &[ProfileResult],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<FixedProfileWalkForwardResult> {
+    let mut results = profile_results
+        .iter()
+        .map(|result| fixed_profile_walk_forward_for_profile(result, from, to))
+        .collect::<Vec<_>>();
+    results.sort_by(fixed_profile_walk_forward_result_order);
+    results
+}
+
+fn fixed_profile_walk_forward_for_profile(
+    result: &ProfileResult,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> FixedProfileWalkForwardResult {
+    let mut years = Vec::new();
+    let mut trades = Vec::new();
+    let mut next_entry_date = NaiveDate::MIN;
+
+    for test_year in from.year()..=to.year() {
+        let test_from = from.max(NaiveDate::from_ymd_opt(test_year, 1, 1).unwrap());
+        let test_to = to.min(NaiveDate::from_ymd_opt(test_year, 12, 31).unwrap());
+        if test_from > test_to {
+            continue;
+        }
+
+        let train_to = test_from - Duration::days(1);
+        if train_to < from || (train_to - from).num_days() < WALK_FORWARD_MIN_TRAIN_DAYS {
+            continue;
+        }
+        let train_from = from;
+        let train_trades = filter_closed_trades_by_entry_date(&result.trades, train_from, train_to);
+        let train_metrics = metrics(&train_trades, train_from, train_to);
+        let selection = WalkForwardSelection {
+            result,
+            train_trades,
+            metrics: train_metrics,
+        };
+        let active = deployable_training_selection(&selection, train_to);
+        let mut accepted = Vec::new();
+        if active {
+            let mut test_trades = filter_trades_by_entry_date(&result.trades, test_from, test_to);
+            test_trades.sort_by(trade_chronological_order);
+
+            for trade in test_trades {
+                if trade.entry_date < next_entry_date {
+                    continue;
+                }
+                next_entry_date = next_entry_date_after_trade(&trade, &result.profile);
+                accepted.push(trade);
+            }
+        }
+
+        trades.extend(accepted.iter().cloned());
+        years.push(FixedProfileWalkForwardYear {
+            test_year,
+            train_from,
+            train_to,
+            test_from,
+            test_to,
+            active,
+            train_metrics: train_metrics_summary(
+                &selection.metrics,
+                &selection.train_trades,
+                train_to,
+            ),
+            test_metrics: period_metrics(
+                "fixed_profile_out_of_sample",
+                &accepted,
+                test_from,
+                test_to,
+            ),
+        });
+    }
+
+    let metrics_from = years.first().map(|year| year.test_from).unwrap_or(from);
+    let metrics = metrics(&trades, metrics_from, to);
+    let active_years = years.iter().filter(|year| year.active).count();
+    FixedProfileWalkForwardResult {
+        profile: result.profile.clone(),
+        detector_strategy: result.detector_strategy.clone(),
+        execution_strategy: result.execution_strategy.clone(),
+        active_years,
+        years,
+        trades,
+        metrics,
+    }
+}
+
+fn fixed_profile_walk_forward_result_order(
+    a: &FixedProfileWalkForwardResult,
+    b: &FixedProfileWalkForwardResult,
+) -> Ordering {
+    out_of_sample_gate_passes(&b.metrics)
+        .cmp(&out_of_sample_gate_passes(&a.metrics))
+        .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
+        .then_with(|| b.metrics.total_pnl.total_cmp(&a.metrics.total_pnl))
+        .then_with(|| b.metrics.trades.cmp(&a.metrics.trades))
+        .then_with(|| profile_complexity(&a.profile).cmp(&profile_complexity(&b.profile)))
+        .then_with(|| a.profile.name.cmp(&b.profile.name))
 }
 
 struct WalkForwardSelection<'a> {
@@ -3866,6 +3998,40 @@ fn research_markdown(report: &ResearchReport) -> String {
     }
     out.push('\n');
 
+    out.push_str("## Fixed-Profile Walk-Forward\n\n");
+    out.push_str("| Rank | Profile | OOS Pass | Active Years | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Score | Robust Score | Detector | Execution |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n");
+    for (idx, result) in report
+        .fixed_profile_walk_forward
+        .iter()
+        .take(15)
+        .enumerate()
+    {
+        let m = &result.metrics;
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} | {:.4} | {} | {} |\n",
+            idx + 1,
+            result.profile.name,
+            if out_of_sample_gate_passes(m) {
+                "yes"
+            } else {
+                "no"
+            },
+            result.active_years,
+            m.trades,
+            m.total_pnl,
+            m.avg_return_on_risk,
+            m.win_rate * 100.0,
+            m.profit_factor,
+            m.max_drawdown,
+            m.score,
+            m.robust_score,
+            result.detector_strategy.name,
+            result.execution_strategy.name
+        ));
+    }
+    out.push('\n');
+
     out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Positive Years | Worst Year | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
     out.push_str(
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
@@ -4539,6 +4705,7 @@ mod tests {
                 trades: Vec::new(),
                 metrics: passing_oos,
             },
+            fixed_profile_walk_forward: Vec::new(),
             profiles: vec![best],
         };
 
@@ -5562,6 +5729,71 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap())
         );
         assert_eq!(stale_year.test_metrics.trades, 0);
+    }
+
+    #[test]
+    fn fixed_profile_walk_forward_ranks_fixed_oos_results() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut good_trades = training_trades(50.0);
+        good_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        good_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            80.0,
+        ));
+        let mut bad_trades = training_trades(50.0);
+        bad_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        bad_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            -80.0,
+        ));
+        let results = vec![
+            profile_result("bad", bad_trades, from, to),
+            profile_result("good", good_trades, from, to),
+        ];
+
+        let fixed = fixed_profile_walk_forward(&results, from, to);
+
+        assert_eq!(fixed[0].profile.name, "good");
+        assert_eq!(fixed[0].active_years, 2);
+        assert_eq!(fixed[0].trades.len(), 2);
+        assert!(fixed[0].metrics.total_pnl > fixed[1].metrics.total_pnl);
+        assert_eq!(fixed[1].profile.name, "bad");
+    }
+
+    #[test]
+    fn fixed_profile_walk_forward_requires_recent_closed_training_activity() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut trades = training_trades(50.0);
+        trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            80.0,
+        ));
+        let results = vec![profile_result("stale", trades, from, to)];
+
+        let fixed = fixed_profile_walk_forward(&results, from, to);
+        let stale_year = fixed[0]
+            .years
+            .iter()
+            .find(|year| year.test_year == 2024)
+            .unwrap();
+
+        assert!(!stale_year.active);
+        assert_eq!(stale_year.train_metrics.recent_trades, 0);
+        assert_eq!(stale_year.test_metrics.trades, 0);
+        assert_eq!(fixed[0].trades.len(), 0);
     }
 
     #[test]
