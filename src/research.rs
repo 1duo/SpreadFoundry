@@ -189,9 +189,41 @@ pub struct PlateauStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileResult {
     pub profile: ResearchProfile,
+    pub detector_strategy: DetectorStrategySummary,
+    pub execution_strategy: ExecutionStrategySummary,
     pub candidates: usize,
     pub trades: Vec<ResearchTrade>,
     pub metrics: ResearchMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DetectorStrategySummary {
+    pub name: String,
+    pub min_dte: i64,
+    pub max_dte: i64,
+    pub min_short_delta_abs: f64,
+    pub max_short_delta_abs: f64,
+    pub min_width: f64,
+    pub max_width: f64,
+    pub min_credit_width: f64,
+    pub max_quote_width_pct_of_mid: f64,
+    pub max_quote_width_abs: f64,
+    pub min_short_oi: u32,
+    pub min_long_oi: u32,
+    pub filters: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStrategySummary {
+    pub name: String,
+    pub candidate_selector: String,
+    pub entry_fill_model: String,
+    pub exit_fill_model: String,
+    pub take_profit_pct: f64,
+    pub stop_loss_multiple: f64,
+    pub force_close_dte: i64,
+    pub max_hold_days: Option<i64>,
+    pub stop_loss_cooldown_days: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -518,6 +550,8 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         let trades = simulate_non_overlapping(&candidates, &rows_by_expiration, &profile);
         let metrics = metrics(&trades, request.from, request.to);
         profile_results.push(ProfileResult {
+            detector_strategy: detector_strategy_summary(&profile),
+            execution_strategy: execution_strategy_summary(&profile),
             profile,
             candidates: candidates.len(),
             trades,
@@ -593,6 +627,121 @@ fn symbol_slug(symbol: &str) -> String {
             }
         })
         .collect()
+}
+
+fn detector_strategy_summary(profile: &ResearchProfile) -> DetectorStrategySummary {
+    DetectorStrategySummary {
+        name: format!(
+            "put_spread_detector_dte{}_{}_delta{:.2}_{:.2}_credit{:.2}_width{:.0}_{:.0}",
+            profile.min_dte,
+            profile.max_dte,
+            profile.min_short_delta_abs,
+            profile.max_short_delta_abs,
+            profile.min_credit_width,
+            profile.min_width,
+            profile.max_width
+        ),
+        min_dte: profile.min_dte,
+        max_dte: profile.max_dte,
+        min_short_delta_abs: profile.min_short_delta_abs,
+        max_short_delta_abs: profile.max_short_delta_abs,
+        min_width: profile.min_width,
+        max_width: profile.max_width,
+        min_credit_width: profile.min_credit_width,
+        max_quote_width_pct_of_mid: profile.max_quote_width_pct_of_mid,
+        max_quote_width_abs: profile.max_quote_width_abs,
+        min_short_oi: profile.min_short_oi,
+        min_long_oi: profile.min_long_oi,
+        filters: detector_filters(profile),
+    }
+}
+
+fn detector_filters(profile: &ResearchProfile) -> Vec<String> {
+    let mut filters = Vec::new();
+    if let Some(days) = profile.trend_lookback_days {
+        if let Some(min_return) = profile.min_underlying_return {
+            filters.push(format!("trend_{days}d_return>={min_return:.3}"));
+        }
+        if let Some(max_return) = profile.max_underlying_return {
+            filters.push(format!("trend_{days}d_return<={max_return:.3}"));
+        }
+    }
+    if let Some(days) = profile.drawdown_lookback_days {
+        if let Some(min_drawdown) = profile.min_underlying_drawdown {
+            filters.push(format!("drawdown_{days}d>={min_drawdown:.3}"));
+        }
+        if let Some(max_drawdown) = profile.max_underlying_drawdown {
+            filters.push(format!("drawdown_{days}d<={max_drawdown:.3}"));
+        }
+    }
+    if let Some(gate) = &profile.return_or_drawdown_gate {
+        filters.push(format!(
+            "return_or_drawdown(return>={}, drawdown>={})",
+            format_optional_threshold(gate.min_underlying_return),
+            format_optional_threshold(gate.min_underlying_drawdown)
+        ));
+    }
+    if let Some(guard) = &profile.trend_drawdown_guard {
+        filters.push(format!(
+            "trend_drawdown_guard(return>={:.3}, drawdown<={:.3})",
+            guard.min_underlying_return, guard.max_underlying_drawdown
+        ));
+    }
+    if let Some(days) = profile.realized_vol_lookback_days
+        && let Some(max_realized_vol) = profile.max_realized_vol
+    {
+        filters.push(format!("realized_vol_{days}d<={max_realized_vol:.3}"));
+    }
+    if let Some(min_short_otm_pct) = profile.min_short_otm_pct {
+        filters.push(format!("short_otm_pct>={min_short_otm_pct:.3}"));
+    }
+    if let Some(min_short_iv) = profile.min_short_iv {
+        filters.push(format!("short_iv>={min_short_iv:.3}"));
+    }
+    if let Some(max_short_iv) = profile.max_short_iv {
+        filters.push(format!("short_iv<={max_short_iv:.3}"));
+    }
+    if let Some(min_long_short_iv_diff) = profile.min_long_short_iv_diff {
+        filters.push(format!("long_short_iv_diff>={min_long_short_iv_diff:.4}"));
+    }
+    if let (Some(delta), Some(width)) = (
+        profile.low_delta_width_cap_delta_abs,
+        profile.low_delta_width_cap,
+    ) {
+        filters.push(format!("delta<={delta:.3}_width<={width:.0}"));
+    }
+    filters
+}
+
+fn execution_strategy_summary(profile: &ResearchProfile) -> ExecutionStrategySummary {
+    let candidate_selector = if profile.prefer_farther_otm {
+        "farther_otm_then_credit"
+    } else {
+        "highest_credit"
+    };
+    ExecutionStrategySummary {
+        name: format!(
+            "put_spread_execution_{}_tp{:.0}_stop{:.1}_close{}d",
+            candidate_selector,
+            profile.take_profit_pct * 100.0,
+            profile.stop_loss_multiple,
+            profile.force_close_dte
+        ),
+        candidate_selector: candidate_selector.to_owned(),
+        entry_fill_model: "short_bid_minus_long_ask".to_owned(),
+        exit_fill_model: "short_ask_minus_long_bid".to_owned(),
+        take_profit_pct: profile.take_profit_pct,
+        stop_loss_multiple: profile.stop_loss_multiple,
+        force_close_dte: profile.force_close_dte,
+        max_hold_days: profile.max_hold_days,
+        stop_loss_cooldown_days: profile.stop_loss_cooldown_days,
+    }
+}
+
+fn format_optional_threshold(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 fn profile_result_order(a: &ProfileResult, b: &ProfileResult) -> Ordering {
@@ -3453,6 +3602,21 @@ fn research_markdown(report: &ResearchReport) -> String {
         holdout.metrics.score
     ));
 
+    out.push_str("## Detector And Execution Strategy Map\n\n");
+    out.push_str("| Rank | Profile | Detector | Execution | Detector Filters |\n");
+    out.push_str("|---:|---|---|---|---|\n");
+    for (idx, result) in report.profiles.iter().take(10).enumerate() {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            idx + 1,
+            result.profile.name,
+            result.detector_strategy.name,
+            result.execution_strategy.name,
+            format_list(&result.detector_strategy.filters)
+        ));
+    }
+    out.push('\n');
+
     out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Positive Years | Worst Year | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
     out.push_str(
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
@@ -3615,6 +3779,14 @@ fn format_profile_counts(counts: &BTreeMap<String, usize>) -> String {
         .join(", ")
 }
 
+fn format_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(", ")
+    }
+}
+
 fn yyyymmdd(date: NaiveDate) -> String {
     date.format("%Y%m%d").to_string()
 }
@@ -3641,6 +3813,22 @@ mod tests {
     fn symbol_slug_is_filesystem_safe() {
         assert_eq!(symbol_slug("NVDA"), "nvda");
         assert_eq!(symbol_slug("BRK.B"), "brk-b");
+    }
+
+    #[test]
+    fn strategy_summaries_separate_detector_from_execution_rules() {
+        let detector_profile = ResearchProfile::baseline();
+        let mut execution_variant = detector_profile.clone();
+        execution_variant.take_profit_pct = 0.35;
+
+        assert_eq!(
+            detector_strategy_summary(&detector_profile),
+            detector_strategy_summary(&execution_variant)
+        );
+        assert_ne!(
+            execution_strategy_summary(&detector_profile),
+            execution_strategy_summary(&execution_variant)
+        );
     }
 
     #[test]
@@ -5336,6 +5524,8 @@ mod tests {
         profile.name = name.to_owned();
         let metrics = metrics(&trades, from, to);
         ProfileResult {
+            detector_strategy: detector_strategy_summary(&profile),
+            execution_strategy: execution_strategy_summary(&profile),
             profile,
             candidates: trades.len(),
             trades,
