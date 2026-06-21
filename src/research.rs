@@ -46,6 +46,8 @@ pub struct ResearchProfile {
     pub trend_lookback_days: Option<i64>,
     pub min_underlying_return: Option<f64>,
     pub max_underlying_return: Option<f64>,
+    pub drawdown_lookback_days: Option<i64>,
+    pub max_underlying_drawdown: Option<f64>,
     pub min_short_otm_pct: Option<f64>,
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
@@ -76,6 +78,8 @@ impl ResearchProfile {
             trend_lookback_days: None,
             min_underlying_return: None,
             max_underlying_return: None,
+            drawdown_lookback_days: None,
+            max_underlying_drawdown: None,
             min_short_otm_pct: None,
             min_short_iv: None,
             max_short_iv: None,
@@ -257,6 +261,7 @@ pub struct ResearchTrade {
     pub underlying_price: f64,
     pub short_otm_pct: f64,
     pub underlying_lookback_return: Option<f64>,
+    pub underlying_recent_drawdown: Option<f64>,
     pub short_iv: f64,
     pub long_iv: f64,
 }
@@ -283,6 +288,7 @@ pub struct ResearchSignal {
     pub underlying_price: f64,
     pub short_otm_pct: f64,
     pub underlying_lookback_return: Option<f64>,
+    pub underlying_recent_drawdown: Option<f64>,
     pub short_iv: f64,
     pub long_iv: f64,
 }
@@ -311,6 +317,7 @@ struct Candidate {
     return_on_risk: f64,
     short_otm_pct: f64,
     underlying_lookback_return: Option<f64>,
+    underlying_recent_drawdown: Option<f64>,
     short_iv: f64,
     long_iv: f64,
 }
@@ -709,6 +716,7 @@ fn signal_from_candidate(
         underlying_price: candidate.short.underlying_price,
         short_otm_pct: candidate.short_otm_pct,
         underlying_lookback_return: candidate.underlying_lookback_return,
+        underlying_recent_drawdown: candidate.underlying_recent_drawdown,
         short_iv: candidate.short_iv,
         long_iv: candidate.long_iv,
     }
@@ -1068,6 +1076,35 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profile.max_width = 15.0;
         profile.low_delta_width_cap_delta_abs = Some(0.23);
         profile.low_delta_width_cap = Some(10.0);
+        profiles.push(profile);
+    }
+
+    for (name, max_drawdown) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max8_delta20_30_credit20",
+            0.08,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max12_delta20_30_credit20",
+            0.12,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max16_delta20_30_credit20",
+            0.16,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.max_underlying_drawdown = Some(max_drawdown);
         profiles.push(profile);
     }
 
@@ -1589,7 +1626,7 @@ fn generate_candidates(
                 {
                     continue;
                 }
-                let Some((short_otm_pct, underlying_lookback_return)) =
+                let Some((short_otm_pct, underlying_lookback_return, underlying_recent_drawdown)) =
                     entry_regime(short, profile, &underlying_by_date)
                 else {
                     continue;
@@ -1628,6 +1665,7 @@ fn generate_candidates(
                         return_on_risk: credit / max_loss,
                         short_otm_pct,
                         underlying_lookback_return,
+                        underlying_recent_drawdown,
                         short_iv: short.implied_vol,
                         long_iv: long.implied_vol,
                     });
@@ -1653,7 +1691,7 @@ fn entry_regime(
     short: &OptionDay,
     profile: &ResearchProfile,
     underlying_by_date: &BTreeMap<NaiveDate, f64>,
-) -> Option<(f64, Option<f64>)> {
+) -> Option<(f64, Option<f64>, Option<f64>)> {
     if short.underlying_price <= 0.0 {
         return None;
     }
@@ -1681,7 +1719,23 @@ fn entry_regime(
         None
     };
 
-    Some((short_otm_pct, underlying_lookback_return))
+    let underlying_recent_drawdown = if let Some(days) = profile.drawdown_lookback_days {
+        let drawdown = underlying_drawdown(short.date, days, underlying_by_date)?;
+        if let Some(max_drawdown) = profile.max_underlying_drawdown
+            && drawdown > max_drawdown
+        {
+            return None;
+        }
+        Some(drawdown)
+    } else {
+        None
+    };
+
+    Some((
+        short_otm_pct,
+        underlying_lookback_return,
+        underlying_recent_drawdown,
+    ))
 }
 
 fn underlying_return(
@@ -1696,6 +1750,24 @@ fn underlying_return(
         return None;
     }
     Some(current / prior - 1.0)
+}
+
+fn underlying_drawdown(
+    date: NaiveDate,
+    lookback_days: i64,
+    underlying_by_date: &BTreeMap<NaiveDate, f64>,
+) -> Option<f64> {
+    let current = *underlying_by_date.get(&date)?;
+    let start = date - Duration::days(lookback_days);
+    let peak = underlying_by_date
+        .range(start..=date)
+        .map(|(_, price)| *price)
+        .filter(|price| *price > 0.0)
+        .max_by(f64::total_cmp)?;
+    if current <= 0.0 {
+        return None;
+    }
+    Some((peak - current).max(0.0) / peak)
 }
 
 fn simulate_non_overlapping(
@@ -1850,6 +1922,7 @@ fn build_trade(
         underlying_price: candidate.short.underlying_price,
         short_otm_pct: candidate.short_otm_pct,
         underlying_lookback_return: candidate.underlying_lookback_return,
+        underlying_recent_drawdown: candidate.underlying_recent_drawdown,
         short_iv: candidate.short_iv,
         long_iv: candidate.long_iv,
     }
@@ -2363,7 +2436,7 @@ fn research_markdown(report: &ResearchReport) -> String {
     if let Some(signal) = &report.latest_signal {
         out.push_str("## Latest Signal\n\n");
         out.push_str(&format!(
-            "- As of: `{}`\n- Status: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n\n",
+            "- As of: `{}`\n- Status: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n- Recent drawdown: `{}`\n\n",
             signal.as_of,
             signal.status,
             signal.profile_name,
@@ -2381,7 +2454,8 @@ fn research_markdown(report: &ResearchReport) -> String {
             signal.short_otm_pct * 100.0,
             signal.short_delta,
             signal.short_iv * 100.0,
-            format_optional_pct(signal.underlying_lookback_return)
+            format_optional_pct(signal.underlying_lookback_return),
+            format_optional_pct(signal.underlying_recent_drawdown)
         ));
     } else {
         out.push_str("## Latest Signal\n\n");
@@ -2562,11 +2636,11 @@ fn research_markdown(report: &ResearchReport) -> String {
         ));
 
         out.push_str("\n## Best Profile Trades\n\n");
-        out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Short IV | Trend Ret | Credit | Exit Debit | PnL | ROR | Reason |\n");
-        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str("| Entry | Exit | Exp | Short | Long | OTM% | Short IV | Trend Ret | Recent DD | Credit | Exit Debit | PnL | ROR | Reason |\n");
+        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for trade in best.trades.iter().take(50) {
             out.push_str(&format!(
-                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {:.1}% | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
+                "| {} | {} | {} | {:.0}P | {:.0}P | {:.1}% | {:.1}% | {} | {} | {:.2} | {:.2} | {:.2} | {:.3} | {} |\n",
                 trade.entry_date,
                 trade.exit_date,
                 trade.expiration,
@@ -2575,6 +2649,7 @@ fn research_markdown(report: &ResearchReport) -> String {
                 trade.short_otm_pct * 100.0,
                 trade.short_iv * 100.0,
                 format_optional_pct(trade.underlying_lookback_return),
+                format_optional_pct(trade.underlying_recent_drawdown),
                 trade.entry_credit,
                 trade.exit_debit,
                 trade.pnl,
@@ -2653,6 +2728,24 @@ mod tests {
     }
 
     #[test]
+    fn underlying_drawdown_uses_only_current_and_prior_window_prices() {
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(), 125.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 110.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 12).unwrap(), 200.0);
+
+        let drawdown = underlying_drawdown(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            10,
+            &underlying,
+        )
+        .unwrap();
+
+        assert!((drawdown - 0.12).abs() < 1e-9);
+    }
+
+    #[test]
     fn entry_regime_rejects_weak_trend_and_too_close_short_strikes() {
         let mut profile = ResearchProfile::baseline();
         profile.trend_lookback_days = Some(10);
@@ -2685,6 +2778,31 @@ mod tests {
 
         underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 80.0);
         assert!(entry_regime(&passing_short, &profile, &underlying).is_none());
+    }
+
+    #[test]
+    fn entry_regime_rejects_excess_recent_drawdown() {
+        let mut profile = ResearchProfile::baseline();
+        profile.drawdown_lookback_days = Some(10);
+        profile.max_underlying_drawdown = Some(0.10);
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(), 120.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 105.0);
+        let short = option_day(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            95.0,
+            1.0,
+            1.1,
+            -0.25,
+            105.0,
+        );
+
+        assert!(entry_regime(&short, &profile, &underlying).is_none());
+
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 110.0);
+        let regime = entry_regime(&short, &profile, &underlying).unwrap();
+        assert!((regime.2.unwrap() - (10.0 / 120.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -3080,6 +3198,40 @@ mod tests {
     }
 
     #[test]
+    fn drawdown_cap_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, max_drawdown) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max8_delta20_30_credit20",
+                0.08,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max12_delta20_30_credit20",
+                0.12,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_max16_delta20_30_credit20",
+                0.16,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(profile.max_underlying_drawdown, Some(max_drawdown));
+        }
+    }
+
+    #[test]
     fn walk_forward_selects_from_prior_data_and_prevents_cross_year_overlap() {
         let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
@@ -3451,6 +3603,7 @@ mod tests {
             underlying_price: 100.0,
             short_otm_pct: 0.05,
             underlying_lookback_return: None,
+            underlying_recent_drawdown: None,
             short_iv: 0.5,
             long_iv: 0.5,
         }
@@ -3481,6 +3634,7 @@ mod tests {
             return_on_risk: credit / max_loss,
             short_otm_pct,
             underlying_lookback_return: None,
+            underlying_recent_drawdown: None,
             short_iv: 0.5,
             long_iv: 0.5,
         }
