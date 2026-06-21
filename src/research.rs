@@ -15,6 +15,7 @@ const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
+const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
 const PLATEAU_MIN_PROFILE_VARIANTS: usize = 75;
 const PLATEAU_MIN_WALK_FORWARD_YEARS: usize = 3;
@@ -158,6 +159,7 @@ pub struct ResearchReport {
     pub deployment_gate: DeploymentGate,
     pub plateau_status: PlateauStatus,
     pub walk_forward: WalkForwardResult,
+    pub rolling_walk_forward: WalkForwardResult,
     pub holdout: HoldoutResult,
     pub profiles: Vec<ProfileResult>,
 }
@@ -228,7 +230,9 @@ pub struct ExecutionStrategySummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalkForwardResult {
+    pub mode: String,
     pub min_train_days: i64,
+    pub train_window_days: Option<i64>,
     pub years: Vec<WalkForwardYear>,
     pub selected_profile_counts: BTreeMap<String, usize>,
     pub trades: Vec<ResearchTrade>,
@@ -559,6 +563,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         });
     }
     let walk_forward = walk_forward(&profile_results, request.from, request.to);
+    let rolling_walk_forward = rolling_walk_forward(&profile_results, request.from, request.to);
     let holdout = holdout(&profile_results, request.from, request.to);
     profile_results.sort_by(profile_result_order);
     let latest_signal = latest_signal_for_best_profile(
@@ -583,6 +588,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         deployment_gate,
         plateau_status,
         walk_forward,
+        rolling_walk_forward,
         holdout,
         profiles: profile_results,
     };
@@ -866,6 +872,39 @@ fn walk_forward(
     from: NaiveDate,
     to: NaiveDate,
 ) -> WalkForwardResult {
+    walk_forward_with_mode(
+        profile_results,
+        from,
+        to,
+        "expanding",
+        None,
+        WALK_FORWARD_MIN_TRAIN_DAYS,
+    )
+}
+
+fn rolling_walk_forward(
+    profile_results: &[ProfileResult],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> WalkForwardResult {
+    walk_forward_with_mode(
+        profile_results,
+        from,
+        to,
+        "rolling",
+        Some(ROLLING_WALK_FORWARD_TRAIN_DAYS),
+        ROLLING_WALK_FORWARD_TRAIN_DAYS,
+    )
+}
+
+fn walk_forward_with_mode(
+    profile_results: &[ProfileResult],
+    from: NaiveDate,
+    to: NaiveDate,
+    mode: &str,
+    train_window_days: Option<i64>,
+    min_train_days: i64,
+) -> WalkForwardResult {
     let mut years = Vec::new();
     let mut trades = Vec::new();
     let mut selected_profile_counts = BTreeMap::new();
@@ -879,11 +918,17 @@ fn walk_forward(
         }
 
         let train_to = test_from - Duration::days(1);
-        if train_to < from || (train_to - from).num_days() < WALK_FORWARD_MIN_TRAIN_DAYS {
+        if train_to < from || (train_to - from).num_days() < min_train_days {
+            continue;
+        }
+        let train_from = train_window_days
+            .map(|days| (train_to - Duration::days(days - 1)).max(from))
+            .unwrap_or(from);
+        if (train_to - train_from).num_days() + 1 < min_train_days {
             continue;
         }
 
-        let ranked_selections = rank_walk_forward_profiles(profile_results, from, train_to);
+        let ranked_selections = rank_walk_forward_profiles(profile_results, train_from, train_to);
         if ranked_selections.is_empty() {
             continue;
         }
@@ -936,7 +981,7 @@ fn walk_forward(
         trades.extend(accepted.iter().cloned());
         years.push(WalkForwardYear {
             test_year,
-            train_from: from,
+            train_from,
             train_to,
             test_from,
             test_to,
@@ -950,7 +995,9 @@ fn walk_forward(
 
     let metrics_from = years.first().map(|year| year.test_from).unwrap_or(from);
     WalkForwardResult {
-        min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
+        mode: mode.to_owned(),
+        min_train_days,
+        train_window_days,
         years,
         selected_profile_counts,
         metrics: metrics(&trades, metrics_from, to),
@@ -3554,6 +3601,51 @@ fn research_markdown(report: &ResearchReport) -> String {
     }
     out.push('\n');
 
+    let rolling = &report.rolling_walk_forward;
+    let rolling_active_years = rolling.years.iter().filter(|year| year.active).count();
+    out.push_str("## Rolling Walk-Forward Selector\n\n");
+    out.push_str(&format!(
+        "- Training window: `{}` days\n- OOS years: `{}`\n- Active OOS years: `{}`\n- OOS trades: `{}`\n- OOS PnL: `{:.2}`\n- OOS win rate: `{:.1}%`\n- OOS profit factor: `{:.2}`\n- OOS max DD: `{:.3}`\n- OOS score: `{:.4}`\n- Selected profiles: `{}`\n\n",
+        rolling.train_window_days.unwrap_or(rolling.min_train_days),
+        rolling.years.len(),
+        rolling_active_years,
+        rolling.metrics.trades,
+        rolling.metrics.total_pnl,
+        rolling.metrics.win_rate * 100.0,
+        rolling.metrics.profit_factor,
+        rolling.metrics.max_drawdown,
+        rolling.metrics.score,
+        format_profile_counts(&rolling.selected_profile_counts)
+    ));
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for year in &rolling.years {
+        out.push_str(&format!(
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            year.test_year,
+            year.train_from,
+            year.train_to,
+            year.test_from,
+            year.test_to,
+            if year.active { "yes" } else { "no" },
+            year.selected_profile,
+            if year.train_metrics.robust_ranking_eligible {
+                "yes"
+            } else {
+                "no"
+            },
+            year.train_metrics.trades,
+            year.train_metrics.total_pnl,
+            year.train_metrics.robust_score,
+            year.test_metrics.trades,
+            year.test_metrics.total_pnl,
+            year.test_metrics.win_rate * 100.0,
+            year.test_metrics.profit_factor,
+            year.test_metrics.score
+        ));
+    }
+    out.push('\n');
+
     out.push_str("## Walk-Forward Selection Diagnostics\n\n");
     out.push_str("| Test Year | Rank | Active | Profile | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
     out.push_str("|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
@@ -4250,7 +4342,18 @@ mod tests {
             deployment_gate,
             plateau_status,
             walk_forward: WalkForwardResult {
+                mode: "expanding".to_owned(),
                 min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
+                train_window_days: None,
+                years: Vec::new(),
+                selected_profile_counts: BTreeMap::new(),
+                trades: Vec::new(),
+                metrics: blocked_oos.clone(),
+            },
+            rolling_walk_forward: WalkForwardResult {
+                mode: "rolling".to_owned(),
+                min_train_days: ROLLING_WALK_FORWARD_TRAIN_DAYS,
+                train_window_days: Some(ROLLING_WALK_FORWARD_TRAIN_DAYS),
                 years: Vec::new(),
                 selected_profile_counts: BTreeMap::new(),
                 trades: Vec::new(),
@@ -5187,6 +5290,28 @@ mod tests {
             NaiveDate::from_ymd_opt(2024, 2, 1).unwrap()
         );
         assert_eq!(result.years[1].test_metrics.trades, 1);
+    }
+
+    #[test]
+    fn rolling_walk_forward_uses_trailing_training_window() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let results = vec![profile_result("steady", training_trades(40.0), from, to)];
+
+        let result = rolling_walk_forward(&results, from, to);
+
+        assert_eq!(result.mode, "rolling");
+        assert_eq!(
+            result.train_window_days,
+            Some(ROLLING_WALK_FORWARD_TRAIN_DAYS)
+        );
+        assert_eq!(result.years[0].test_year, 2024);
+        assert!(result.years[0].train_from > from);
+        assert_eq!(
+            result.years[0].train_to,
+            NaiveDate::from_ymd_opt(2023, 12, 31).unwrap()
+        );
+        assert!(result.years[1].train_from > result.years[0].train_from);
     }
 
     #[test]
