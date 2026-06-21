@@ -1986,6 +1986,48 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, stop_loss_multiple, take_profit_pct) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            1.75,
+            0.50,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop150_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            1.50,
+            0.50,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_take40_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            2.00,
+            0.40,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_take35_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            2.00,
+            0.35,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.12);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.stop_loss_multiple = stop_loss_multiple;
+        profile.take_profit_pct = take_profit_pct;
+        profiles.push(profile);
+    }
+
     for (name, max_drawdown) in [
         (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2max4p5_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -5233,6 +5275,56 @@ mod tests {
                     min_underlying_drawdown: Some(0.02),
                 })
             );
+        }
+    }
+
+    #[test]
+    fn current_best_execution_variants_keep_detector_gates() {
+        let profiles = research_profiles();
+        for (name, stop_loss_multiple, take_profit_pct) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                1.75,
+                0.50,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop150_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                1.50,
+                0.50,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_take40_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                2.00,
+                0.40,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_take35_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                2.00,
+                0.35,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.12));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(profile.stop_loss_multiple, stop_loss_multiple);
+            assert_eq!(profile.take_profit_pct, take_profit_pct);
         }
     }
 
