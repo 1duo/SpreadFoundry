@@ -7,10 +7,13 @@ use spreadfoundry::broker::RobinhoodBrokerAdapter;
 use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
-use spreadfoundry::research::{ResearchReport, ResearchRequest, run_symbol_research};
+use spreadfoundry::research::{
+    ResearchMetrics, ResearchReport, ResearchRequest, run_symbol_research,
+};
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
 use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -177,6 +180,7 @@ struct UniverseSeedSymbol {
 
 #[derive(Debug, Serialize)]
 struct UniverseSymbolSummary {
+    suitability_rank: usize,
     symbol: String,
     seed_rank: Option<usize>,
     seed_role: Option<String>,
@@ -184,7 +188,12 @@ struct UniverseSymbolSummary {
     report_dir: String,
     deployment_status: String,
     plateau_status: String,
+    detector_status: String,
+    execution_strategy_status: String,
     expansion_ready: bool,
+    expirations_loaded: usize,
+    rows_loaded: usize,
+    profiles_evaluated: usize,
     best_profile: String,
     best_detector: String,
     best_execution: String,
@@ -198,6 +207,14 @@ struct UniverseSymbolSummary {
     holdout_trades: usize,
     holdout_pnl: f64,
     holdout_score: f64,
+    fixed_profile_oos_passes: usize,
+    best_fixed_profile: String,
+    best_fixed_detector: String,
+    best_fixed_execution: String,
+    best_fixed_trades: usize,
+    best_fixed_pnl: f64,
+    best_fixed_score: f64,
+    best_fixed_robust_score: f64,
     latest_signal_status: Option<String>,
 }
 
@@ -516,8 +533,8 @@ async fn research_universe(
         .and_then(|name| name.to_str())
         .unwrap_or("universe-research")
         .to_owned();
-    let mut results = Vec::new();
     let expansion_seed = expansion_seed_for_symbols(&symbols);
+    let mut results = Vec::new();
     for symbol in &symbols {
         println!("researching {symbol}");
         let report = run_symbol_research(ResearchRequest {
@@ -531,6 +548,7 @@ async fn research_universe(
         .await?;
         results.push(universe_symbol_summary(&report, &expansion_seed));
     }
+    rank_universe_results(&mut results);
 
     let summary = UniverseResearchSummary {
         run_id,
@@ -540,7 +558,7 @@ async fn research_universe(
         plateau_run: plateau_run
             .as_ref()
             .map(|path| path.display().to_string()),
-        selection_basis: "Plateau expansion uses a liquidity-first, single-stock seed for put credit spreads, then reranks by ThetaData chain liquidity, OI, bid/ask spreads, and out-of-sample strategy results before any live use.".to_owned(),
+        selection_basis: "Plateau expansion uses a liquidity-first, single-stock seed for put credit spreads, then sorts the final table by deployment pass, fixed-profile OOS passes, walk-forward score, holdout score, robust score, and chain data coverage before any live use.".to_owned(),
         expansion_seed,
         results,
     };
@@ -648,10 +666,17 @@ fn universe_symbol_summary(
     expansion_seed: &[UniverseSeedSymbol],
 ) -> UniverseSymbolSummary {
     let best = report.profiles.first();
+    let best_fixed = report.fixed_profile_walk_forward.first();
+    let fixed_profile_oos_passes = report
+        .fixed_profile_walk_forward
+        .iter()
+        .filter(|result| research_metrics_oos_passes(&result.metrics))
+        .count();
     let seed = expansion_seed
         .iter()
         .find(|seed| seed.symbol == report.symbol);
     UniverseSymbolSummary {
+        suitability_rank: 0,
         symbol: report.symbol.clone(),
         seed_rank: seed.map(|seed| seed.rank),
         seed_role: seed.map(|seed| seed.role.clone()),
@@ -662,7 +687,12 @@ fn universe_symbol_summary(
             .to_string(),
         deployment_status: report.deployment_gate.status.clone(),
         plateau_status: report.plateau_status.status.clone(),
+        detector_status: report.plateau_status.detector_status.clone(),
+        execution_strategy_status: report.plateau_status.execution_strategy_status.clone(),
         expansion_ready: report.plateau_status.expansion_ready,
+        expirations_loaded: report.expirations_loaded,
+        rows_loaded: report.rows_loaded,
+        profiles_evaluated: report.profiles.len(),
         best_profile: best
             .map(|result| result.profile.name.clone())
             .unwrap_or_default(),
@@ -686,11 +716,66 @@ fn universe_symbol_summary(
         holdout_trades: report.holdout.metrics.trades,
         holdout_pnl: report.holdout.metrics.total_pnl,
         holdout_score: report.holdout.metrics.score,
+        fixed_profile_oos_passes,
+        best_fixed_profile: best_fixed
+            .map(|result| result.profile.name.clone())
+            .unwrap_or_default(),
+        best_fixed_detector: best_fixed
+            .map(|result| result.detector_strategy.name.clone())
+            .unwrap_or_default(),
+        best_fixed_execution: best_fixed
+            .map(|result| result.execution_strategy.name.clone())
+            .unwrap_or_default(),
+        best_fixed_trades: best_fixed
+            .map(|result| result.metrics.trades)
+            .unwrap_or_default(),
+        best_fixed_pnl: best_fixed
+            .map(|result| result.metrics.total_pnl)
+            .unwrap_or_default(),
+        best_fixed_score: best_fixed
+            .map(|result| result.metrics.score)
+            .unwrap_or_default(),
+        best_fixed_robust_score: best_fixed
+            .map(|result| result.metrics.robust_score)
+            .unwrap_or_default(),
         latest_signal_status: report
             .latest_signal
             .as_ref()
             .map(|signal| signal.status.clone()),
     }
+}
+
+fn research_metrics_oos_passes(metrics: &ResearchMetrics) -> bool {
+    metrics.ranking_eligible && metrics.total_pnl > 0.0 && metrics.score > 0.0
+}
+
+fn rank_universe_results(results: &mut [UniverseSymbolSummary]) {
+    results.sort_by(universe_result_order);
+    for (idx, result) in results.iter_mut().enumerate() {
+        result.suitability_rank = idx + 1;
+    }
+}
+
+fn universe_result_order(a: &UniverseSymbolSummary, b: &UniverseSymbolSummary) -> Ordering {
+    universe_deployment_passes(b)
+        .cmp(&universe_deployment_passes(a))
+        .then_with(|| b.fixed_profile_oos_passes.cmp(&a.fixed_profile_oos_passes))
+        .then_with(|| b.walk_forward_score.total_cmp(&a.walk_forward_score))
+        .then_with(|| b.holdout_score.total_cmp(&a.holdout_score))
+        .then_with(|| b.best_fixed_score.total_cmp(&a.best_fixed_score))
+        .then_with(|| b.robust_score.total_cmp(&a.robust_score))
+        .then_with(|| b.score.total_cmp(&a.score))
+        .then_with(|| b.rows_loaded.cmp(&a.rows_loaded))
+        .then_with(|| {
+            a.seed_rank
+                .unwrap_or(usize::MAX)
+                .cmp(&b.seed_rank.unwrap_or(usize::MAX))
+        })
+        .then_with(|| a.symbol.cmp(&b.symbol))
+}
+
+fn universe_deployment_passes(summary: &UniverseSymbolSummary) -> bool {
+    summary.deployment_status == "pass"
 }
 
 fn universe_markdown(summary: &UniverseResearchSummary) -> String {
@@ -719,13 +804,15 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     }
     out.push('\n');
 
-    out.push_str("| Seed Rank | Symbol | Report | Deployment | Plateau | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Latest Signal |\n");
+    out.push_str("## Symbol Suitability Ranking\n\n");
+    out.push_str("| Rank | Seed Rank | Symbol | Report | Deployment | Plateau | Detector Status | Execution Status | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
     out.push_str(
-        "|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "|---:|---:|---|---|---|---|---|---|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     for result in &summary.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
+            result.suitability_rank,
             result
                 .seed_rank
                 .map(|rank| rank.to_string())
@@ -734,6 +821,16 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
             result.report_dir,
             result.deployment_status,
             result.plateau_status,
+            result.detector_status,
+            result.execution_strategy_status,
+            result.fixed_profile_oos_passes,
+            result.best_fixed_profile,
+            result.best_fixed_detector,
+            result.best_fixed_execution,
+            result.best_fixed_trades,
+            result.best_fixed_pnl,
+            result.best_fixed_score,
+            result.best_fixed_robust_score,
             result.best_profile,
             result.best_detector,
             result.best_execution,
@@ -747,6 +844,8 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
             result.holdout_trades,
             result.holdout_pnl,
             result.holdout_score,
+            result.expirations_loaded,
+            result.rows_loaded,
             result.latest_signal_status.as_deref().unwrap_or("none")
         ));
     }
@@ -835,5 +934,123 @@ mod tests {
 
         assert_eq!(status.status, "plateau_expand_universe");
         assert!(status.expansion_ready);
+    }
+
+    #[test]
+    fn universe_results_rank_by_oos_evidence_not_seed_order() {
+        let mut results = vec![
+            universe_summary_row(TestUniverseRow {
+                symbol: "AAPL",
+                seed_rank: Some(1),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 0,
+                walk_forward_score: -1.0,
+                holdout_score: -2.0,
+                robust_score: 0.2,
+                rows_loaded: 20_000,
+            }),
+            universe_summary_row(TestUniverseRow {
+                symbol: "TSLA",
+                seed_rank: Some(2),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 1,
+                walk_forward_score: -10.0,
+                holdout_score: -10.0,
+                robust_score: -1.0,
+                rows_loaded: 10_000,
+            }),
+        ];
+
+        rank_universe_results(&mut results);
+
+        assert_eq!(results[0].symbol, "TSLA");
+        assert_eq!(results[0].suitability_rank, 1);
+        assert_eq!(results[1].symbol, "AAPL");
+        assert_eq!(results[1].suitability_rank, 2);
+    }
+
+    #[test]
+    fn universe_report_surfaces_fixed_profile_and_strategy_statuses() {
+        let mut results = vec![universe_summary_row(TestUniverseRow {
+            symbol: "TSLA",
+            seed_rank: Some(2),
+            deployment_status: "blocked",
+            fixed_profile_oos_passes: 1,
+            walk_forward_score: 0.4,
+            holdout_score: 0.3,
+            robust_score: 0.2,
+            rows_loaded: 10_000,
+        })];
+        rank_universe_results(&mut results);
+        let summary = UniverseResearchSummary {
+            run_id: "universe-test".to_owned(),
+            from: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            to: NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
+            symbols: vec!["TSLA".to_owned()],
+            plateau_run: Some("runs/nvda/research.json".to_owned()),
+            selection_basis: "test".to_owned(),
+            expansion_seed: Vec::new(),
+            results,
+        };
+
+        let markdown = universe_markdown(&summary);
+
+        assert!(markdown.contains("## Symbol Suitability Ranking"));
+        assert!(markdown.contains("Detector Status"));
+        assert!(markdown.contains("Best Fixed Detector"));
+        assert!(markdown.contains("put_spread_detector_test"));
+        assert!(markdown.contains("put_spread_execution_test"));
+    }
+
+    struct TestUniverseRow {
+        symbol: &'static str,
+        seed_rank: Option<usize>,
+        deployment_status: &'static str,
+        fixed_profile_oos_passes: usize,
+        walk_forward_score: f64,
+        holdout_score: f64,
+        robust_score: f64,
+        rows_loaded: usize,
+    }
+
+    fn universe_summary_row(input: TestUniverseRow) -> UniverseSymbolSummary {
+        UniverseSymbolSummary {
+            suitability_rank: 0,
+            symbol: input.symbol.to_owned(),
+            seed_rank: input.seed_rank,
+            seed_role: Some("test".to_owned()),
+            seed_rationale: Some("test".to_owned()),
+            report_dir: format!("runs/{}", input.symbol),
+            deployment_status: input.deployment_status.to_owned(),
+            plateau_status: "plateau_expand_universe".to_owned(),
+            detector_status: "robust".to_owned(),
+            execution_strategy_status: "oos_blocked".to_owned(),
+            expansion_ready: true,
+            expirations_loaded: 5,
+            rows_loaded: input.rows_loaded,
+            profiles_evaluated: 102,
+            best_profile: "best_profile".to_owned(),
+            best_detector: "put_spread_detector_test".to_owned(),
+            best_execution: "put_spread_execution_test".to_owned(),
+            trades: 10,
+            total_pnl: 100.0,
+            score: 0.1,
+            robust_score: input.robust_score,
+            walk_forward_trades: 4,
+            walk_forward_pnl: 40.0,
+            walk_forward_score: input.walk_forward_score,
+            holdout_trades: 3,
+            holdout_pnl: 30.0,
+            holdout_score: input.holdout_score,
+            fixed_profile_oos_passes: input.fixed_profile_oos_passes,
+            best_fixed_profile: "best_fixed_profile".to_owned(),
+            best_fixed_detector: "put_spread_detector_test".to_owned(),
+            best_fixed_execution: "put_spread_execution_test".to_owned(),
+            best_fixed_trades: 4,
+            best_fixed_pnl: 40.0,
+            best_fixed_score: input.walk_forward_score,
+            best_fixed_robust_score: input.robust_score,
+            latest_signal_status: Some("research_only".to_owned()),
+        }
     }
 }
