@@ -8,7 +8,8 @@ use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
 use spreadfoundry::research::{
-    ResearchMetrics, ResearchReport, ResearchRequest, run_symbol_research,
+    DEFAULT_PLATEAU_UNIVERSE_SYMBOLS, DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV, ResearchMetrics,
+    ResearchReport, ResearchRequest, run_symbol_research,
 };
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
@@ -17,8 +18,6 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_UNIVERSE_SYMBOLS: [&str; 5] = ["TSLA", "AMD", "META", "AMZN", "AAPL"];
-const DEFAULT_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AMD,META,AMZN,AAPL";
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses five non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
 
@@ -102,7 +101,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            default_value = DEFAULT_UNIVERSE_SYMBOLS_CSV
+            default_value = DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV
         )]
         symbols: Vec<String>,
         #[arg(long)]
@@ -641,7 +640,7 @@ fn default_universe_seed() -> Vec<UniverseSeedSymbol> {
             "Deep, tight option chain with lower relative premium; useful as an execution-quality control for conservative fills.",
         ),
     ];
-    DEFAULT_UNIVERSE_SYMBOLS
+    DEFAULT_PLATEAU_UNIVERSE_SYMBOLS
         .iter()
         .zip(metadata.iter())
         .enumerate()
@@ -875,6 +874,11 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.research_method
     ));
 
+    out.push_str("## Research Protocol\n\n");
+    out.push_str("- Detector search: each symbol gets its own DTE, delta, credit, width, liquidity, IV, trend, drawdown, and realized-volatility filters selected only from that symbol's historical training data.\n");
+    out.push_str("- Execution strategy search: take-profit, stop-loss, force-close DTE, cooldown, and spread-selection rules are scored separately from detector filters under conservative bid/ask fills.\n");
+    out.push_str("- Promotion rule: seed order never promotes a symbol; fixed-profile OOS passes, walk-forward evidence, holdout evidence, and deployment gates drive the suitability ranking.\n\n");
+
     out.push_str("## Expansion Seed\n\n");
     out.push_str("| Rank | Symbol | Role | Rationale |\n");
     out.push_str("|---:|---|---|---|\n");
@@ -995,7 +999,7 @@ mod tests {
             seed.iter()
                 .map(|symbol| symbol.symbol.as_str())
                 .collect::<Vec<_>>(),
-            DEFAULT_UNIVERSE_SYMBOLS.to_vec()
+            DEFAULT_PLATEAU_UNIVERSE_SYMBOLS.to_vec()
         );
         assert!(!seed.iter().any(|symbol| symbol.symbol == "NVDA"));
         assert!(seed.iter().all(|symbol| !symbol.rationale.is_empty()));
@@ -1087,6 +1091,9 @@ mod tests {
 
         assert!(markdown.contains("Strategy: `put_credit_spread`"));
         assert!(markdown.contains("same Rust put-credit-spread profile grid"));
+        assert!(markdown.contains("## Research Protocol"));
+        assert!(markdown.contains("Detector search: each symbol gets its own"));
+        assert!(markdown.contains("Execution strategy search: take-profit"));
         assert!(markdown.contains("## Symbol Suitability Ranking"));
         assert!(markdown.contains("Detector Status"));
         assert!(markdown.contains("Best Fixed Detector"));

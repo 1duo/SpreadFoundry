@@ -21,6 +21,8 @@ const PLATEAU_MIN_PROFILE_VARIANTS: usize = 75;
 const PLATEAU_MIN_WALK_FORWARD_YEARS: usize = 3;
 const RECENT_TRAIN_ACTIVITY_DAYS: i64 = 365;
 const MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE: f64 = 0.005;
+pub const DEFAULT_PLATEAU_UNIVERSE_SYMBOLS: [&str; 5] = ["TSLA", "AMD", "META", "AMZN", "AAPL"];
+pub const DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AMD,META,AMZN,AAPL";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -3845,6 +3847,17 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
+fn plateau_expansion_command(report: &ResearchReport) -> Option<String> {
+    if !report.plateau_status.expansion_ready {
+        return None;
+    }
+
+    Some(format!(
+        "cargo run --release -- research-universe --plateau-run runs/{}/research.json --symbols {} --from {} --to {}",
+        report.run_id, DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV, report.requested_from, report.to
+    ))
+}
+
 fn research_markdown(report: &ResearchReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -4014,6 +4027,9 @@ fn research_markdown(report: &ResearchReport) -> String {
         plateau.reason,
         plateau.next_action
     ));
+    if let Some(command) = plateau_expansion_command(report) {
+        out.push_str(&format!("- Universe research command: `{}`\n\n", command));
+    }
 
     if let Some(signal) = &report.latest_signal {
         out.push_str("## Latest Signal\n\n");
@@ -4984,7 +5000,7 @@ mod tests {
             holdout_oos_gate: true,
         };
         let plateau_status = plateau_status_from_counts(1, 0, true, &deployment_gate);
-        let report = ResearchReport {
+        let mut report = ResearchReport {
             run_id: "test-run".to_owned(),
             symbol: "NVDA".to_owned(),
             requested_from: NaiveDate::from_ymd_opt(2012, 1, 1).unwrap(),
@@ -5043,12 +5059,34 @@ mod tests {
         assert!(markdown.contains("Expirations skipped before data: `2`"));
         assert!(markdown.contains("- Status: `blocked`"));
         assert!(markdown.contains("- Research deployment gate: `blocked`"));
+        assert!(!markdown.contains("Universe research command"));
         assert!(markdown.contains("latest signals are research candidates only"));
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["deployment_gate"]["status"], "blocked");
         assert_eq!(json["deployment_gate"]["pass"], false);
         assert_eq!(json["plateau_status"]["status"], "continue_symbol_research");
+
+        let expansion_gate = DeploymentGate {
+            status: "blocked".to_owned(),
+            pass: false,
+            best_profile_gate: true,
+            walk_forward_oos_gate: false,
+            holdout_oos_gate: false,
+        };
+        report.deployment_gate = expansion_gate.clone();
+        report.plateau_status = plateau_status_from_counts(
+            PLATEAU_MIN_PROFILE_VARIANTS + 1,
+            PLATEAU_MIN_WALK_FORWARD_YEARS,
+            true,
+            &expansion_gate,
+        );
+
+        let expansion_markdown = research_markdown(&report);
+
+        assert!(expansion_markdown.contains(
+            "Universe research command: `cargo run --release -- research-universe --plateau-run runs/test-run/research.json --symbols TSLA,AMD,META,AMZN,AAPL --from 2012-01-01 --to 2022-12-31`"
+        ));
     }
 
     #[test]
