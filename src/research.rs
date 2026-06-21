@@ -1443,6 +1443,38 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, base_min_return) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.10,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.12,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min15_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.15,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(base_min_return);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profiles.push(profile);
+    }
+
     for (name, max_realized_vol) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_rv20max45_delta20_30_credit20",
@@ -4048,17 +4080,35 @@ mod tests {
     #[test]
     fn return_or_drawdown_profiles_keep_current_best_risk_gates() {
         let profiles = research_profiles();
-        for (name, min_return) in [
+        for (name, base_min_return, gate_min_return) in [
             (
                 "select_farther_otm_cooldown10_trend60d_min5_trend15_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.05,
                 0.15,
             ),
             (
                 "select_farther_otm_cooldown10_trend60d_min5_trend20_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.05,
                 0.20,
             ),
             (
                 "select_farther_otm_cooldown10_trend60d_min5_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.05,
+                0.25,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.10,
+                0.25,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.12,
+                0.25,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min15_trend25_or_dd20d_min2_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.15,
                 0.25,
             ),
         ] {
@@ -4067,7 +4117,7 @@ mod tests {
                 .find(|profile| profile.name == name)
                 .unwrap();
             assert_eq!(profile.trend_lookback_days, Some(60));
-            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.min_underlying_return, Some(base_min_return));
             assert_eq!(profile.max_short_iv, Some(0.45));
             assert_eq!(profile.max_width, 15.0);
             assert!(profile.prefer_farther_otm);
@@ -4078,7 +4128,7 @@ mod tests {
             assert_eq!(
                 profile.return_or_drawdown_gate,
                 Some(ReturnOrDrawdownGate {
-                    min_underlying_return: Some(min_return),
+                    min_underlying_return: Some(gate_min_return),
                     min_underlying_drawdown: Some(0.02),
                 })
             );
