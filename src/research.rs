@@ -15,6 +15,7 @@ const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
+const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -172,6 +173,16 @@ pub struct WalkForwardYear {
     pub test_to: NaiveDate,
     pub active: bool,
     pub selected_profile: String,
+    pub train_metrics: WalkForwardTrainMetrics,
+    pub test_metrics: PeriodMetrics,
+    pub selection_candidates: Vec<WalkForwardSelectionCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalkForwardSelectionCandidate {
+    pub rank: usize,
+    pub profile: String,
+    pub active: bool,
     pub train_metrics: WalkForwardTrainMetrics,
     pub test_metrics: PeriodMetrics,
 }
@@ -660,9 +671,11 @@ fn walk_forward(
             continue;
         }
 
-        let Some(selection) = select_walk_forward_profile(profile_results, from, train_to) else {
+        let ranked_selections = rank_walk_forward_profiles(profile_results, from, train_to);
+        if ranked_selections.is_empty() {
             continue;
-        };
+        }
+        let selection = &ranked_selections[0];
 
         let active = deployable_training_profile(&selection.metrics);
         let mut accepted = Vec::new();
@@ -679,6 +692,31 @@ fn walk_forward(
                 accepted.push(trade);
             }
         }
+        let selection_candidates = ranked_selections
+            .iter()
+            .take(WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT)
+            .enumerate()
+            .map(|(idx, candidate)| {
+                let candidate_active = deployable_training_profile(&candidate.metrics);
+                let test_trades = if candidate_active {
+                    filter_trades_by_entry_date(&candidate.result.trades, test_from, test_to)
+                } else {
+                    Vec::new()
+                };
+                WalkForwardSelectionCandidate {
+                    rank: idx + 1,
+                    profile: candidate.result.profile.name.clone(),
+                    active: candidate_active,
+                    train_metrics: train_metrics_summary(&candidate.metrics),
+                    test_metrics: period_metrics(
+                        "out_of_sample_candidate",
+                        &test_trades,
+                        test_from,
+                        test_to,
+                    ),
+                }
+            })
+            .collect();
 
         *selected_profile_counts
             .entry(selection.result.profile.name.clone())
@@ -694,6 +732,7 @@ fn walk_forward(
             selected_profile: selection.result.profile.name.clone(),
             train_metrics: train_metrics_summary(&selection.metrics),
             test_metrics: period_metrics("out_of_sample", &accepted, test_from, test_to),
+            selection_candidates,
         });
     }
 
@@ -759,6 +798,16 @@ fn select_walk_forward_profile<'a>(
     train_from: NaiveDate,
     train_to: NaiveDate,
 ) -> Option<WalkForwardSelection<'a>> {
+    rank_walk_forward_profiles(profile_results, train_from, train_to)
+        .into_iter()
+        .next()
+}
+
+fn rank_walk_forward_profiles<'a>(
+    profile_results: &'a [ProfileResult],
+    train_from: NaiveDate,
+    train_to: NaiveDate,
+) -> Vec<WalkForwardSelection<'a>> {
     let mut scored = profile_results
         .iter()
         .map(|result| {
@@ -773,7 +822,7 @@ fn select_walk_forward_profile<'a>(
     scored.sort_by(|a, b| {
         profile_rank_order(&a.metrics, &a.result.profile, &b.metrics, &b.result.profile)
     });
-    scored.into_iter().next()
+    scored
 }
 
 fn deployable_training_profile(metrics: &ResearchMetrics) -> bool {
@@ -3133,6 +3182,28 @@ fn research_markdown(report: &ResearchReport) -> String {
     }
     out.push('\n');
 
+    out.push_str("## Walk-Forward Selection Diagnostics\n\n");
+    out.push_str("| Test Year | Rank | Active | Profile | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
+    out.push_str("|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    for year in &wf.years {
+        for candidate in &year.selection_candidates {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} |\n",
+                year.test_year,
+                candidate.rank,
+                if candidate.active { "yes" } else { "no" },
+                candidate.profile,
+                candidate.train_metrics.trades,
+                candidate.train_metrics.total_pnl,
+                candidate.train_metrics.robust_score,
+                candidate.test_metrics.trades,
+                candidate.test_metrics.total_pnl,
+                candidate.test_metrics.score
+            ));
+        }
+    }
+    out.push('\n');
+
     let holdout = &report.holdout;
     out.push_str("## Half-Window Holdout Selector\n\n");
     out.push_str(&format!(
@@ -4568,6 +4639,9 @@ mod tests {
         assert_eq!(result.years[0].test_year, 2023);
         assert!(result.years[0].active);
         assert_eq!(result.years[0].selected_profile, "better");
+        assert_eq!(result.years[0].selection_candidates.len(), 2);
+        assert_eq!(result.years[0].selection_candidates[0].rank, 1);
+        assert_eq!(result.years[0].selection_candidates[0].profile, "better");
         assert_eq!(result.years[1].test_year, 2024);
         assert!(result.years[1].active);
         assert_eq!(result.years[1].selected_profile, "better");
