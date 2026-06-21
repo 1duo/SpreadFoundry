@@ -806,11 +806,16 @@ fn latest_signal_for_profile(
         .filter(|candidate| candidate.entry_date == latest_entry_date)
         .collect::<Vec<_>>();
     day_candidates.sort_by(|a, b| candidate_quality_order(a, b, &result.profile));
+    let status = if latest_entry_date == to {
+        "entry_candidate"
+    } else {
+        "open_candidate"
+    };
     Some(signal_from_candidate(
         day_candidates[0],
         &result.profile.name,
         to,
-        "entry_candidate",
+        status,
     ))
 }
 
@@ -4464,6 +4469,28 @@ mod tests {
         assert_eq!(signal.long_put, 90.0);
         assert!((signal.entry_credit - 1.05).abs() < 1e-9);
         assert!((signal.max_loss - 395.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn latest_signal_labels_prior_entry_as_open_candidate() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let expiration = entry_date + Duration::days(40);
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            expiration,
+            vec![
+                option_day(entry_date, 95.0, 1.20, 1.25, -0.25, 105.0),
+                option_day(entry_date, 90.0, 0.10, 0.15, -0.15, 105.0),
+            ],
+        );
+        let result = profile_result("baseline", Vec::new(), entry_date, as_of);
+
+        let signal = latest_signal_for_profile(&result, &rows, entry_date, as_of).unwrap();
+
+        assert_eq!(signal.status, "open_candidate");
+        assert_eq!(signal.as_of, as_of);
+        assert_eq!(signal.entry_date, entry_date);
     }
 
     #[test]
