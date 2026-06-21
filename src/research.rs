@@ -4009,6 +4009,53 @@ fn research_markdown(report: &ResearchReport) -> String {
                 best_metrics.robust_score - baseline_metrics.robust_score
             ));
         }
+
+        out.push_str("## Detector Robustness Gap\n\n");
+        let best_metrics = &best.metrics;
+        let robust_gap = MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE - best_metrics.robust_score;
+        let weakest_period = best_metrics
+            .chronological
+            .iter()
+            .min_by(|a, b| a.score.total_cmp(&b.score));
+        out.push_str(&format!(
+            "- Best robust score: `{:.4}`\n- Required deployable robust score: `{:.4}`\n- Robust score gap: `{:.4}`\n",
+            best_metrics.robust_score,
+            MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE,
+            robust_gap.max(0.0)
+        ));
+        if let Some(period) = weakest_period {
+            out.push_str(&format!(
+                "- Weakest chronological period: `{}` (`{}` to `{}`, score `{:.4}`, trades `{}`)\n",
+                period.name, period.from, period.to, period.score, period.trades
+            ));
+        }
+        out.push_str("\n| Rank | Profile | Trades | PnL | Score | Robust Score | Gap | Weakest Period | Worst Year |\n");
+        out.push_str("|---:|---|---:|---:|---:|---:|---:|---|---|\n");
+        for (idx, result) in report.profiles.iter().take(5).enumerate() {
+            let m = &result.metrics;
+            let weakest = m
+                .chronological
+                .iter()
+                .min_by(|a, b| a.score.total_cmp(&b.score));
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.2} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
+                idx + 1,
+                result.profile.name,
+                m.trades,
+                m.total_pnl,
+                m.score,
+                m.robust_score,
+                (MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE - m.robust_score).max(0.0),
+                weakest
+                    .map(|period| format!("{} {:.4}", period.name, period.score))
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                format_optional_year_pnl(
+                    m.annual_stability.worst_year,
+                    m.annual_stability.worst_year_pnl
+                )
+            ));
+        }
+        out.push('\n');
     }
 
     let plateau = &report.plateau_status;
@@ -5052,6 +5099,9 @@ mod tests {
 
         assert!(markdown.contains("## Research Deployment Gate"));
         assert!(markdown.contains("## Out-of-Sample Failure Summary"));
+        assert!(markdown.contains("## Detector Robustness Gap"));
+        assert!(markdown.contains("Required deployable robust score"));
+        assert!(markdown.contains("Weakest chronological period"));
         assert!(markdown.contains("Inactive walk-forward years from weak train edge: `0`"));
         assert!(markdown.contains("Holdout active: `yes`"));
         assert!(markdown.contains("Requested window: `2012-01-01` to `2022-12-31`"));
