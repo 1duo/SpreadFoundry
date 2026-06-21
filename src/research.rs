@@ -2663,6 +2663,63 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, min_dte, max_delta, max_short_iv) in [
+        (
+            "edgeguard_dte35_delta25_35_ivcap45_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+            35,
+            0.35,
+            0.45,
+        ),
+        (
+            "edgeguard_dte30_delta25_34_ivcap45_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+            30,
+            0.34,
+            0.45,
+        ),
+        (
+            "edgeguard_dte30_delta25_35_ivcap44_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+            30,
+            0.35,
+            0.44,
+        ),
+        (
+            "edgeguard_dte35_delta25_34_ivcap44_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+            35,
+            0.34,
+            0.44,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.min_dte = min_dte;
+        profile.min_short_delta_abs = 0.25;
+        profile.max_short_delta_abs = max_delta;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.10);
+        profile.max_short_iv = Some(max_short_iv);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: 0.13,
+            min_underlying_drawdown: 0.03,
+            max_underlying_drawdown: 0.06,
+        });
+        profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        profile.risk_regime_cooldown_days = 20;
+        profiles.push(profile);
+    }
+
     for (name, stop_loss_multiple, take_profit_pct) in [
         (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -6862,6 +6919,81 @@ mod tests {
             assert_eq!(profile.trend_lookback_days, Some(60));
             assert_eq!(profile.min_underlying_return, Some(0.10));
             assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(
+                profile.weak_trend_pullback_guard,
+                Some(WeakTrendPullbackGuard {
+                    max_underlying_return: 0.13,
+                    min_underlying_drawdown: 0.03,
+                    max_underlying_drawdown: 0.06,
+                })
+            );
+            assert_eq!(
+                profile.risk_regime_cooldown_guard,
+                Some(TrendDrawdownGuard {
+                    min_underlying_return: 0.30,
+                    max_underlying_drawdown: 0.05,
+                })
+            );
+            assert_eq!(profile.risk_regime_cooldown_days, 20);
+        }
+    }
+
+    #[test]
+    fn edge_guard_profiles_keep_current_best_detector_except_edge_caps() {
+        let profiles = research_profiles();
+        for (name, min_dte, max_delta, max_short_iv) in [
+            (
+                "edgeguard_dte35_delta25_35_ivcap45_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+                35,
+                0.35,
+                0.45,
+            ),
+            (
+                "edgeguard_dte30_delta25_34_ivcap45_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+                30,
+                0.34,
+                0.45,
+            ),
+            (
+                "edgeguard_dte30_delta25_35_ivcap44_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+                30,
+                0.35,
+                0.44,
+            ),
+            (
+                "edgeguard_dte35_delta25_34_ivcap44_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_width15_lowdelta23_width10_credit20",
+                35,
+                0.34,
+                0.44,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.min_dte, min_dte);
+            assert_eq!(profile.max_dte, 45);
+            assert_eq!(profile.min_short_delta_abs, 0.25);
+            assert_eq!(profile.max_short_delta_abs, max_delta);
+            assert_eq!(profile.max_short_iv, Some(max_short_iv));
+            assert_eq!(profile.min_credit_width, 0.20);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.max_concurrent_positions, 1);
+            assert_eq!(profile.min_entry_spacing_days, 1);
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.10));
             assert_eq!(profile.max_width, 15.0);
             assert!(profile.prefer_farther_otm);
             assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
