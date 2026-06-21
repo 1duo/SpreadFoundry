@@ -677,6 +677,8 @@ fn universe_symbol_summary(
 ) -> UniverseSymbolSummary {
     let best = report.profiles.first();
     let best_fixed = report.fixed_profile_walk_forward.first();
+    let (research_status, error_message) =
+        universe_research_outcome(report.expirations_loaded, report.rows_loaded);
     let fixed_profile_oos_passes = report
         .fixed_profile_walk_forward
         .iter()
@@ -691,8 +693,8 @@ fn universe_symbol_summary(
         seed_rank: seed.map(|seed| seed.rank),
         seed_role: seed.map(|seed| seed.role.clone()),
         seed_rationale: seed.map(|seed| seed.rationale.clone()),
-        research_status: "ok".to_owned(),
-        error_message: None,
+        research_status,
+        error_message,
         report_dir: PathBuf::from("runs")
             .join(&report.run_id)
             .display()
@@ -755,6 +757,22 @@ fn universe_symbol_summary(
             .as_ref()
             .map(|signal| signal.status.clone()),
     }
+}
+
+fn universe_research_outcome(
+    expirations_loaded: usize,
+    rows_loaded: usize,
+) -> (String, Option<String>) {
+    if rows_loaded > 0 {
+        return ("ok".to_owned(), None);
+    }
+
+    let message = if expirations_loaded == 0 {
+        "ThetaData loaded zero expirations for this symbol/window; not comparable until data is available."
+    } else {
+        "ThetaData loaded expirations but zero usable EOD rows for this symbol/window; not comparable until data is available."
+    };
+    ("no_data".to_owned(), Some(message.to_owned()))
 }
 
 fn universe_symbol_error_summary(
@@ -1132,6 +1150,54 @@ mod tests {
             results[1].error_message.as_deref(),
             Some("ThetaData 403 | subscription required")
         );
+    }
+
+    #[test]
+    fn universe_research_outcome_marks_zero_rows_as_no_data() {
+        assert_eq!(universe_research_outcome(0, 0).0, "no_data");
+        assert!(
+            universe_research_outcome(3, 0)
+                .1
+                .unwrap()
+                .contains("zero usable EOD rows")
+        );
+        assert_eq!(universe_research_outcome(3, 100).0, "ok");
+    }
+
+    #[test]
+    fn universe_results_rank_no_data_behind_usable_research() {
+        let mut no_data = universe_summary_row(TestUniverseRow {
+            symbol: "TSLA",
+            seed_rank: Some(1),
+            deployment_status: "blocked",
+            fixed_profile_oos_passes: 10,
+            walk_forward_score: 10.0,
+            holdout_score: 10.0,
+            robust_score: 10.0,
+            rows_loaded: 0,
+        });
+        no_data.research_status = "no_data".to_owned();
+        no_data.error_message = Some("ThetaData loaded zero expirations".to_owned());
+        let mut results = vec![
+            no_data,
+            universe_summary_row(TestUniverseRow {
+                symbol: "AAPL",
+                seed_rank: Some(2),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 0,
+                walk_forward_score: -1.0,
+                holdout_score: -1.0,
+                robust_score: 0.1,
+                rows_loaded: 10_000,
+            }),
+        ];
+
+        rank_universe_results(&mut results);
+
+        assert_eq!(results[0].symbol, "AAPL");
+        assert_eq!(results[0].research_status, "ok");
+        assert_eq!(results[1].symbol, "TSLA");
+        assert_eq!(results[1].research_status, "no_data");
     }
 
     struct TestUniverseRow {
