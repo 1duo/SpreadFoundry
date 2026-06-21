@@ -49,6 +49,8 @@ pub struct ResearchProfile {
     pub min_short_otm_pct: Option<f64>,
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
+    pub low_delta_width_cap_delta_abs: Option<f64>,
+    pub low_delta_width_cap: Option<f64>,
     pub prefer_farther_otm: bool,
     pub stop_loss_cooldown_days: i64,
 }
@@ -77,6 +79,8 @@ impl ResearchProfile {
             min_short_otm_pct: None,
             min_short_iv: None,
             max_short_iv: None,
+            low_delta_width_cap_delta_abs: None,
+            low_delta_width_cap: None,
             prefer_farther_otm: false,
             stop_loss_cooldown_days: 1,
         }
@@ -833,6 +837,29 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, delta_threshold) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.23,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta24_width10_delta20_30_credit20",
+            0.24,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(delta_threshold);
+        profile.low_delta_width_cap = Some(10.0);
+        profiles.push(profile);
+    }
+
     for (name, max_short_iv) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_ivcap42_width15_delta20_30_credit20",
@@ -1364,7 +1391,7 @@ fn generate_candidates(
                         continue;
                     }
                     let width = short.strike - long.strike;
-                    if width < profile.min_width || width > profile.max_width {
+                    if !width_allowed(width, short_delta, profile) {
                         continue;
                     }
                     let credit = short.bid - long.ask;
@@ -1637,6 +1664,21 @@ fn iv_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
     }
     if let Some(max_short_iv) = profile.max_short_iv
         && row.implied_vol > max_short_iv
+    {
+        return false;
+    }
+    true
+}
+
+fn width_allowed(width: f64, short_delta_abs: f64, profile: &ResearchProfile) -> bool {
+    if width < profile.min_width || width > profile.max_width {
+        return false;
+    }
+    if let (Some(delta_threshold), Some(width_cap)) = (
+        profile.low_delta_width_cap_delta_abs,
+        profile.low_delta_width_cap,
+    ) && short_delta_abs < delta_threshold
+        && width > width_cap
     {
         return false;
     }
@@ -2567,6 +2609,19 @@ mod tests {
     }
 
     #[test]
+    fn low_delta_width_cap_only_rejects_wide_low_delta_spreads() {
+        let mut profile = ResearchProfile::baseline();
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+
+        assert!(width_allowed(15.0, 0.24, &profile));
+        assert!(width_allowed(10.0, 0.22, &profile));
+        assert!(!width_allowed(15.0, 0.22, &profile));
+        assert!(!width_allowed(20.0, 0.24, &profile));
+    }
+
+    #[test]
     fn early_take_profit_profiles_keep_current_best_entry_gates() {
         let profiles = research_profiles();
         let take35 = profiles
@@ -2654,6 +2709,34 @@ mod tests {
             assert_eq!(profile.stop_loss_cooldown_days, 10);
             assert_eq!(profile.min_short_delta_abs, min_delta);
             assert_eq!(profile.max_short_delta_abs, 0.30);
+        }
+    }
+
+    #[test]
+    fn low_delta_width_cap_profiles_keep_current_best_entry_gates() {
+        let profiles = research_profiles();
+        for (name, delta_threshold) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.23,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta24_width10_delta20_30_credit20",
+                0.24,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(delta_threshold));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
         }
     }
 
