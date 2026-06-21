@@ -1265,7 +1265,7 @@ fn execution_strategy_details(strategy: Option<&ExecutionStrategySummary>) -> St
         .map(|days| format!("{days}d"))
         .unwrap_or_else(|| "none".to_owned());
     format!(
-        "selector {}; entry {}; exit {}; take profit {:.0}%; stop {:.1}x credit; force close {} DTE; max hold {}; stop cooldown {}d",
+        "selector {}; entry {}; exit {}; take profit {:.0}%; stop {:.1}x credit; force close {} DTE; max hold {}; stop cooldown {}d; max positions {}; entry spacing {}d",
         strategy.candidate_selector,
         strategy.entry_fill_model,
         strategy.exit_fill_model,
@@ -1273,7 +1273,9 @@ fn execution_strategy_details(strategy: Option<&ExecutionStrategySummary>) -> St
         strategy.stop_loss_multiple,
         strategy.force_close_dte,
         max_hold,
-        strategy.stop_loss_cooldown_days
+        strategy.stop_loss_cooldown_days,
+        strategy.max_concurrent_positions,
+        strategy.min_entry_spacing_days
     )
 }
 
@@ -1774,6 +1776,7 @@ mod tests {
         assert!(markdown.contains("quote width <= max(10% mid, $0.10)"));
         assert!(markdown.contains("filters: short_iv<=0.450"));
         assert!(markdown.contains("selector farther_otm_then_credit"));
+        assert!(markdown.contains("max positions 1; entry spacing 1d"));
     }
 
     #[test]
@@ -1947,6 +1950,8 @@ mod tests {
             force_close_dte: 21,
             max_hold_days: None,
             stop_loss_cooldown_days: 10,
+            max_concurrent_positions: 1,
+            min_entry_spacing_days: 1,
         }
     }
 

@@ -131,6 +131,8 @@ pub struct ResearchProfile {
     pub low_delta_width_cap: Option<f64>,
     pub prefer_farther_otm: bool,
     pub stop_loss_cooldown_days: i64,
+    pub max_concurrent_positions: usize,
+    pub min_entry_spacing_days: i64,
 }
 
 impl ResearchProfile {
@@ -173,6 +175,8 @@ impl ResearchProfile {
             low_delta_width_cap: None,
             prefer_farther_otm: false,
             stop_loss_cooldown_days: 1,
+            max_concurrent_positions: 1,
+            min_entry_spacing_days: 1,
         }
     }
 }
@@ -277,6 +281,8 @@ pub struct ExecutionStrategySummary {
     pub force_close_dte: i64,
     pub max_hold_days: Option<i64>,
     pub stop_loss_cooldown_days: i64,
+    pub max_concurrent_positions: usize,
+    pub min_entry_spacing_days: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -950,13 +956,23 @@ fn execution_strategy_summary(profile: &ResearchProfile) -> ExecutionStrategySum
     } else {
         "highest_return_on_risk"
     };
+    let concurrency_suffix =
+        if profile.max_concurrent_positions > 1 || profile.min_entry_spacing_days != 1 {
+            format!(
+                "_maxpos{}_gap{}d",
+                profile.max_concurrent_positions, profile.min_entry_spacing_days
+            )
+        } else {
+            String::new()
+        };
     ExecutionStrategySummary {
         name: format!(
-            "put_spread_execution_{}_tp{:.0}_stop{:.1}_close{}d",
+            "put_spread_execution_{}_tp{:.0}_stop{:.1}_close{}d{}",
             candidate_selector,
             profile.take_profit_pct * 100.0,
             profile.stop_loss_multiple,
-            profile.force_close_dte
+            profile.force_close_dte,
+            concurrency_suffix
         ),
         candidate_selector: candidate_selector.to_owned(),
         entry_fill_model: "short_bid_minus_long_ask".to_owned(),
@@ -966,6 +982,8 @@ fn execution_strategy_summary(profile: &ResearchProfile) -> ExecutionStrategySum
         force_close_dte: profile.force_close_dte,
         max_hold_days: profile.max_hold_days,
         stop_loss_cooldown_days: profile.stop_loss_cooldown_days,
+        max_concurrent_positions: profile.max_concurrent_positions,
+        min_entry_spacing_days: profile.min_entry_spacing_days,
     }
 }
 
@@ -1102,6 +1120,9 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
     complexity += option_complexity(&profile.low_delta_width_cap, &baseline.low_delta_width_cap);
     complexity += usize::from(profile.prefer_farther_otm != baseline.prefer_farther_otm);
     complexity += usize::from(profile.stop_loss_cooldown_days != baseline.stop_loss_cooldown_days);
+    complexity +=
+        usize::from(profile.max_concurrent_positions != baseline.max_concurrent_positions);
+    complexity += usize::from(profile.min_entry_spacing_days != baseline.min_entry_spacing_days);
     complexity
 }
 
@@ -2593,6 +2614,55 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, max_concurrent_positions, min_entry_spacing_days) in [
+        (
+            "overlap2_gap5_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+            2,
+            5,
+        ),
+        (
+            "overlap2_gap10_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+            2,
+            10,
+        ),
+        (
+            "overlap3_gap7_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+            3,
+            7,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.max_concurrent_positions = max_concurrent_positions;
+        profile.min_entry_spacing_days = min_entry_spacing_days;
+        profile.min_short_delta_abs = 0.25;
+        profile.max_short_delta_abs = 0.35;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.10);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: 0.13,
+            min_underlying_drawdown: 0.03,
+            max_underlying_drawdown: 0.06,
+        });
+        profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        profile.risk_regime_cooldown_days = 20;
+        profiles.push(profile);
+    }
+
     for (name, stop_loss_multiple, take_profit_pct) in [
         (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -3532,7 +3602,11 @@ fn simulate_non_overlapping(
 
     let mut trades = Vec::new();
     let mut next_entry_date = NaiveDate::MIN;
+    let mut open_trades = Vec::new();
     for (date, mut day_candidates) in by_date {
+        if profile.max_concurrent_positions > 1 {
+            retire_closed_trades(date, &mut open_trades, &mut next_entry_date, profile);
+        }
         if date < next_entry_date {
             continue;
         }
@@ -3540,16 +3614,46 @@ fn simulate_non_overlapping(
             next_entry_date = next_entry_date_after_risk_regime(date, profile);
             continue;
         }
+        if profile.max_concurrent_positions > 1
+            && open_trades.len() >= profile.max_concurrent_positions
+        {
+            continue;
+        }
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
         for candidate in day_candidates {
             if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
-                next_entry_date = next_entry_date_after_trade(&trade, profile);
+                if profile.max_concurrent_positions > 1 {
+                    next_entry_date = date + Duration::days(profile.min_entry_spacing_days.max(1));
+                    open_trades.push(trade.clone());
+                } else {
+                    next_entry_date = next_entry_date_after_trade(&trade, profile);
+                }
                 trades.push(trade);
                 break;
             }
         }
     }
     trades
+}
+
+fn retire_closed_trades(
+    date: NaiveDate,
+    open_trades: &mut Vec<ResearchTrade>,
+    next_entry_date: &mut NaiveDate,
+    profile: &ResearchProfile,
+) {
+    let mut still_open = Vec::new();
+    for trade in open_trades.drain(..) {
+        if trade.exit_date < date {
+            if trade.exit_reason == "stop_loss" {
+                *next_entry_date =
+                    (*next_entry_date).max(next_entry_date_after_trade(&trade, profile));
+            }
+        } else {
+            still_open.push(trade);
+        }
+    }
+    *open_trades = still_open;
 }
 
 fn risk_regime_cooldown_triggered(
@@ -6724,6 +6828,72 @@ mod tests {
     }
 
     #[test]
+    fn overlap_profiles_keep_current_best_detector_and_cap_heat() {
+        let profiles = research_profiles();
+        for (name, max_concurrent_positions, min_entry_spacing_days) in [
+            (
+                "overlap2_gap5_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+                2,
+                5,
+            ),
+            (
+                "overlap2_gap10_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+                2,
+                10,
+            ),
+            (
+                "overlap3_gap7_stopcool10_riskcool30dd5_20d_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta25_35_credit20",
+                3,
+                7,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.min_dte, 30);
+            assert_eq!(profile.max_dte, 45);
+            assert_eq!(profile.min_short_delta_abs, 0.25);
+            assert_eq!(profile.max_short_delta_abs, 0.35);
+            assert_eq!(profile.min_credit_width, 0.20);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.max_concurrent_positions, max_concurrent_positions);
+            assert_eq!(profile.min_entry_spacing_days, min_entry_spacing_days);
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.10));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(
+                profile.weak_trend_pullback_guard,
+                Some(WeakTrendPullbackGuard {
+                    max_underlying_return: 0.13,
+                    min_underlying_drawdown: 0.03,
+                    max_underlying_drawdown: 0.06,
+                })
+            );
+            assert_eq!(
+                profile.risk_regime_cooldown_guard,
+                Some(TrendDrawdownGuard {
+                    min_underlying_return: 0.30,
+                    max_underlying_drawdown: 0.05,
+                })
+            );
+            assert_eq!(profile.risk_regime_cooldown_days, 20);
+        }
+    }
+
+    #[test]
     fn current_best_execution_variants_keep_detector_gates() {
         let profiles = research_profiles();
         for (name, stop_loss_multiple, take_profit_pct) in [
@@ -7520,6 +7690,40 @@ mod tests {
         assert_eq!(day_candidates[0].entry_date, eligible_date);
     }
 
+    #[test]
+    fn capped_overlap_scheduler_allows_staggered_entries_but_caps_heat() {
+        let first_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let second_date = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
+        let third_date = NaiveDate::from_ymd_opt(2026, 1, 14).unwrap();
+        let candidates = vec![
+            candidate_for_ordering(first_date, 95.0, 90.0, 1.00, -0.30, 0.05),
+            candidate_for_ordering(second_date, 94.0, 89.0, 1.00, -0.30, 0.05),
+            candidate_for_ordering(third_date, 93.0, 88.0, 1.00, -0.30, 0.05),
+        ];
+        let rows_by_expiration =
+            rows_for_take_profit_candidates(&candidates, first_date + Duration::days(20));
+
+        let mut single = ResearchProfile::baseline();
+        single.prefer_farther_otm = true;
+        let single_trades = simulate_non_overlapping(&candidates, &rows_by_expiration, &single);
+        assert_eq!(single_trades.len(), 1);
+        assert_eq!(single_trades[0].entry_date, first_date);
+
+        let mut capped_overlap = single.clone();
+        capped_overlap.max_concurrent_positions = 2;
+        capped_overlap.min_entry_spacing_days = 1;
+        let overlap_trades =
+            simulate_non_overlapping(&candidates, &rows_by_expiration, &capped_overlap);
+
+        assert_eq!(
+            overlap_trades
+                .iter()
+                .map(|trade| trade.entry_date)
+                .collect::<Vec<_>>(),
+            vec![first_date, second_date]
+        );
+    }
+
     fn training_trades(pnl: f64) -> Vec<ResearchTrade> {
         let mut trades = Vec::new();
         for month in 1..=10 {
@@ -7683,6 +7887,37 @@ mod tests {
             short_iv: 0.5,
             long_iv: 0.5,
         }
+    }
+
+    fn rows_for_take_profit_candidates(
+        candidates: &[Candidate],
+        exit_date: NaiveDate,
+    ) -> BTreeMap<NaiveDate, Vec<OptionDay>> {
+        let mut rows_by_expiration = BTreeMap::new();
+        for candidate in candidates {
+            rows_by_expiration
+                .entry(candidate.expiration)
+                .or_insert_with(Vec::new)
+                .extend([
+                    option_day(
+                        exit_date,
+                        candidate.short.strike,
+                        0.30,
+                        0.40,
+                        candidate.short.delta,
+                        100.0,
+                    ),
+                    option_day(
+                        exit_date,
+                        candidate.long.strike,
+                        0.00,
+                        0.05,
+                        candidate.long.delta,
+                        100.0,
+                    ),
+                ]);
+        }
+        rows_by_expiration
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
