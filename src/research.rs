@@ -43,6 +43,7 @@ pub struct ResearchProfile {
     pub stop_loss_multiple: f64,
     pub trend_lookback_days: Option<i64>,
     pub min_underlying_return: Option<f64>,
+    pub max_underlying_return: Option<f64>,
     pub min_short_otm_pct: Option<f64>,
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
@@ -70,6 +71,7 @@ impl ResearchProfile {
             stop_loss_multiple: 2.0,
             trend_lookback_days: None,
             min_underlying_return: None,
+            max_underlying_return: None,
             min_short_otm_pct: None,
             min_short_iv: None,
             max_short_iv: None,
@@ -607,6 +609,32 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_trend60_min5_ivcap45_width15.max_width = 15.0;
     profiles.push(otm_cooldown_trend60_min5_ivcap45_width15);
 
+    for (name, max_return) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max25_ivcap45_width15_delta20_30_credit20",
+            0.25,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max30_ivcap45_width15_delta20_30_credit20",
+            0.30,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max40_ivcap45_width15_delta20_30_credit20",
+            0.40,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_underlying_return = Some(max_return);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profiles.push(profile);
+    }
+
     let mut otm_cooldown_trend60_min5_ivcap45_width15_stop175 = baseline.clone();
     otm_cooldown_trend60_min5_ivcap45_width15_stop175.name =
         "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_stop175_delta20_30_credit20"
@@ -1135,6 +1163,11 @@ fn entry_regime(
         let lookback_return = underlying_return(short.date, days, underlying_by_date)?;
         if let Some(min_return) = profile.min_underlying_return
             && lookback_return < min_return
+        {
+            return None;
+        }
+        if let Some(max_return) = profile.max_underlying_return
+            && lookback_return > max_return
         {
             return None;
         }
@@ -1838,6 +1871,7 @@ mod tests {
         let mut profile = ResearchProfile::baseline();
         profile.trend_lookback_days = Some(10);
         profile.min_underlying_return = Some(0.0);
+        profile.max_underlying_return = Some(0.20);
         profile.min_short_otm_pct = Some(0.08);
         let mut underlying = BTreeMap::new();
         underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
@@ -1861,6 +1895,9 @@ mod tests {
         assert!(entry_regime(&close_short, &profile, &underlying).is_none());
 
         underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 110.0);
+        assert!(entry_regime(&passing_short, &profile, &underlying).is_none());
+
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 80.0);
         assert!(entry_regime(&passing_short, &profile, &underlying).is_none());
     }
 
