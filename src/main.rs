@@ -177,6 +177,9 @@ struct UniverseResearchSummary {
     to: NaiveDate,
     symbols: Vec<String>,
     plateau_run: Option<String>,
+    max_expirations: Option<usize>,
+    fetch_concurrency: usize,
+    force_refresh: bool,
     strategy: String,
     selection_basis: String,
     research_method: String,
@@ -665,6 +668,9 @@ async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
         to,
         symbols,
         plateau_run: plateau_run.as_ref().map(|path| path.display().to_string()),
+        max_expirations,
+        fetch_concurrency,
+        force_refresh,
         strategy: "put_credit_spread".to_owned(),
         selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
         research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
@@ -1166,6 +1172,12 @@ fn optional_u16(value: Option<u16>) -> String {
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "all".to_owned())
+}
+
 fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1173,11 +1185,14 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Seed score basis: {}\n- Research method: {}\n\n",
+        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Max expirations per symbol: `{}`\n- Fetch concurrency: `{}`\n- Force refresh: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Seed score basis: {}\n- Research method: {}\n\n",
         summary.from,
         summary.to,
         summary.symbols.join(", "),
         summary.plateau_run.as_deref().unwrap_or("not provided"),
+        optional_usize(summary.max_expirations),
+        summary.fetch_concurrency,
+        summary.force_refresh,
         summary.strategy,
         summary.selection_basis,
         summary.seed_score_basis,
@@ -1528,6 +1543,9 @@ mod tests {
             to: NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
             symbols: vec!["TSLA".to_owned()],
             plateau_run: Some("runs/nvda/research.json".to_owned()),
+            max_expirations: Some(24),
+            fetch_concurrency: 8,
+            force_refresh: false,
             strategy: "put_credit_spread".to_owned(),
             selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
             research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
@@ -1541,6 +1559,8 @@ mod tests {
         let markdown = universe_markdown(&summary);
 
         assert!(markdown.contains("Strategy: `put_credit_spread`"));
+        assert!(markdown.contains("Max expirations per symbol: `24`"));
+        assert!(markdown.contains("Fetch concurrency: `8`"));
         assert!(markdown.contains("same Rust put-credit-spread profile grid"));
         assert!(markdown.contains("Seed score basis"));
         assert!(markdown.contains("## Research Protocol"));
