@@ -466,21 +466,98 @@ fn evenly_spaced<T: Copy>(items: Vec<T>, max: usize) -> Vec<T> {
 }
 
 fn profile_result_order(a: &ProfileResult, b: &ProfileResult) -> Ordering {
-    metrics_rank_order(&a.metrics, &a.profile.name, &b.metrics, &b.profile.name)
+    profile_rank_order(&a.metrics, &a.profile, &b.metrics, &b.profile)
 }
 
-fn metrics_rank_order(
+fn profile_rank_order(
     a_metrics: &ResearchMetrics,
-    a_name: &str,
+    a_profile: &ResearchProfile,
     b_metrics: &ResearchMetrics,
-    b_name: &str,
+    b_profile: &ResearchProfile,
 ) -> Ordering {
     b_metrics
         .robust_ranking_eligible
         .cmp(&a_metrics.robust_ranking_eligible)
         .then_with(|| b_metrics.robust_score.total_cmp(&a_metrics.robust_score))
         .then_with(|| b_metrics.score.total_cmp(&a_metrics.score))
-        .then_with(|| a_name.cmp(b_name))
+        .then_with(|| profile_complexity(a_profile).cmp(&profile_complexity(b_profile)))
+        .then_with(|| a_profile.name.cmp(&b_profile.name))
+}
+
+fn profile_complexity(profile: &ResearchProfile) -> usize {
+    let baseline = ResearchProfile::baseline();
+    let mut complexity = 0;
+    complexity += usize::from(profile.min_dte != baseline.min_dte);
+    complexity += usize::from(profile.max_dte != baseline.max_dte);
+    complexity += usize::from(profile.force_close_dte != baseline.force_close_dte);
+    complexity += usize::from(float_differs(
+        profile.min_short_delta_abs,
+        baseline.min_short_delta_abs,
+    ));
+    complexity += usize::from(float_differs(
+        profile.max_short_delta_abs,
+        baseline.max_short_delta_abs,
+    ));
+    complexity += usize::from(float_differs(profile.min_width, baseline.min_width));
+    complexity += usize::from(float_differs(profile.max_width, baseline.max_width));
+    complexity += usize::from(float_differs(
+        profile.min_credit_width,
+        baseline.min_credit_width,
+    ));
+    complexity += usize::from(float_differs(
+        profile.max_quote_width_pct_of_mid,
+        baseline.max_quote_width_pct_of_mid,
+    ));
+    complexity += usize::from(float_differs(
+        profile.max_quote_width_abs,
+        baseline.max_quote_width_abs,
+    ));
+    complexity += usize::from(profile.min_short_oi != baseline.min_short_oi);
+    complexity += usize::from(profile.min_long_oi != baseline.min_long_oi);
+    complexity += usize::from(float_differs(
+        profile.take_profit_pct,
+        baseline.take_profit_pct,
+    ));
+    complexity += usize::from(float_differs(
+        profile.stop_loss_multiple,
+        baseline.stop_loss_multiple,
+    ));
+    complexity += option_complexity(&profile.trend_lookback_days, &baseline.trend_lookback_days);
+    complexity += option_complexity(
+        &profile.min_underlying_return,
+        &baseline.min_underlying_return,
+    );
+    complexity += option_complexity(
+        &profile.max_underlying_return,
+        &baseline.max_underlying_return,
+    );
+    complexity += option_complexity(
+        &profile.drawdown_lookback_days,
+        &baseline.drawdown_lookback_days,
+    );
+    complexity += option_complexity(
+        &profile.max_underlying_drawdown,
+        &baseline.max_underlying_drawdown,
+    );
+    complexity += option_complexity(&profile.min_short_otm_pct, &baseline.min_short_otm_pct);
+    complexity += option_complexity(&profile.min_short_iv, &baseline.min_short_iv);
+    complexity += option_complexity(&profile.max_short_iv, &baseline.max_short_iv);
+    complexity += option_complexity(
+        &profile.low_delta_width_cap_delta_abs,
+        &baseline.low_delta_width_cap_delta_abs,
+    );
+    complexity += option_complexity(&profile.low_delta_width_cap, &baseline.low_delta_width_cap);
+    complexity += usize::from(profile.prefer_farther_otm != baseline.prefer_farther_otm);
+    complexity += usize::from(profile.stop_loss_cooldown_days != baseline.stop_loss_cooldown_days);
+    complexity
+}
+
+fn option_complexity<T: PartialEq>(value: &Option<T>, baseline: &Option<T>) -> usize {
+    usize::from(value != baseline)
+}
+
+fn float_differs(a: f64, b: f64) -> bool {
+    (a - b).abs() > f64::EPSILON
 }
 
 fn walk_forward(
@@ -615,12 +692,7 @@ fn select_walk_forward_profile<'a>(
         })
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| {
-        metrics_rank_order(
-            &a.metrics,
-            &a.result.profile.name,
-            &b.metrics,
-            &b.result.profile.name,
-        )
+        profile_rank_order(&a.metrics, &a.result.profile, &b.metrics, &b.result.profile)
     });
     scored.into_iter().next()
 }
@@ -2937,6 +3009,22 @@ mod tests {
         assert!(metrics.robust_ranking_eligible);
         assert!(metrics.robust_score < 0.0);
         assert!(!deployable_training_profile(&metrics));
+    }
+
+    #[test]
+    fn profile_ranking_prefers_simpler_profile_when_metrics_tie() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let trades = training_trades(50.0);
+        let simple = profile_result("z_simple", trades.clone(), from, to);
+        let mut complex = profile_result("a_complex", trades, from, to);
+        complex.profile.drawdown_lookback_days = Some(20);
+        complex.profile.max_underlying_drawdown = Some(0.12);
+
+        let mut results = [complex, simple];
+        results.sort_by(profile_result_order);
+
+        assert_eq!(results[0].profile.name, "z_simple");
     }
 
     #[test]
