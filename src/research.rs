@@ -990,8 +990,19 @@ fn profile_rank_order(
         .cmp(&a_metrics.robust_ranking_eligible)
         .then_with(|| b_metrics.robust_score.total_cmp(&a_metrics.robust_score))
         .then_with(|| b_metrics.score.total_cmp(&a_metrics.score))
+        .then_with(|| {
+            risk_regime_cooldown_tiebreak_score(b_profile)
+                .cmp(&risk_regime_cooldown_tiebreak_score(a_profile))
+        })
         .then_with(|| profile_complexity(a_profile).cmp(&profile_complexity(b_profile)))
         .then_with(|| a_profile.name.cmp(&b_profile.name))
+}
+
+fn risk_regime_cooldown_tiebreak_score(profile: &ResearchProfile) -> i64 {
+    if profile.risk_regime_cooldown_guard.is_none() {
+        return 0;
+    }
+    1_000 + profile.risk_regime_cooldown_days.max(0)
 }
 
 fn profile_complexity(profile: &ResearchProfile) -> usize {
@@ -5629,6 +5640,33 @@ mod tests {
         results.sort_by(profile_result_order);
 
         assert_eq!(results[0].profile.name, "z_simple");
+    }
+
+    #[test]
+    fn profile_ranking_prefers_risk_cooldown_when_training_metrics_tie() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let trades = training_trades(50.0);
+        let simple = profile_result("a_simple", trades.clone(), from, to);
+        let mut cooldown_10d = profile_result("b_cooldown_10d", trades.clone(), from, to);
+        cooldown_10d.profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        cooldown_10d.profile.risk_regime_cooldown_days = 10;
+        let mut cooldown_20d = profile_result("c_cooldown_20d", trades, from, to);
+        cooldown_20d.profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        cooldown_20d.profile.risk_regime_cooldown_days = 20;
+
+        let mut results = [simple, cooldown_10d, cooldown_20d];
+        results.sort_by(profile_result_order);
+
+        assert_eq!(results[0].profile.name, "c_cooldown_20d");
+        assert_eq!(results[1].profile.name, "b_cooldown_10d");
+        assert_eq!(results[2].profile.name, "a_simple");
     }
 
     #[test]
