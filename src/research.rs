@@ -131,9 +131,19 @@ pub struct ResearchReport {
     pub expirations_loaded: usize,
     pub rows_loaded: usize,
     pub latest_signal: Option<ResearchSignal>,
+    pub deployment_gate: DeploymentGate,
     pub walk_forward: WalkForwardResult,
     pub holdout: HoldoutResult,
     pub profiles: Vec<ProfileResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeploymentGate {
+    pub status: String,
+    pub pass: bool,
+    pub best_profile_gate: bool,
+    pub walk_forward_oos_gate: bool,
+    pub holdout_oos_gate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -469,6 +479,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         request.from,
         request.to,
     );
+    let deployment_gate = deployment_gate_for(&profile_results, &walk_forward, &holdout);
 
     let report = ResearchReport {
         run_id: run_id.clone(),
@@ -479,6 +490,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         expirations_loaded: rows_by_expiration.len(),
         rows_loaded,
         latest_signal,
+        deployment_gate,
         walk_forward,
         holdout,
         profiles: profile_results,
@@ -766,6 +778,26 @@ fn select_walk_forward_profile<'a>(
 
 fn deployable_training_profile(metrics: &ResearchMetrics) -> bool {
     metrics.robust_ranking_eligible && metrics.robust_score > 0.0
+}
+
+fn deployment_gate_for(
+    profile_results: &[ProfileResult],
+    walk_forward: &WalkForwardResult,
+    holdout: &HoldoutResult,
+) -> DeploymentGate {
+    let best_profile_gate = profile_results
+        .first()
+        .is_some_and(|result| deployable_training_profile(&result.metrics));
+    let walk_forward_oos_gate = out_of_sample_gate_passes(&walk_forward.metrics);
+    let holdout_oos_gate = holdout.active && out_of_sample_gate_passes(&holdout.metrics);
+    let pass = best_profile_gate && walk_forward_oos_gate && holdout_oos_gate;
+    DeploymentGate {
+        status: format_gate(pass).to_owned(),
+        pass,
+        best_profile_gate,
+        walk_forward_oos_gate,
+        holdout_oos_gate,
+    }
 }
 
 fn filter_trades_by_entry_date(
@@ -3000,28 +3032,22 @@ fn research_markdown(report: &ResearchReport) -> String {
             .unwrap_or(MIN_RANKING_TRADES)
     ));
 
-    let best_profile_gate = report
-        .profiles
-        .first()
-        .is_some_and(|result| deployable_training_profile(&result.metrics));
-    let walk_forward_gate = out_of_sample_gate_passes(&report.walk_forward.metrics);
-    let holdout_gate = report.holdout.active && out_of_sample_gate_passes(&report.holdout.metrics);
-    let deployment_gate = best_profile_gate && walk_forward_gate && holdout_gate;
+    let gate = &report.deployment_gate;
     out.push_str("## Research Deployment Gate\n\n");
     out.push_str(&format!(
         "- Status: `{}`\n- Best-profile robust gate: `{}`\n- Walk-forward OOS gate: `{}` (trades `{}`, PnL `{:.2}`, score `{:.4}`)\n- Holdout OOS gate: `{}` (trades `{}`, PnL `{:.2}`, score `{:.4}`)\n",
-        format_gate(deployment_gate),
-        format_gate(best_profile_gate),
-        format_gate(walk_forward_gate),
+        gate.status,
+        format_gate(gate.best_profile_gate),
+        format_gate(gate.walk_forward_oos_gate),
         report.walk_forward.metrics.trades,
         report.walk_forward.metrics.total_pnl,
         report.walk_forward.metrics.score,
-        format_gate(holdout_gate),
+        format_gate(gate.holdout_oos_gate),
         report.holdout.metrics.trades,
         report.holdout.metrics.total_pnl,
         report.holdout.metrics.score
     ));
-    if !deployment_gate {
+    if !gate.pass {
         out.push_str(
             "- Interpretation: latest signals are research candidates only until out-of-sample gates are positive.\n\n",
         );
@@ -3035,7 +3061,7 @@ fn research_markdown(report: &ResearchReport) -> String {
             "- As of: `{}`\n- Status: `{}`\n- Research deployment gate: `{}`\n- Profile: `{}`\n- Entry date: `{}`\n- Expiration: `{}`\n- Entry DTE: `{}`\n- Spread: `{:.0}P/{:.0}P`\n- Width: `{:.2}`\n- Credit: `{:.2}`\n- Max profit: `{:.2}`\n- Max loss: `{:.2}`\n- Return on risk: `{:.3}`\n- Underlying: `{:.2}`\n- Short OTM: `{:.1}%`\n- Short delta: `{:.3}`\n- Short IV: `{:.1}%`\n- Trend return: `{}`\n- Recent drawdown: `{}`\n- Realized vol: `{}`\n\n",
             signal.as_of,
             signal.status,
-            format_gate(deployment_gate),
+            gate.status,
             signal.profile_name,
             signal.entry_date,
             signal.expiration,
@@ -3689,6 +3715,13 @@ mod tests {
             expirations_loaded: 1,
             rows_loaded: 2,
             latest_signal: Some(test_signal(to, "best")),
+            deployment_gate: DeploymentGate {
+                status: "blocked".to_owned(),
+                pass: false,
+                best_profile_gate: true,
+                walk_forward_oos_gate: false,
+                holdout_oos_gate: true,
+            },
             walk_forward: WalkForwardResult {
                 min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
                 years: Vec::new(),
@@ -3716,6 +3749,10 @@ mod tests {
         assert!(markdown.contains("- Status: `blocked`"));
         assert!(markdown.contains("- Research deployment gate: `blocked`"));
         assert!(markdown.contains("latest signals are research candidates only"));
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["deployment_gate"]["status"], "blocked");
+        assert_eq!(json["deployment_gate"]["pass"], false);
     }
 
     #[test]
