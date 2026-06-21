@@ -1174,6 +1174,34 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, max_return) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max25_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.25,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max30_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.30,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_max40_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.40,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_underlying_return = Some(max_return);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profiles.push(profile);
+    }
+
     for (name, lookback_days, min_return) in [
         (
             "select_farther_otm_cooldown10_trend20d_min0_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -3360,6 +3388,39 @@ mod tests {
             assert_eq!(profile.trend_lookback_days, Some(60));
             assert_eq!(profile.min_underlying_return, Some(0.05));
             assert_eq!(profile.max_short_iv, Some(max_short_iv));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+        }
+    }
+
+    #[test]
+    fn max_trend_low_delta_width_cap_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, max_return) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_max25_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.25,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_max30_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.30,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_max40_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.40,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_underlying_return, Some(max_return));
+            assert_eq!(profile.max_short_iv, Some(0.45));
             assert_eq!(profile.max_width, 15.0);
             assert!(profile.prefer_farther_otm);
             assert_eq!(profile.stop_loss_cooldown_days, 10);
