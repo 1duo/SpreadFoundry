@@ -1519,12 +1519,12 @@ fn plateau_status_for(
 fn plateau_status_from_counts(
     profiles_evaluated: usize,
     walk_forward_years: usize,
-    holdout_active: bool,
+    _holdout_active: bool,
     deployment_gate: &DeploymentGate,
 ) -> PlateauStatus {
     let profile_variants_evaluated = profiles_evaluated.saturating_sub(1);
     let enough_variants = profile_variants_evaluated >= PLATEAU_MIN_PROFILE_VARIANTS;
-    let enough_oos = walk_forward_years >= PLATEAU_MIN_WALK_FORWARD_YEARS && holdout_active;
+    let enough_walk_forward = walk_forward_years >= PLATEAU_MIN_WALK_FORWARD_YEARS;
     let detector_status = if deployment_gate.best_profile_gate {
         "robust"
     } else {
@@ -1548,7 +1548,7 @@ fn plateau_status_from_counts(
         && !deployment_gate.walk_forward_oos_gate
         && !deployment_gate.holdout_oos_gate
         && enough_variants
-        && enough_oos
+        && enough_walk_forward
     {
         (
             "plateau_expand_universe",
@@ -1570,11 +1570,11 @@ fn plateau_status_from_counts(
             "no robust in-sample detector is available yet",
             "continue current-symbol detector search",
         )
-    } else if !enough_oos {
+    } else if !enough_walk_forward {
         (
             "continue_symbol_research",
             false,
-            "out-of-sample coverage is too thin for plateau",
+            "walk-forward coverage is too thin for plateau",
             "extend current-symbol history or walk-forward coverage before expanding symbols",
         )
     } else {
@@ -5531,6 +5531,29 @@ mod tests {
                 .next_action
                 .contains("five liquid single-stock symbols")
         );
+    }
+
+    #[test]
+    fn plateau_status_expands_universe_when_holdout_is_inactive_after_broad_search() {
+        let gate = DeploymentGate {
+            status: "blocked".to_owned(),
+            pass: false,
+            best_profile_gate: true,
+            walk_forward_oos_gate: false,
+            holdout_oos_gate: false,
+        };
+
+        let status = plateau_status_from_counts(
+            PLATEAU_MIN_PROFILE_VARIANTS + 32,
+            PLATEAU_MIN_WALK_FORWARD_YEARS + 4,
+            false,
+            &gate,
+        );
+
+        assert_eq!(status.status, "plateau_expand_universe");
+        assert!(status.expansion_ready);
+        assert_eq!(status.detector_status, "robust");
+        assert_eq!(status.execution_strategy_status, "oos_blocked");
     }
 
     #[test]
