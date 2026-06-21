@@ -14,6 +14,9 @@ use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_UNIVERSE_SYMBOLS: [&str; 5] = ["TSLA", "AAPL", "AMD", "AMZN", "MSFT"];
+const DEFAULT_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AAPL,AMD,AMZN,MSFT";
+
 #[derive(Parser, Debug)]
 #[command(name = "spreadfoundry")]
 #[command(about = "Rust-only options spread simulation and gated execution research")]
@@ -94,7 +97,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            default_value = "TSLA,AAPL,AMZN,META,MSFT"
+            default_value = DEFAULT_UNIVERSE_SYMBOLS_CSV
         )]
         symbols: Vec<String>,
         #[arg(long)]
@@ -160,12 +163,24 @@ struct UniverseResearchSummary {
     symbols: Vec<String>,
     plateau_run: Option<String>,
     selection_basis: String,
+    expansion_seed: Vec<UniverseSeedSymbol>,
     results: Vec<UniverseSymbolSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UniverseSeedSymbol {
+    rank: usize,
+    symbol: String,
+    role: String,
+    rationale: String,
 }
 
 #[derive(Debug, Serialize)]
 struct UniverseSymbolSummary {
     symbol: String,
+    seed_rank: Option<usize>,
+    seed_role: Option<String>,
+    seed_rationale: Option<String>,
     report_dir: String,
     deployment_status: String,
     plateau_status: String,
@@ -502,6 +517,7 @@ async fn research_universe(
         .unwrap_or("universe-research")
         .to_owned();
     let mut results = Vec::new();
+    let expansion_seed = expansion_seed_for_symbols(&symbols);
     for symbol in &symbols {
         println!("researching {symbol}");
         let report = run_symbol_research(ResearchRequest {
@@ -513,7 +529,7 @@ async fn research_universe(
             force_refresh,
         })
         .await?;
-        results.push(universe_symbol_summary(&report));
+        results.push(universe_symbol_summary(&report, &expansion_seed));
     }
 
     let summary = UniverseResearchSummary {
@@ -524,7 +540,8 @@ async fn research_universe(
         plateau_run: plateau_run
             .as_ref()
             .map(|path| path.display().to_string()),
-        selection_basis: "Liquidity-first single-stock expansion seed; rerank with ThetaData chain liquidity, OI, spreads, and out-of-sample strategy results before any live use.".to_owned(),
+        selection_basis: "Plateau expansion uses a liquidity-first, single-stock seed for put credit spreads, then reranks by ThetaData chain liquidity, OI, bid/ask spreads, and out-of-sample strategy results before any live use.".to_owned(),
+        expansion_seed,
         results,
     };
     fs::write(
@@ -547,6 +564,67 @@ fn normalize_symbols(symbols: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn expansion_seed_for_symbols(symbols: &[String]) -> Vec<UniverseSeedSymbol> {
+    let default_seed = default_universe_seed();
+    symbols
+        .iter()
+        .enumerate()
+        .map(|(idx, symbol)| {
+            if let Some(default_symbol) = default_seed
+                .iter()
+                .find(|seed| seed.symbol == *symbol)
+            {
+                let mut seed = default_symbol.clone();
+                seed.rank = idx + 1;
+                seed
+            } else {
+                UniverseSeedSymbol {
+                    rank: idx + 1,
+                    symbol: symbol.clone(),
+                    role: "manual_override".to_owned(),
+                    rationale: "Manual universe override; must still pass ThetaData liquidity, detector, execution, and out-of-sample gates before promotion.".to_owned(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn default_universe_seed() -> Vec<UniverseSeedSymbol> {
+    let metadata = [
+        (
+            "high_iv_liquidity",
+            "Highest-liquidity high-IV single-stock candidate; useful for testing whether premium-rich spreads survive gap and drawdown risk.",
+        ),
+        (
+            "liquidity_anchor",
+            "Deep, tight, weekly option chain; useful as a lower-IV execution-quality anchor for spread fills.",
+        ),
+        (
+            "semiconductor_beta",
+            "Liquid semiconductor options with higher beta than mega-cap software; useful to compare against NVDA without reusing the plateau symbol.",
+        ),
+        (
+            "mega_cap_growth",
+            "Large-cap growth chain with active weeklies; useful for testing whether the detector generalizes beyond semiconductors.",
+        ),
+        (
+            "quality_mega_cap",
+            "Deep mega-cap option chain; useful as a lower-gap-risk quality-stock control for put credit spread execution.",
+        ),
+    ];
+    DEFAULT_UNIVERSE_SYMBOLS
+        .iter()
+        .zip(metadata.iter())
+        .enumerate()
+        .map(|(idx, (symbol, (role, rationale)))| UniverseSeedSymbol {
+            rank: idx + 1,
+            symbol: (*symbol).to_owned(),
+            role: (*role).to_owned(),
+            rationale: (*rationale).to_owned(),
+        })
+        .collect()
+}
+
 fn research_report_path(path: &Path) -> PathBuf {
     if path.is_dir() {
         path.join("research.json")
@@ -565,10 +643,19 @@ fn parse_plateau_run_gate(body: &str) -> Result<PlateauRunStatus> {
     Ok(gate.plateau_status)
 }
 
-fn universe_symbol_summary(report: &ResearchReport) -> UniverseSymbolSummary {
+fn universe_symbol_summary(
+    report: &ResearchReport,
+    expansion_seed: &[UniverseSeedSymbol],
+) -> UniverseSymbolSummary {
     let best = report.profiles.first();
+    let seed = expansion_seed
+        .iter()
+        .find(|seed| seed.symbol == report.symbol);
     UniverseSymbolSummary {
         symbol: report.symbol.clone(),
+        seed_rank: seed.map(|seed| seed.rank),
+        seed_role: seed.map(|seed| seed.role.clone()),
+        seed_rationale: seed.map(|seed| seed.rationale.clone()),
         report_dir: PathBuf::from("runs")
             .join(&report.run_id)
             .display()
@@ -620,13 +707,29 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.plateau_run.as_deref().unwrap_or("not provided"),
         summary.selection_basis
     ));
-    out.push_str("| Symbol | Report | Deployment | Plateau | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Latest Signal |\n");
+
+    out.push_str("## Expansion Seed\n\n");
+    out.push_str("| Rank | Symbol | Role | Rationale |\n");
+    out.push_str("|---:|---|---|---|\n");
+    for seed in &summary.expansion_seed {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            seed.rank, seed.symbol, seed.role, seed.rationale
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("| Seed Rank | Symbol | Report | Deployment | Plateau | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Latest Signal |\n");
     out.push_str(
-        "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     for result in &summary.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} |\n",
+            result
+                .seed_rank
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
             result.symbol,
             result.report_dir,
             result.deployment_status,
@@ -694,6 +797,33 @@ mod tests {
             ]),
             vec!["TSLA".to_owned(), "AAPL".to_owned()]
         );
+    }
+
+    #[test]
+    fn default_universe_seed_is_five_non_nvda_single_stocks() {
+        let seed = default_universe_seed();
+
+        assert_eq!(seed.len(), 5);
+        assert_eq!(
+            seed.iter()
+                .map(|symbol| symbol.symbol.as_str())
+                .collect::<Vec<_>>(),
+            DEFAULT_UNIVERSE_SYMBOLS.to_vec()
+        );
+        assert!(!seed.iter().any(|symbol| symbol.symbol == "NVDA"));
+        assert!(seed.iter().all(|symbol| !symbol.rationale.is_empty()));
+    }
+
+    #[test]
+    fn expansion_seed_marks_manual_overrides() {
+        let seed = expansion_seed_for_symbols(&["AAPL".to_owned(), "GOOGL".to_owned()]);
+
+        assert_eq!(seed[0].rank, 1);
+        assert_eq!(seed[0].symbol, "AAPL");
+        assert_eq!(seed[0].role, "liquidity_anchor");
+        assert_eq!(seed[1].rank, 2);
+        assert_eq!(seed[1].symbol, "GOOGL");
+        assert_eq!(seed[1].role, "manual_override");
     }
 
     #[test]
