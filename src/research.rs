@@ -48,6 +48,7 @@ pub struct ResearchProfile {
     pub min_underlying_return: Option<f64>,
     pub max_underlying_return: Option<f64>,
     pub drawdown_lookback_days: Option<i64>,
+    pub min_underlying_drawdown: Option<f64>,
     pub max_underlying_drawdown: Option<f64>,
     pub realized_vol_lookback_days: Option<i64>,
     pub max_realized_vol: Option<f64>,
@@ -83,6 +84,7 @@ impl ResearchProfile {
             min_underlying_return: None,
             max_underlying_return: None,
             drawdown_lookback_days: None,
+            min_underlying_drawdown: None,
             max_underlying_drawdown: None,
             realized_vol_lookback_days: None,
             max_realized_vol: None,
@@ -559,6 +561,10 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
     complexity += option_complexity(
         &profile.drawdown_lookback_days,
         &baseline.drawdown_lookback_days,
+    );
+    complexity += option_complexity(
+        &profile.min_underlying_drawdown,
+        &baseline.min_underlying_drawdown,
     );
     complexity += option_complexity(
         &profile.max_underlying_drawdown,
@@ -1352,6 +1358,35 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, min_drawdown) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min1_delta20_30_credit20",
+            0.01,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min2_delta20_30_credit20",
+            0.02,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min3_delta20_30_credit20",
+            0.03,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.min_underlying_drawdown = Some(min_drawdown);
+        profiles.push(profile);
+    }
+
     for (name, max_realized_vol) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_rv20max45_delta20_30_credit20",
@@ -1993,6 +2028,11 @@ fn entry_regime(
 
     let underlying_recent_drawdown = if let Some(days) = profile.drawdown_lookback_days {
         let drawdown = underlying_drawdown(short.date, days, underlying_by_date)?;
+        if let Some(min_drawdown) = profile.min_underlying_drawdown
+            && drawdown < min_drawdown
+        {
+            return None;
+        }
         if let Some(max_drawdown) = profile.max_underlying_drawdown
             && drawdown > max_drawdown
         {
@@ -3182,6 +3222,31 @@ mod tests {
     }
 
     #[test]
+    fn entry_regime_rejects_insufficient_recent_drawdown() {
+        let mut profile = ResearchProfile::baseline();
+        profile.drawdown_lookback_days = Some(10);
+        profile.min_underlying_drawdown = Some(0.05);
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(), 120.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 118.0);
+        let short = option_day(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            95.0,
+            1.0,
+            1.1,
+            -0.25,
+            118.0,
+        );
+
+        assert!(entry_regime(&short, &profile, &underlying).is_none());
+
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(), 112.0);
+        let regime = entry_regime(&short, &profile, &underlying).unwrap();
+        assert!((regime.underlying_recent_drawdown.unwrap() - (8.0 / 120.0)).abs() < 1e-9);
+    }
+
+    #[test]
     fn candidate_generation_ignores_pre_window_lookback_rows() {
         let expiration = NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
         let pre_window = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
@@ -3853,6 +3918,40 @@ mod tests {
             assert_eq!(profile.low_delta_width_cap, Some(10.0));
             assert_eq!(profile.drawdown_lookback_days, Some(20));
             assert_eq!(profile.max_underlying_drawdown, Some(max_drawdown));
+        }
+    }
+
+    #[test]
+    fn pullback_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, min_drawdown) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min1_delta20_30_credit20",
+                0.01,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min2_delta20_30_credit20",
+                0.02,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_dd20d_min3_delta20_30_credit20",
+                0.03,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(profile.min_underlying_drawdown, Some(min_drawdown));
         }
     }
 
