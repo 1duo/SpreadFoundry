@@ -534,6 +534,36 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_trend60.min_underlying_return = Some(0.0);
     profiles.push(otm_cooldown_trend60);
 
+    let mut otm_cooldown_trend60_ivcap55 = baseline.clone();
+    otm_cooldown_trend60_ivcap55.name =
+        "select_farther_otm_cooldown10_trend60d_ivcap55_delta20_30_credit20".to_owned();
+    otm_cooldown_trend60_ivcap55.prefer_farther_otm = true;
+    otm_cooldown_trend60_ivcap55.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_ivcap55.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_ivcap55.min_underlying_return = Some(0.0);
+    otm_cooldown_trend60_ivcap55.max_short_iv = Some(0.55);
+    profiles.push(otm_cooldown_trend60_ivcap55);
+
+    let mut otm_cooldown_trend60_ivcap50 = baseline.clone();
+    otm_cooldown_trend60_ivcap50.name =
+        "select_farther_otm_cooldown10_trend60d_ivcap50_delta20_30_credit20".to_owned();
+    otm_cooldown_trend60_ivcap50.prefer_farther_otm = true;
+    otm_cooldown_trend60_ivcap50.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_ivcap50.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_ivcap50.min_underlying_return = Some(0.0);
+    otm_cooldown_trend60_ivcap50.max_short_iv = Some(0.50);
+    profiles.push(otm_cooldown_trend60_ivcap50);
+
+    let mut otm_cooldown_trend60_ivcap45 = baseline.clone();
+    otm_cooldown_trend60_ivcap45.name =
+        "select_farther_otm_cooldown10_trend60d_ivcap45_delta20_30_credit20".to_owned();
+    otm_cooldown_trend60_ivcap45.prefer_farther_otm = true;
+    otm_cooldown_trend60_ivcap45.stop_loss_cooldown_days = 10;
+    otm_cooldown_trend60_ivcap45.trend_lookback_days = Some(60);
+    otm_cooldown_trend60_ivcap45.min_underlying_return = Some(0.0);
+    otm_cooldown_trend60_ivcap45.max_short_iv = Some(0.45);
+    profiles.push(otm_cooldown_trend60_ivcap45);
+
     let mut otm_cooldown_trend60_otm8 = baseline.clone();
     otm_cooldown_trend60_otm8.name =
         "select_farther_otm_cooldown10_trend60d_otm8pct_delta20_30_credit20".to_owned();
