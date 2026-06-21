@@ -117,6 +117,7 @@ pub struct ResearchMetrics {
     pub best_trade_pnl: f64,
     pub worst_trade_pnl: f64,
     pub score: f64,
+    pub robust_score: f64,
     pub ranking_eligible: bool,
     pub required_trades: usize,
     pub exit_reasons: BTreeMap<String, usize>,
@@ -296,8 +297,9 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
     }
     profile_results.sort_by(|a, b| {
         b.metrics
-            .score
-            .total_cmp(&a.metrics.score)
+            .robust_score
+            .total_cmp(&a.metrics.robust_score)
+            .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
             .then_with(|| a.profile.name.cmp(&b.profile.name))
     });
 
@@ -1359,6 +1361,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             best_trade_pnl: 0.0,
             worst_trade_pnl: 0.0,
             score: -1_000_000.0,
+            robust_score: -1_000_000.0,
             ranking_eligible: false,
             required_trades,
             exit_reasons: BTreeMap::new(),
@@ -1401,6 +1404,8 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
     } else {
         -1_000_000.0 + sorted.len() as f64 / required_trades as f64
     };
+    let chronological = chronological_period_metrics(&sorted, from, to);
+    let robust_score = robust_score(score, &chronological);
     ResearchMetrics {
         trades: sorted.len(),
         total_pnl,
@@ -1428,11 +1433,12 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             .map(|trade| trade.pnl)
             .fold(f64::MAX, f64::min),
         score,
+        robust_score,
         ranking_eligible,
         required_trades,
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
-        chronological: chronological_period_metrics(&sorted, from, to),
+        chronological,
     }
 }
 
@@ -1470,6 +1476,13 @@ fn max_drawdown(trades: &[ResearchTrade]) -> f64 {
         }
     }
     drawdown / risk
+}
+
+fn robust_score(score: f64, periods: &[PeriodMetrics]) -> f64 {
+    periods
+        .iter()
+        .map(|period| period.score)
+        .fold(score, f64::min)
 }
 
 fn chronological_period_metrics(
@@ -1648,12 +1661,12 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
-    out.push_str("| Rank | Profile | Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score |\n");
-    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Rank | Profile | Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for (idx, result) in report.profiles.iter().enumerate() {
         let m = &result.metrics;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} |\n",
+            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.1} | {:.1} | {:.1} | {:.4} | {:.4} |\n",
             idx + 1,
             result.profile.name,
             if m.ranking_eligible { "yes" } else { "no" },
@@ -1667,7 +1680,8 @@ fn research_markdown(report: &ResearchReport) -> String {
             m.avg_entry_dte,
             m.avg_days_held,
             m.trades_per_year,
-            m.score
+            m.score,
+            m.robust_score
         ));
     }
     out.push_str("\n## Chronological Robustness\n\n");
@@ -1893,6 +1907,19 @@ mod tests {
     }
 
     #[test]
+    fn robust_score_uses_weakest_chronological_period() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2020, 12, 31).unwrap();
+        let periods = vec![
+            test_period_metrics("first_half", from, to, 0.12),
+            test_period_metrics("second_half", from, to, -0.05),
+        ];
+
+        assert_eq!(robust_score(0.04, &periods), -0.05);
+        assert_eq!(robust_score(-0.10, &periods), -0.10);
+    }
+
+    #[test]
     fn iv_filter_rejects_short_leg_above_cap() {
         let mut profile = ResearchProfile::baseline();
         profile.max_short_iv = Some(0.8);
@@ -2035,6 +2062,28 @@ mod tests {
         trade.return_on_risk = pnl / max_loss;
         trade.max_loss = max_loss;
         trade
+    }
+
+    fn test_period_metrics(
+        name: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        score: f64,
+    ) -> PeriodMetrics {
+        PeriodMetrics {
+            name: name.to_owned(),
+            from,
+            to,
+            trades: 10,
+            total_pnl: 0.0,
+            avg_return_on_risk: 0.0,
+            win_rate: 0.0,
+            profit_factor: 0.0,
+            max_drawdown: 0.0,
+            score,
+            ranking_eligible: true,
+            required_trades: 10,
+        }
     }
 
     fn trade_with_exit(exit_date: NaiveDate, exit_reason: &str) -> ResearchTrade {
