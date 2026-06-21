@@ -502,7 +502,7 @@ fn walk_forward(
             continue;
         };
 
-        let active = selection.metrics.robust_ranking_eligible;
+        let active = deployable_training_profile(&selection.metrics);
         let mut accepted = Vec::new();
         if active {
             let mut test_trades =
@@ -567,7 +567,7 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
         };
     };
 
-    let active = selection.metrics.robust_ranking_eligible;
+    let active = deployable_training_profile(&selection.metrics);
     let mut trades = if active {
         filter_trades_by_entry_date(&selection.result.trades, test_from, to)
     } else {
@@ -616,6 +616,10 @@ fn select_walk_forward_profile<'a>(
         )
     });
     scored.into_iter().next()
+}
+
+fn deployable_training_profile(metrics: &ResearchMetrics) -> bool {
+    metrics.robust_ranking_eligible && metrics.robust_score > 0.0
 }
 
 fn filter_trades_by_entry_date(
@@ -2784,6 +2788,37 @@ mod tests {
         assert!(!robust_ranking_eligible(true, 75.0, &periods));
         assert!(!robust_ranking_eligible(false, 75.0, &periods));
         assert!(!robust_ranking_eligible(true, -1.0, &periods));
+    }
+
+    #[test]
+    fn deployable_training_profile_requires_positive_robust_score() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2021, 12, 31).unwrap();
+        let mut trades = Vec::new();
+        for month in 1..=10 {
+            trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2020, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2020, month, 8).unwrap(),
+                20.0,
+            ));
+        }
+        trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2021, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2021, 1, 8).unwrap(),
+            -300.0,
+        ));
+        for month in 2..=11 {
+            trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2021, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2021, month, 8).unwrap(),
+                40.0,
+            ));
+        }
+        let metrics = metrics(&trades, from, to);
+
+        assert!(metrics.robust_ranking_eligible);
+        assert!(metrics.robust_score < 0.0);
+        assert!(!deployable_training_profile(&metrics));
     }
 
     #[test]
