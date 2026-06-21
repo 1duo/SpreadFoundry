@@ -43,6 +43,7 @@ pub struct ResearchProfile {
     pub min_long_oi: u32,
     pub take_profit_pct: f64,
     pub stop_loss_multiple: f64,
+    pub max_hold_days: Option<i64>,
     pub trend_lookback_days: Option<i64>,
     pub min_underlying_return: Option<f64>,
     pub max_underlying_return: Option<f64>,
@@ -75,6 +76,7 @@ impl ResearchProfile {
             min_long_oi: 250,
             take_profit_pct: 0.50,
             stop_loss_multiple: 2.0,
+            max_hold_days: None,
             trend_lookback_days: None,
             min_underlying_return: None,
             max_underlying_return: None,
@@ -522,6 +524,7 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
         profile.stop_loss_multiple,
         baseline.stop_loss_multiple,
     ));
+    complexity += option_complexity(&profile.max_hold_days, &baseline.max_hold_days);
     complexity += option_complexity(&profile.trend_lookback_days, &baseline.trend_lookback_days);
     complexity += option_complexity(
         &profile.min_underlying_return,
@@ -1116,6 +1119,34 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profile.max_width = 15.0;
         profile.low_delta_width_cap_delta_abs = Some(delta_threshold);
         profile.low_delta_width_cap = Some(10.0);
+        profiles.push(profile);
+    }
+
+    for (name, max_hold_days) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold7_delta20_30_credit20",
+            7,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold10_delta20_30_credit20",
+            10,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold14_delta20_30_credit20",
+            14,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.max_hold_days = Some(max_hold_days);
         profiles.push(profile);
     }
 
@@ -2027,6 +2058,7 @@ fn simulate_candidate(
     let stop_debit = candidate.credit * profile.stop_loss_multiple;
 
     for (date, short) in short_rows.range((candidate.entry_date + Duration::days(1))..) {
+        let days_held = (*date - candidate.entry_date).num_days();
         let dte = (candidate.expiration - *date).num_days();
         let Some(long) = long_rows.get(date) else {
             continue;
@@ -2036,6 +2068,11 @@ fn simulate_candidate(
             Some("stop_loss")
         } else if debit <= take_profit_debit {
             Some("take_profit")
+        } else if profile
+            .max_hold_days
+            .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
+        {
+            Some("max_hold")
         } else if dte <= profile.force_close_dte {
             Some("force_close")
         } else {
@@ -3213,6 +3250,76 @@ mod tests {
     }
 
     #[test]
+    fn max_hold_exit_triggers_after_configured_days() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let candidate = candidate_for_ordering(entry_date, 95.0, 90.0, 1.0, -0.25, 0.05);
+        let mut rows_by_expiration = BTreeMap::new();
+        rows_by_expiration.insert(
+            candidate.expiration,
+            vec![
+                option_day(
+                    entry_date + Duration::days(1),
+                    95.0,
+                    1.10,
+                    1.20,
+                    -0.25,
+                    100.0,
+                ),
+                option_day(
+                    entry_date + Duration::days(1),
+                    90.0,
+                    0.05,
+                    0.20,
+                    -0.15,
+                    100.0,
+                ),
+                option_day(
+                    entry_date + Duration::days(2),
+                    95.0,
+                    1.10,
+                    1.20,
+                    -0.25,
+                    100.0,
+                ),
+                option_day(
+                    entry_date + Duration::days(2),
+                    90.0,
+                    0.05,
+                    0.20,
+                    -0.15,
+                    100.0,
+                ),
+                option_day(
+                    entry_date + Duration::days(3),
+                    95.0,
+                    1.10,
+                    1.20,
+                    -0.25,
+                    100.0,
+                ),
+                option_day(
+                    entry_date + Duration::days(3),
+                    90.0,
+                    0.05,
+                    0.20,
+                    -0.15,
+                    100.0,
+                ),
+            ],
+        );
+        let lookup = build_lookup(&rows_by_expiration);
+        let mut profile = ResearchProfile::baseline();
+        profile.max_hold_days = Some(3);
+
+        let trade = simulate_candidate(&candidate, &lookup, &profile).unwrap();
+
+        assert_eq!(trade.exit_date, entry_date + Duration::days(3));
+        assert_eq!(trade.days_held, 3);
+        assert_eq!(trade.exit_reason, "max_hold");
+        assert!((trade.exit_debit - 1.15).abs() < 1e-9);
+    }
+
+    #[test]
     fn early_take_profit_profiles_keep_current_best_entry_gates() {
         let profiles = research_profiles();
         let take35 = profiles
@@ -3328,6 +3435,39 @@ mod tests {
             assert_eq!(profile.stop_loss_cooldown_days, 10);
             assert_eq!(profile.low_delta_width_cap_delta_abs, Some(delta_threshold));
             assert_eq!(profile.low_delta_width_cap, Some(10.0));
+        }
+    }
+
+    #[test]
+    fn max_hold_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, max_hold_days) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold7_delta20_30_credit20",
+                7,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold10_delta20_30_credit20",
+                10,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_hold14_delta20_30_credit20",
+                14,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.max_hold_days, Some(max_hold_days));
         }
     }
 
