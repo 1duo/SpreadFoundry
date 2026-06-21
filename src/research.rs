@@ -16,6 +16,8 @@ const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
+const PLATEAU_MIN_PROFILE_VARIANTS: usize = 75;
+const PLATEAU_MIN_WALK_FORWARD_YEARS: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -154,6 +156,7 @@ pub struct ResearchReport {
     pub rows_loaded: usize,
     pub latest_signal: Option<ResearchSignal>,
     pub deployment_gate: DeploymentGate,
+    pub plateau_status: PlateauStatus,
     pub walk_forward: WalkForwardResult,
     pub holdout: HoldoutResult,
     pub profiles: Vec<ProfileResult>,
@@ -166,6 +169,21 @@ pub struct DeploymentGate {
     pub best_profile_gate: bool,
     pub walk_forward_oos_gate: bool,
     pub holdout_oos_gate: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlateauStatus {
+    pub status: String,
+    pub expansion_ready: bool,
+    pub profiles_evaluated: usize,
+    pub profile_variants_evaluated: usize,
+    pub min_profile_variants: usize,
+    pub walk_forward_years: usize,
+    pub min_walk_forward_years: usize,
+    pub detector_status: String,
+    pub execution_strategy_status: String,
+    pub reason: String,
+    pub next_action: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -512,6 +530,8 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         request.to,
     );
     let deployment_gate = deployment_gate_for(&profile_results, &walk_forward, &holdout);
+    let plateau_status =
+        plateau_status_for(&profile_results, &deployment_gate, &walk_forward, &holdout);
 
     let report = ResearchReport {
         run_id: run_id.clone(),
@@ -523,6 +543,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         rows_loaded,
         latest_signal,
         deployment_gate,
+        plateau_status,
         walk_forward,
         holdout,
         profiles: profile_results,
@@ -871,6 +892,105 @@ fn deployment_gate_for(
         best_profile_gate,
         walk_forward_oos_gate,
         holdout_oos_gate,
+    }
+}
+
+fn plateau_status_for(
+    profile_results: &[ProfileResult],
+    deployment_gate: &DeploymentGate,
+    walk_forward: &WalkForwardResult,
+    holdout: &HoldoutResult,
+) -> PlateauStatus {
+    plateau_status_from_counts(
+        profile_results.len(),
+        walk_forward.years.len(),
+        holdout.active,
+        deployment_gate,
+    )
+}
+
+fn plateau_status_from_counts(
+    profiles_evaluated: usize,
+    walk_forward_years: usize,
+    holdout_active: bool,
+    deployment_gate: &DeploymentGate,
+) -> PlateauStatus {
+    let profile_variants_evaluated = profiles_evaluated.saturating_sub(1);
+    let enough_variants = profile_variants_evaluated >= PLATEAU_MIN_PROFILE_VARIANTS;
+    let enough_oos = walk_forward_years >= PLATEAU_MIN_WALK_FORWARD_YEARS && holdout_active;
+    let detector_status = if deployment_gate.best_profile_gate {
+        "robust"
+    } else {
+        "blocked"
+    };
+    let execution_strategy_status =
+        if deployment_gate.walk_forward_oos_gate && deployment_gate.holdout_oos_gate {
+            "oos_pass"
+        } else {
+            "oos_blocked"
+        };
+
+    let (status, expansion_ready, reason, next_action) = if deployment_gate.pass {
+        (
+            "live_gate_passed",
+            false,
+            "detector and execution strategy both passed deployment gates",
+            "review shadow-live readiness before any broker integration",
+        )
+    } else if deployment_gate.best_profile_gate
+        && !deployment_gate.walk_forward_oos_gate
+        && !deployment_gate.holdout_oos_gate
+        && enough_variants
+        && enough_oos
+    {
+        (
+            "plateau_expand_universe",
+            true,
+            "current-symbol detector is robust in sample, but execution validation is still blocked out of sample after broad profile search",
+            "run the same separated detector and execution-strategy research on five liquid single-stock symbols",
+        )
+    } else if !enough_variants {
+        (
+            "continue_symbol_research",
+            false,
+            "profile search has not reached the minimum variant coverage for plateau",
+            "continue current-symbol detector and execution-strategy variants",
+        )
+    } else if !enough_oos {
+        (
+            "continue_symbol_research",
+            false,
+            "out-of-sample coverage is too thin for plateau",
+            "extend current-symbol history or walk-forward coverage before expanding symbols",
+        )
+    } else if !deployment_gate.best_profile_gate {
+        (
+            "continue_symbol_research",
+            false,
+            "no robust in-sample detector is available yet",
+            "continue current-symbol detector search",
+        )
+    } else {
+        (
+            "continue_symbol_research",
+            false,
+            "at least one out-of-sample gate still needs targeted validation",
+            "continue current-symbol execution-strategy research",
+        )
+    };
+
+    PlateauStatus {
+        status: status.to_owned(),
+        expansion_ready,
+        profiles_evaluated,
+        profile_variants_evaluated,
+        min_profile_variants: PLATEAU_MIN_PROFILE_VARIANTS,
+        walk_forward_years,
+        min_walk_forward_years: PLATEAU_MIN_WALK_FORWARD_YEARS,
+        detector_status: detector_status.to_owned(),
+        execution_strategy_status: execution_strategy_status.to_owned(),
+        reason: reason.to_owned(),
+        next_action: next_action.to_owned(),
     }
 }
 
@@ -3173,6 +3293,23 @@ fn research_markdown(report: &ResearchReport) -> String {
         out.push('\n');
     }
 
+    let plateau = &report.plateau_status;
+    out.push_str("## Research Plateau Status\n\n");
+    out.push_str(&format!(
+        "- Status: `{}`\n- Expansion ready: `{}`\n- Profiles evaluated: `{}` (`{}` variants; plateau minimum `{}`)\n- Walk-forward years: `{}` (plateau minimum `{}`)\n- Detector status: `{}`\n- Execution strategy status: `{}`\n- Reason: {}\n- Next action: {}\n\n",
+        plateau.status,
+        format_gate(plateau.expansion_ready),
+        plateau.profiles_evaluated,
+        plateau.profile_variants_evaluated,
+        plateau.min_profile_variants,
+        plateau.walk_forward_years,
+        plateau.min_walk_forward_years,
+        plateau.detector_status,
+        plateau.execution_strategy_status,
+        plateau.reason,
+        plateau.next_action
+    ));
+
     if let Some(signal) = &report.latest_signal {
         out.push_str("## Latest Signal\n\n");
         out.push_str(&format!(
@@ -3882,6 +4019,14 @@ mod tests {
         let passing_oos = metrics(&training_trades(40.0), from, to);
         let mut blocked_oos = passing_oos.clone();
         blocked_oos.score = -0.01;
+        let deployment_gate = DeploymentGate {
+            status: "blocked".to_owned(),
+            pass: false,
+            best_profile_gate: true,
+            walk_forward_oos_gate: false,
+            holdout_oos_gate: true,
+        };
+        let plateau_status = plateau_status_from_counts(1, 0, true, &deployment_gate);
         let report = ResearchReport {
             run_id: "test-run".to_owned(),
             symbol: "NVDA".to_owned(),
@@ -3891,13 +4036,8 @@ mod tests {
             expirations_loaded: 1,
             rows_loaded: 2,
             latest_signal: Some(test_signal(to, "best")),
-            deployment_gate: DeploymentGate {
-                status: "blocked".to_owned(),
-                pass: false,
-                best_profile_gate: true,
-                walk_forward_oos_gate: false,
-                holdout_oos_gate: true,
-            },
+            deployment_gate,
+            plateau_status,
             walk_forward: WalkForwardResult {
                 min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
                 years: Vec::new(),
@@ -3929,6 +4069,39 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["deployment_gate"]["status"], "blocked");
         assert_eq!(json["deployment_gate"]["pass"], false);
+        assert_eq!(json["plateau_status"]["status"], "continue_symbol_research");
+    }
+
+    #[test]
+    fn plateau_status_expands_universe_after_broad_blocked_oos_search() {
+        let gate = DeploymentGate {
+            status: "blocked".to_owned(),
+            pass: false,
+            best_profile_gate: true,
+            walk_forward_oos_gate: false,
+            holdout_oos_gate: false,
+        };
+
+        let status = plateau_status_from_counts(
+            PLATEAU_MIN_PROFILE_VARIANTS + 1,
+            PLATEAU_MIN_WALK_FORWARD_YEARS,
+            true,
+            &gate,
+        );
+
+        assert_eq!(status.status, "plateau_expand_universe");
+        assert!(status.expansion_ready);
+        assert_eq!(
+            status.profile_variants_evaluated,
+            PLATEAU_MIN_PROFILE_VARIANTS
+        );
+        assert_eq!(status.detector_status, "robust");
+        assert_eq!(status.execution_strategy_status, "oos_blocked");
+        assert!(
+            status
+                .next_action
+                .contains("five liquid single-stock symbols")
+        );
     }
 
     #[test]
