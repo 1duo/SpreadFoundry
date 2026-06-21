@@ -2114,7 +2114,7 @@ fn contract_key_strike(contract: &Value) -> Result<String> {
 
 fn row_date(row: &Value) -> Option<NaiveDate> {
     let ts = row.get("timestamp")?.as_str()?;
-    NaiveDate::parse_from_str(&ts[0..10], "%Y-%m-%d").ok()
+    NaiveDate::parse_from_str(ts.get(0..10)?, "%Y-%m-%d").ok()
 }
 
 fn number(row: &Value, key: &str) -> f64 {
@@ -3562,6 +3562,13 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].entry_date, entry_date);
+    }
+
+    #[test]
+    fn row_date_rejects_short_timestamp_without_panicking() {
+        let row = serde_json::json!({ "timestamp": "bad" });
+
+        assert_eq!(row_date(&row), None);
     }
 
     #[test]
