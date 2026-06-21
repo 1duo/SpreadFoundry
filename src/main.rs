@@ -17,8 +17,10 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_UNIVERSE_SYMBOLS: [&str; 5] = ["TSLA", "AAPL", "AMD", "AMZN", "MSFT"];
-const DEFAULT_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AAPL,AMD,AMZN,MSFT";
+const DEFAULT_UNIVERSE_SYMBOLS: [&str; 5] = ["TSLA", "AMD", "META", "AMZN", "AAPL"];
+const DEFAULT_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AMD,META,AMZN,AAPL";
+const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses five non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
+const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
 
 #[derive(Parser, Debug)]
 #[command(name = "spreadfoundry")]
@@ -165,7 +167,9 @@ struct UniverseResearchSummary {
     to: NaiveDate,
     symbols: Vec<String>,
     plateau_run: Option<String>,
+    strategy: String,
     selection_basis: String,
+    research_method: String,
     expansion_seed: Vec<UniverseSeedSymbol>,
     results: Vec<UniverseSymbolSummary>,
 }
@@ -562,10 +566,10 @@ async fn research_universe(
         from,
         to,
         symbols,
-        plateau_run: plateau_run
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        selection_basis: "Plateau expansion uses a liquidity-first, single-stock seed for put credit spreads, then sorts the final table by deployment pass, fixed-profile OOS passes, walk-forward score, holdout score, robust score, and chain data coverage before any live use.".to_owned(),
+        plateau_run: plateau_run.as_ref().map(|path| path.display().to_string()),
+        strategy: "put_credit_spread".to_owned(),
+        selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
+        research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
         expansion_seed,
         results,
     };
@@ -617,24 +621,24 @@ fn expansion_seed_for_symbols(symbols: &[String]) -> Vec<UniverseSeedSymbol> {
 fn default_universe_seed() -> Vec<UniverseSeedSymbol> {
     let metadata = [
         (
-            "high_iv_liquidity",
-            "Highest-liquidity high-IV single-stock candidate; useful for testing whether premium-rich spreads survive gap and drawdown risk.",
+            "premium_liquidity_leader",
+            "High-liquidity, premium-rich single-stock option chain; tests whether rich credits survive gap and drawdown risk.",
         ),
         (
-            "liquidity_anchor",
-            "Deep, tight, weekly option chain; useful as a lower-IV execution-quality anchor for spread fills.",
+            "semiconductor_beta_peer",
+            "Liquid semiconductor chain with NVDA-adjacent beta; tests whether the detector is sector-specific or transferable.",
         ),
         (
-            "semiconductor_beta",
-            "Liquid semiconductor options with higher beta than mega-cap software; useful to compare against NVDA without reusing the plateau symbol.",
+            "mega_cap_premium_growth",
+            "Deep mega-cap growth chain with active weeklies and historically usable premium; tests a non-semiconductor high-beta large cap.",
         ),
         (
-            "mega_cap_growth",
-            "Large-cap growth chain with active weeklies; useful for testing whether the detector generalizes beyond semiconductors.",
+            "commerce_cloud_growth",
+            "Large, liquid growth stock with active weeklies; adds a different earnings and volatility profile than semiconductors and social ads.",
         ),
         (
-            "quality_mega_cap",
-            "Deep mega-cap option chain; useful as a lower-gap-risk quality-stock control for put credit spread execution.",
+            "liquidity_quality_anchor",
+            "Deep, tight option chain with lower relative premium; useful as an execution-quality control for conservative fills.",
         ),
     ];
     DEFAULT_UNIVERSE_SYMBOLS
@@ -861,12 +865,14 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Selection basis: {}\n\n",
+        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Research method: {}\n\n",
         summary.from,
         summary.to,
         summary.symbols.join(", "),
         summary.plateau_run.as_deref().unwrap_or("not provided"),
-        summary.selection_basis
+        summary.strategy,
+        summary.selection_basis,
+        summary.research_method
     ));
 
     out.push_str("## Expansion Seed\n\n");
@@ -1001,7 +1007,7 @@ mod tests {
 
         assert_eq!(seed[0].rank, 1);
         assert_eq!(seed[0].symbol, "AAPL");
-        assert_eq!(seed[0].role, "liquidity_anchor");
+        assert_eq!(seed[0].role, "liquidity_quality_anchor");
         assert_eq!(seed[1].rank, 2);
         assert_eq!(seed[1].symbol, "GOOGL");
         assert_eq!(seed[1].role, "manual_override");
@@ -1070,13 +1076,17 @@ mod tests {
             to: NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
             symbols: vec!["TSLA".to_owned()],
             plateau_run: Some("runs/nvda/research.json".to_owned()),
-            selection_basis: "test".to_owned(),
+            strategy: "put_credit_spread".to_owned(),
+            selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
+            research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
             expansion_seed: Vec::new(),
             results,
         };
 
         let markdown = universe_markdown(&summary);
 
+        assert!(markdown.contains("Strategy: `put_credit_spread`"));
+        assert!(markdown.contains("same Rust put-credit-spread profile grid"));
         assert!(markdown.contains("## Symbol Suitability Ranking"));
         assert!(markdown.contains("Detector Status"));
         assert!(markdown.contains("Best Fixed Detector"));
