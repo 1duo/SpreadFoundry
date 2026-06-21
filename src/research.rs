@@ -940,7 +940,7 @@ fn walk_forward_with_mode(
         }
         let selection = &ranked_selections[0];
 
-        let active = deployable_training_profile(&selection.metrics);
+        let active = deployable_training_selection(selection, train_to);
         let mut accepted = Vec::new();
         if active {
             let mut test_trades =
@@ -960,7 +960,7 @@ fn walk_forward_with_mode(
             .take(WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT)
             .enumerate()
             .map(|(idx, candidate)| {
-                let candidate_active = deployable_training_profile(&candidate.metrics);
+                let candidate_active = deployable_training_selection(candidate, train_to);
                 let test_trades = if candidate_active {
                     filter_trades_by_entry_date(&candidate.result.trades, test_from, test_to)
                 } else {
@@ -1041,7 +1041,7 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
         };
     };
 
-    let active = deployable_training_profile(&selection.metrics);
+    let active = deployable_training_selection(&selection, train_to);
     let mut trades = if active {
         filter_trades_by_entry_date(&selection.result.trades, test_from, to)
     } else {
@@ -1103,6 +1103,21 @@ fn rank_walk_forward_profiles<'a>(
 
 fn deployable_training_profile(metrics: &ResearchMetrics) -> bool {
     metrics.robust_ranking_eligible && metrics.robust_score > 0.0
+}
+
+fn deployable_training_selection(
+    selection: &WalkForwardSelection<'_>,
+    train_to: NaiveDate,
+) -> bool {
+    deployable_training_profile(&selection.metrics)
+        && recent_training_activity_gate(&selection.train_trades, train_to)
+}
+
+fn recent_training_activity_gate(train_trades: &[ResearchTrade], train_to: NaiveDate) -> bool {
+    let recent_from = train_to - Duration::days(RECENT_TRAIN_ACTIVITY_DAYS - 1);
+    train_trades
+        .iter()
+        .any(|trade| trade.entry_date >= recent_from && trade.entry_date <= train_to)
 }
 
 fn deployment_gate_for(
@@ -5360,6 +5375,11 @@ mod tests {
         let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
         let mut better_trades = training_trades(50.0);
         better_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        better_trades.push(trade_with_entry_exit(
             NaiveDate::from_ymd_opt(2023, 12, 29).unwrap(),
             NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
             25.0,
@@ -5392,26 +5412,64 @@ mod tests {
         assert_eq!(result.years[1].test_year, 2024);
         assert!(result.years[1].active);
         assert_eq!(result.years[1].selected_profile, "better");
-        assert_eq!(result.years[1].train_metrics.recent_trades, 0);
-        assert!(!result.years[1].train_metrics.recent_activity_gate);
+        assert_eq!(result.years[1].train_metrics.recent_trades, 1);
+        assert!(result.years[1].train_metrics.recent_activity_gate);
         assert_eq!(
             result.years[1].train_metrics.last_entry_date,
-            Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap())
+            Some(NaiveDate::from_ymd_opt(2023, 12, 1).unwrap())
         );
         assert_eq!(
             result.years[1].train_metrics.days_since_last_entry,
-            Some(456)
+            Some(30)
         );
-        assert_eq!(result.trades.len(), 2);
+        assert_eq!(result.trades.len(), 3);
         assert_eq!(
             result.trades[0].entry_date,
-            NaiveDate::from_ymd_opt(2023, 12, 29).unwrap()
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap()
         );
         assert_eq!(
             result.trades[1].entry_date,
+            NaiveDate::from_ymd_opt(2023, 12, 29).unwrap()
+        );
+        assert_eq!(
+            result.trades[2].entry_date,
             NaiveDate::from_ymd_opt(2024, 2, 1).unwrap()
         );
         assert_eq!(result.years[1].test_metrics.trades, 1);
+    }
+
+    #[test]
+    fn walk_forward_requires_recent_closed_training_activity() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut trades = training_trades(50.0);
+        trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 29).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+            25.0,
+        ));
+        trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            25.0,
+        ));
+        let results = vec![profile_result("stale", trades, from, to)];
+
+        let result = walk_forward(&results, from, to);
+        let stale_year = result
+            .years
+            .iter()
+            .find(|year| year.test_year == 2024)
+            .unwrap();
+
+        assert!(!stale_year.active);
+        assert_eq!(stale_year.train_metrics.recent_trades, 0);
+        assert!(!stale_year.train_metrics.recent_activity_gate);
+        assert_eq!(
+            stale_year.train_metrics.last_entry_date,
+            Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap())
+        );
+        assert_eq!(stale_year.test_metrics.trades, 0);
     }
 
     #[test]
