@@ -119,6 +119,8 @@ pub struct ResearchProfile {
     pub return_or_drawdown_gate: Option<ReturnOrDrawdownGate>,
     pub trend_drawdown_guard: Option<TrendDrawdownGuard>,
     pub weak_trend_pullback_guard: Option<WeakTrendPullbackGuard>,
+    pub risk_regime_cooldown_guard: Option<TrendDrawdownGuard>,
+    pub risk_regime_cooldown_days: i64,
     pub realized_vol_lookback_days: Option<i64>,
     pub max_realized_vol: Option<f64>,
     pub min_short_otm_pct: Option<f64>,
@@ -159,6 +161,8 @@ impl ResearchProfile {
             return_or_drawdown_gate: None,
             trend_drawdown_guard: None,
             weak_trend_pullback_guard: None,
+            risk_regime_cooldown_guard: None,
+            risk_regime_cooldown_days: 0,
             realized_vol_lookback_days: None,
             max_realized_vol: None,
             min_short_otm_pct: None,
@@ -906,6 +910,14 @@ fn detector_filters(profile: &ResearchProfile) -> Vec<String> {
             guard.max_underlying_drawdown
         ));
     }
+    if let Some(guard) = &profile.risk_regime_cooldown_guard {
+        filters.push(format!(
+            "risk_regime_cooldown(return>={:.3}, drawdown>{:.3}, days={})",
+            guard.min_underlying_return,
+            guard.max_underlying_drawdown,
+            profile.risk_regime_cooldown_days
+        ));
+    }
     if let Some(days) = profile.realized_vol_lookback_days
         && let Some(max_realized_vol) = profile.max_realized_vol
     {
@@ -1050,6 +1062,16 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
         &profile.trend_drawdown_guard,
         &baseline.trend_drawdown_guard,
     );
+    complexity += option_complexity(
+        &profile.weak_trend_pullback_guard,
+        &baseline.weak_trend_pullback_guard,
+    );
+    complexity += option_complexity(
+        &profile.risk_regime_cooldown_guard,
+        &baseline.risk_regime_cooldown_guard,
+    );
+    complexity +=
+        usize::from(profile.risk_regime_cooldown_days != baseline.risk_regime_cooldown_days);
     complexity += option_complexity(
         &profile.realized_vol_lookback_days,
         &baseline.realized_vol_lookback_days,
@@ -1627,15 +1649,8 @@ fn latest_signal_for_profile(
         return None;
     }
     let candidates = generate_candidates(rows_by_expiration, &result.profile, entry_from, to);
-    let latest_entry_date = candidates
-        .iter()
-        .map(|candidate| candidate.entry_date)
-        .max()?;
-    let mut day_candidates = candidates
-        .iter()
-        .filter(|candidate| candidate.entry_date == latest_entry_date)
-        .collect::<Vec<_>>();
-    day_candidates.sort_by(|a, b| candidate_quality_order(a, b, &result.profile));
+    let (latest_entry_date, day_candidates) =
+        latest_signal_day_candidates(&candidates, &result.profile)?;
     let status = if latest_entry_date == to {
         "entry_candidate"
     } else {
@@ -1647,6 +1662,34 @@ fn latest_signal_for_profile(
         to,
         status,
     ))
+}
+
+fn latest_signal_day_candidates<'a>(
+    candidates: &'a [Candidate],
+    profile: &ResearchProfile,
+) -> Option<(NaiveDate, Vec<&'a Candidate>)> {
+    let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
+    for candidate in candidates {
+        by_date
+            .entry(candidate.entry_date)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut next_entry_date = NaiveDate::MIN;
+    let mut latest = None;
+    for (date, mut day_candidates) in by_date {
+        if date < next_entry_date {
+            continue;
+        }
+        if risk_regime_cooldown_triggered(&day_candidates, profile) {
+            next_entry_date = next_entry_date_after_risk_regime(date, profile);
+            continue;
+        }
+        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
+        latest = Some((date, day_candidates));
+    }
+    latest
 }
 
 fn next_signal_entry_date(result: &ProfileResult, as_of: NaiveDate) -> NaiveDate {
@@ -2362,6 +2405,54 @@ fn research_profiles() -> Vec<ResearchProfile> {
             min_underlying_drawdown: min_guard_drawdown,
             max_underlying_drawdown: max_guard_drawdown,
         });
+        profiles.push(profile);
+    }
+
+    for (name, min_return, max_drawdown, cooldown_days) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool30dd5_10d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.30,
+            0.05,
+            10,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool30dd5_20d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.30,
+            0.05,
+            20,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool28dd5_10d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.28,
+            0.05,
+            10,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.10);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: 0.13,
+            min_underlying_drawdown: 0.03,
+            max_underlying_drawdown: 0.06,
+        });
+        profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: min_return,
+            max_underlying_drawdown: max_drawdown,
+        });
+        profile.risk_regime_cooldown_days = cooldown_days;
         profiles.push(profile);
     }
 
@@ -3308,6 +3399,10 @@ fn simulate_non_overlapping(
         if date < next_entry_date {
             continue;
         }
+        if risk_regime_cooldown_triggered(&day_candidates, profile) {
+            next_entry_date = next_entry_date_after_risk_regime(date, profile);
+            continue;
+        }
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
         for candidate in day_candidates {
             if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
@@ -3318,6 +3413,25 @@ fn simulate_non_overlapping(
         }
     }
     trades
+}
+
+fn risk_regime_cooldown_triggered(
+    day_candidates: &[&Candidate],
+    profile: &ResearchProfile,
+) -> bool {
+    let Some(guard) = &profile.risk_regime_cooldown_guard else {
+        return false;
+    };
+    day_candidates.iter().any(|candidate| {
+        !guard.allows(
+            candidate.underlying_lookback_return,
+            candidate.underlying_recent_drawdown,
+        )
+    })
+}
+
+fn next_entry_date_after_risk_regime(date: NaiveDate, profile: &ResearchProfile) -> NaiveDate {
+    date + Duration::days(profile.risk_regime_cooldown_days.max(1))
 }
 
 fn next_entry_date_after_trade(trade: &ResearchTrade, profile: &ResearchProfile) -> NaiveDate {
@@ -6189,6 +6303,68 @@ mod tests {
     }
 
     #[test]
+    fn risk_regime_cooldown_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, min_return, max_drawdown, cooldown_days) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool30dd5_10d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.30,
+                0.05,
+                10,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool30dd5_20d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.30,
+                0.05,
+                20,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_riskcool28dd5_10d_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.28,
+                0.05,
+                10,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.10));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(
+                profile.weak_trend_pullback_guard,
+                Some(WeakTrendPullbackGuard {
+                    max_underlying_return: 0.13,
+                    min_underlying_drawdown: 0.03,
+                    max_underlying_drawdown: 0.06,
+                })
+            );
+            assert_eq!(
+                profile.risk_regime_cooldown_guard,
+                Some(TrendDrawdownGuard {
+                    min_underlying_return: min_return,
+                    max_underlying_drawdown: max_drawdown,
+                })
+            );
+            assert_eq!(profile.risk_regime_cooldown_days, cooldown_days);
+        }
+    }
+
+    #[test]
     fn current_best_execution_variants_keep_detector_gates() {
         let profiles = research_profiles();
         for (name, stop_loss_multiple, take_profit_pct) in [
@@ -6947,6 +7123,42 @@ mod tests {
             next_entry_date_after_trade(&trade_with_exit(exit_date, "take_profit"), &profile),
             NaiveDate::from_ymd_opt(2026, 1, 21).unwrap()
         );
+    }
+
+    #[test]
+    fn risk_regime_cooldown_skips_immediate_reentry_candidates() {
+        let risk_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let skipped_date = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let eligible_date = NaiveDate::from_ymd_opt(2026, 1, 22).unwrap();
+        let mut profile = ResearchProfile::baseline();
+        profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        profile.risk_regime_cooldown_days = 10;
+
+        let mut risk_candidate = candidate_for_ordering(risk_date, 95.0, 90.0, 1.05, -0.25, 0.05);
+        risk_candidate.underlying_lookback_return = Some(0.35);
+        risk_candidate.underlying_recent_drawdown = Some(0.06);
+        let mut skipped_candidate =
+            candidate_for_ordering(skipped_date, 95.0, 90.0, 1.05, -0.25, 0.05);
+        skipped_candidate.underlying_lookback_return = Some(0.20);
+        skipped_candidate.underlying_recent_drawdown = Some(0.02);
+        let mut eligible_candidate =
+            candidate_for_ordering(eligible_date, 95.0, 90.0, 1.05, -0.25, 0.05);
+        eligible_candidate.underlying_lookback_return = Some(0.20);
+        eligible_candidate.underlying_recent_drawdown = Some(0.02);
+        let candidates = vec![risk_candidate, skipped_candidate, eligible_candidate];
+
+        let (signal_date, day_candidates) =
+            latest_signal_day_candidates(&candidates, &profile).unwrap();
+
+        assert_eq!(
+            next_entry_date_after_risk_regime(risk_date, &profile),
+            NaiveDate::from_ymd_opt(2026, 1, 20).unwrap()
+        );
+        assert_eq!(signal_date, eligible_date);
+        assert_eq!(day_candidates[0].entry_date, eligible_date);
     }
 
     fn training_trades(pnl: f64) -> Vec<ResearchTrade> {
