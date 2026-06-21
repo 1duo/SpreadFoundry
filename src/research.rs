@@ -609,6 +609,28 @@ fn research_profiles() -> Vec<ResearchProfile> {
     otm_cooldown_trend60_min5_ivcap45_width15.max_width = 15.0;
     profiles.push(otm_cooldown_trend60_min5_ivcap45_width15);
 
+    for (name, take_profit_pct) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_take35_delta20_30_credit20",
+            0.35,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_take40_delta20_30_credit20",
+            0.40,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.05);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.take_profit_pct = take_profit_pct;
+        profiles.push(profile);
+    }
+
     for (name, max_return) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_max25_ivcap45_width15_delta20_30_credit20",
@@ -2022,6 +2044,36 @@ mod tests {
 
         row.implied_vol = 0.95;
         assert!(!iv_allowed(&row, &profile));
+    }
+
+    #[test]
+    fn early_take_profit_profiles_keep_current_best_entry_gates() {
+        let profiles = research_profiles();
+        let take35 = profiles
+            .iter()
+            .find(|profile| {
+                profile.name
+                    == "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_take35_delta20_30_credit20"
+            })
+            .unwrap();
+        let take40 = profiles
+            .iter()
+            .find(|profile| {
+                profile.name
+                    == "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_take40_delta20_30_credit20"
+            })
+            .unwrap();
+
+        for profile in [take35, take40] {
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.05));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+        }
+        assert_eq!(take35.take_profit_pct, 0.35);
+        assert_eq!(take40.take_profit_pct, 0.40);
     }
 
     #[test]
