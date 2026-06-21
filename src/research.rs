@@ -14,6 +14,7 @@ const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
+const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -91,6 +92,7 @@ pub struct ResearchReport {
     pub expirations_discovered: usize,
     pub expirations_loaded: usize,
     pub rows_loaded: usize,
+    pub walk_forward: WalkForwardResult,
     pub profiles: Vec<ProfileResult>,
 }
 
@@ -100,6 +102,37 @@ pub struct ProfileResult {
     pub candidates: usize,
     pub trades: Vec<ResearchTrade>,
     pub metrics: ResearchMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalkForwardResult {
+    pub min_train_days: i64,
+    pub years: Vec<WalkForwardYear>,
+    pub selected_profile_counts: BTreeMap<String, usize>,
+    pub trades: Vec<ResearchTrade>,
+    pub metrics: ResearchMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalkForwardYear {
+    pub test_year: i32,
+    pub train_from: NaiveDate,
+    pub train_to: NaiveDate,
+    pub test_from: NaiveDate,
+    pub test_to: NaiveDate,
+    pub selected_profile: String,
+    pub train_metrics: WalkForwardTrainMetrics,
+    pub test_metrics: PeriodMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalkForwardTrainMetrics {
+    pub trades: usize,
+    pub total_pnl: f64,
+    pub score: f64,
+    pub robust_score: f64,
+    pub ranking_eligible: bool,
+    pub robust_ranking_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -326,14 +359,8 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
             metrics,
         });
     }
-    profile_results.sort_by(|a, b| {
-        b.metrics
-            .robust_ranking_eligible
-            .cmp(&a.metrics.robust_ranking_eligible)
-            .then_with(|| b.metrics.robust_score.total_cmp(&a.metrics.robust_score))
-            .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
-            .then_with(|| a.profile.name.cmp(&b.profile.name))
-    });
+    let walk_forward = walk_forward(&profile_results, request.from, request.to);
+    profile_results.sort_by(profile_result_order);
 
     let report = ResearchReport {
         run_id: run_id.clone(),
@@ -343,6 +370,7 @@ pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchRepor
         expirations_discovered: expirations.len(),
         expirations_loaded: rows_by_expiration.len(),
         rows_loaded,
+        walk_forward,
         profiles: profile_results,
     };
 
@@ -373,6 +401,143 @@ fn evenly_spaced<T: Copy>(items: Vec<T>, max: usize) -> Vec<T> {
             items[selected]
         })
         .collect()
+}
+
+fn profile_result_order(a: &ProfileResult, b: &ProfileResult) -> Ordering {
+    metrics_rank_order(&a.metrics, &a.profile.name, &b.metrics, &b.profile.name)
+}
+
+fn metrics_rank_order(
+    a_metrics: &ResearchMetrics,
+    a_name: &str,
+    b_metrics: &ResearchMetrics,
+    b_name: &str,
+) -> Ordering {
+    b_metrics
+        .robust_ranking_eligible
+        .cmp(&a_metrics.robust_ranking_eligible)
+        .then_with(|| b_metrics.robust_score.total_cmp(&a_metrics.robust_score))
+        .then_with(|| b_metrics.score.total_cmp(&a_metrics.score))
+        .then_with(|| a_name.cmp(b_name))
+}
+
+fn walk_forward(
+    profile_results: &[ProfileResult],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> WalkForwardResult {
+    let mut years = Vec::new();
+    let mut trades = Vec::new();
+    let mut selected_profile_counts = BTreeMap::new();
+    let mut next_entry_date = NaiveDate::MIN;
+
+    for test_year in from.year()..=to.year() {
+        let test_from = from.max(NaiveDate::from_ymd_opt(test_year, 1, 1).unwrap());
+        let test_to = to.min(NaiveDate::from_ymd_opt(test_year, 12, 31).unwrap());
+        if test_from > test_to {
+            continue;
+        }
+
+        let train_to = test_from - Duration::days(1);
+        if train_to < from || (train_to - from).num_days() < WALK_FORWARD_MIN_TRAIN_DAYS {
+            continue;
+        }
+
+        let Some(selection) = select_walk_forward_profile(profile_results, from, train_to) else {
+            continue;
+        };
+
+        let mut test_trades =
+            filter_trades_by_entry_date(&selection.result.trades, test_from, test_to);
+        test_trades.sort_by(trade_chronological_order);
+
+        let mut accepted = Vec::new();
+        for trade in test_trades {
+            if trade.entry_date < next_entry_date {
+                continue;
+            }
+            next_entry_date = next_entry_date_after_trade(&trade, &selection.result.profile);
+            accepted.push(trade);
+        }
+
+        *selected_profile_counts
+            .entry(selection.result.profile.name.clone())
+            .or_insert(0) += 1;
+        trades.extend(accepted.iter().cloned());
+        years.push(WalkForwardYear {
+            test_year,
+            train_from: from,
+            train_to,
+            test_from,
+            test_to,
+            selected_profile: selection.result.profile.name.clone(),
+            train_metrics: train_metrics_summary(&selection.metrics),
+            test_metrics: period_metrics("out_of_sample", &accepted, test_from, test_to),
+        });
+    }
+
+    let metrics_from = years.first().map(|year| year.test_from).unwrap_or(from);
+    WalkForwardResult {
+        min_train_days: WALK_FORWARD_MIN_TRAIN_DAYS,
+        years,
+        selected_profile_counts,
+        metrics: metrics(&trades, metrics_from, to),
+        trades,
+    }
+}
+
+struct WalkForwardSelection<'a> {
+    result: &'a ProfileResult,
+    metrics: ResearchMetrics,
+}
+
+fn select_walk_forward_profile<'a>(
+    profile_results: &'a [ProfileResult],
+    train_from: NaiveDate,
+    train_to: NaiveDate,
+) -> Option<WalkForwardSelection<'a>> {
+    let mut scored = profile_results
+        .iter()
+        .map(|result| {
+            let train_trades = filter_trades_by_entry_date(&result.trades, train_from, train_to);
+            WalkForwardSelection {
+                result,
+                metrics: metrics(&train_trades, train_from, train_to),
+            }
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        metrics_rank_order(
+            &a.metrics,
+            &a.result.profile.name,
+            &b.metrics,
+            &b.result.profile.name,
+        )
+    });
+    scored.into_iter().next()
+}
+
+fn filter_trades_by_entry_date(
+    trades: &[ResearchTrade],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<ResearchTrade> {
+    trades
+        .iter()
+        .filter(|trade| trade.entry_date >= from && trade.entry_date <= to)
+        .cloned()
+        .collect()
+}
+
+fn train_metrics_summary(metrics: &ResearchMetrics) -> WalkForwardTrainMetrics {
+    WalkForwardTrainMetrics {
+        trades: metrics.trades,
+        total_pnl: metrics.total_pnl,
+        score: metrics.score,
+        robust_score: metrics.robust_score,
+        ranking_eligible: metrics.ranking_eligible,
+        robust_ranking_eligible: metrics.robust_ranking_eligible,
+    }
 }
 
 fn research_profiles() -> Vec<ResearchProfile> {
@@ -1910,6 +2075,48 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
+    let wf = &report.walk_forward;
+    out.push_str("## Walk-Forward Selector\n\n");
+    out.push_str(&format!(
+        "- Minimum training window: `{}` days\n- OOS years: `{}`\n- OOS trades: `{}`\n- OOS PnL: `{:.2}`\n- OOS win rate: `{:.1}%`\n- OOS profit factor: `{:.2}`\n- OOS max DD: `{:.3}`\n- OOS score: `{:.4}`\n- Selected profiles: `{}`\n\n",
+        wf.min_train_days,
+        wf.years.len(),
+        wf.metrics.trades,
+        wf.metrics.total_pnl,
+        wf.metrics.win_rate * 100.0,
+        wf.metrics.profit_factor,
+        wf.metrics.max_drawdown,
+        wf.metrics.score,
+        format_profile_counts(&wf.selected_profile_counts)
+    ));
+    out.push_str("| Test Year | Train Window | Test Window | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for year in &wf.years {
+        out.push_str(&format!(
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            year.test_year,
+            year.train_from,
+            year.train_to,
+            year.test_from,
+            year.test_to,
+            year.selected_profile,
+            if year.train_metrics.robust_ranking_eligible {
+                "yes"
+            } else {
+                "no"
+            },
+            year.train_metrics.trades,
+            year.train_metrics.total_pnl,
+            year.train_metrics.robust_score,
+            year.test_metrics.trades,
+            year.test_metrics.total_pnl,
+            year.test_metrics.win_rate * 100.0,
+            year.test_metrics.profit_factor,
+            year.test_metrics.score
+        ));
+    }
+    out.push('\n');
+
     out.push_str("| Rank | Profile | Eligible | Robust Eligible | Candidates | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Positive Years | Worst Year | Avg Entry DTE | Avg Hold | Trades/Yr | Score | Robust Score |\n");
     out.push_str(
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
@@ -2050,6 +2257,14 @@ fn format_exit_reasons(reasons: &BTreeMap<String, usize>) -> String {
     reasons
         .iter()
         .map(|(reason, count)| format!("{reason}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_profile_counts(counts: &BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(profile, count)| format!("{profile}: {count}"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2377,6 +2592,51 @@ mod tests {
     }
 
     #[test]
+    fn walk_forward_selects_from_prior_data_and_prevents_cross_year_overlap() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut better_trades = training_trades(50.0);
+        better_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 29).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+            25.0,
+        ));
+        better_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+            25.0,
+        ));
+        better_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            25.0,
+        ));
+        let worse_trades = training_trades(1.0);
+        let results = vec![
+            profile_result("better", better_trades, from, to),
+            profile_result("worse", worse_trades, from, to),
+        ];
+
+        let result = walk_forward(&results, from, to);
+
+        assert_eq!(result.years.len(), 2);
+        assert_eq!(result.years[0].test_year, 2023);
+        assert_eq!(result.years[0].selected_profile, "better");
+        assert_eq!(result.years[1].test_year, 2024);
+        assert_eq!(result.years[1].selected_profile, "better");
+        assert_eq!(result.trades.len(), 2);
+        assert_eq!(
+            result.trades[0].entry_date,
+            NaiveDate::from_ymd_opt(2023, 12, 29).unwrap()
+        );
+        assert_eq!(
+            result.trades[1].entry_date,
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap()
+        );
+        assert_eq!(result.years[1].test_metrics.trades, 1);
+    }
+
+    #[test]
     fn corrupt_cache_file_is_treated_as_cache_miss() {
         let path = unique_test_path("corrupt-cache.json");
         fs::write(&path, "").unwrap();
@@ -2484,6 +2744,40 @@ mod tests {
             next_entry_date_after_trade(&trade_with_exit(exit_date, "take_profit"), &profile),
             NaiveDate::from_ymd_opt(2026, 1, 21).unwrap()
         );
+    }
+
+    fn training_trades(pnl: f64) -> Vec<ResearchTrade> {
+        let mut trades = Vec::new();
+        for month in 1..=10 {
+            trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2020, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2020, month, 8).unwrap(),
+                pnl,
+            ));
+            trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2022, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2022, month, 8).unwrap(),
+                pnl,
+            ));
+        }
+        trades
+    }
+
+    fn profile_result(
+        name: &str,
+        trades: Vec<ResearchTrade>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> ProfileResult {
+        let mut profile = ResearchProfile::baseline();
+        profile.name = name.to_owned();
+        let metrics = metrics(&trades, from, to);
+        ProfileResult {
+            profile,
+            candidates: trades.len(),
+            trades,
+            metrics,
+        }
     }
 
     fn trade_with_entry_exit(
