@@ -71,6 +71,27 @@ impl TrendDrawdownGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WeakTrendPullbackGuard {
+    pub max_underlying_return: f64,
+    pub min_underlying_drawdown: f64,
+    pub max_underlying_drawdown: f64,
+}
+
+impl WeakTrendPullbackGuard {
+    fn allows(&self, underlying_return: Option<f64>, underlying_drawdown: Option<f64>) -> bool {
+        let Some(underlying_return) = underlying_return else {
+            return false;
+        };
+        let Some(underlying_drawdown) = underlying_drawdown else {
+            return false;
+        };
+        !(underlying_return <= self.max_underlying_return
+            && underlying_drawdown >= self.min_underlying_drawdown
+            && underlying_drawdown <= self.max_underlying_drawdown)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchProfile {
     pub name: String,
@@ -97,6 +118,7 @@ pub struct ResearchProfile {
     pub max_underlying_drawdown: Option<f64>,
     pub return_or_drawdown_gate: Option<ReturnOrDrawdownGate>,
     pub trend_drawdown_guard: Option<TrendDrawdownGuard>,
+    pub weak_trend_pullback_guard: Option<WeakTrendPullbackGuard>,
     pub realized_vol_lookback_days: Option<i64>,
     pub max_realized_vol: Option<f64>,
     pub min_short_otm_pct: Option<f64>,
@@ -136,6 +158,7 @@ impl ResearchProfile {
             max_underlying_drawdown: None,
             return_or_drawdown_gate: None,
             trend_drawdown_guard: None,
+            weak_trend_pullback_guard: None,
             realized_vol_lookback_days: None,
             max_realized_vol: None,
             min_short_otm_pct: None,
@@ -873,6 +896,14 @@ fn detector_filters(profile: &ResearchProfile) -> Vec<String> {
         filters.push(format!(
             "trend_drawdown_guard(return>={:.3}, drawdown<={:.3})",
             guard.min_underlying_return, guard.max_underlying_drawdown
+        ));
+    }
+    if let Some(guard) = &profile.weak_trend_pullback_guard {
+        filters.push(format!(
+            "weak_trend_pullback_guard(return<={:.3}, drawdown={:.3}-{:.3})",
+            guard.max_underlying_return,
+            guard.min_underlying_drawdown,
+            guard.max_underlying_drawdown
         ));
     }
     if let Some(days) = profile.realized_vol_lookback_days
@@ -2269,6 +2300,43 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, max_guard_return, min_guard_drawdown, max_guard_drawdown) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.13,
+            0.03,
+            0.06,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak12dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.12,
+            0.03,
+            0.06,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.10);
+        profile.max_short_iv = Some(0.45);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: max_guard_return,
+            min_underlying_drawdown: min_guard_drawdown,
+            max_underlying_drawdown: max_guard_drawdown,
+        });
+        profiles.push(profile);
+    }
+
     for (name, stop_loss_multiple, take_profit_pct) in [
         (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_stop175_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
@@ -3098,6 +3166,11 @@ fn entry_regime(
         return None;
     }
     if let Some(guard) = &profile.trend_drawdown_guard
+        && !guard.allows(underlying_lookback_return, underlying_recent_drawdown)
+    {
+        return None;
+    }
+    if let Some(guard) = &profile.weak_trend_pullback_guard
         && !guard.allows(underlying_lookback_return, underlying_recent_drawdown)
     {
         return None;
@@ -4926,6 +4999,35 @@ mod tests {
     }
 
     #[test]
+    fn entry_regime_rejects_weak_trend_middle_pullback_band() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 11).unwrap();
+        let short = option_day(date, 95.0, 1.0, 1.1, -0.25, 112.0);
+        let mut profile = ResearchProfile::baseline();
+        profile.trend_lookback_days = Some(10);
+        profile.min_underlying_return = Some(0.05);
+        profile.drawdown_lookback_days = Some(10);
+        profile.weak_trend_pullback_guard = Some(WeakTrendPullbackGuard {
+            max_underlying_return: 0.13,
+            min_underlying_drawdown: 0.03,
+            max_underlying_drawdown: 0.06,
+        });
+        let mut underlying = BTreeMap::new();
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(), 116.0);
+        underlying.insert(date, 112.0);
+
+        assert!(entry_regime(&short, &profile, &underlying).is_none());
+
+        underlying.insert(date, 108.0);
+        let deeper_pullback_short = option_day(date, 95.0, 1.0, 1.1, -0.25, 108.0);
+        assert!(entry_regime(&deeper_pullback_short, &profile, &underlying).is_some());
+
+        underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 80.0);
+        underlying.insert(date, 112.0);
+        assert!(entry_regime(&short, &profile, &underlying).is_some());
+    }
+
+    #[test]
     fn candidate_generation_ignores_pre_window_lookback_rows() {
         let expiration = NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
         let pre_window = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
@@ -6005,6 +6107,54 @@ mod tests {
                 Some(ReturnOrDrawdownGate {
                     min_underlying_return: Some(gate_min_return),
                     min_underlying_drawdown: Some(0.02),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn weak_trend_pullback_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, max_guard_return, min_guard_drawdown, max_guard_drawdown) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak13dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.13,
+                0.03,
+                0.06,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min10_trend25_or_dd20d_min2_weak12dd3to6_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.12,
+                0.03,
+                0.06,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.10));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+            assert_eq!(
+                profile.weak_trend_pullback_guard,
+                Some(WeakTrendPullbackGuard {
+                    max_underlying_return: max_guard_return,
+                    min_underlying_drawdown: min_guard_drawdown,
+                    max_underlying_drawdown: max_guard_drawdown,
                 })
             );
         }
