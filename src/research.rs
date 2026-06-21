@@ -13,6 +13,7 @@ use tokio::time::sleep;
 const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
+const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -126,6 +127,19 @@ pub struct ResearchMetrics {
     pub exit_reasons: BTreeMap<String, usize>,
     pub yearly: BTreeMap<i32, YearMetrics>,
     pub chronological: Vec<PeriodMetrics>,
+    pub cost_stress: Vec<CostStressMetrics>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CostStressMetrics {
+    pub per_trade_cost: f64,
+    pub trades: usize,
+    pub total_pnl: f64,
+    pub avg_return_on_risk: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub max_drawdown: f64,
+    pub score: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1425,6 +1439,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
             exit_reasons: BTreeMap::new(),
             yearly: BTreeMap::new(),
             chronological: chronological_period_metrics(&[], from, to),
+            cost_stress: cost_stress_metrics(&[]),
         };
     }
     let mut sorted = trades.to_vec();
@@ -1500,6 +1515,7 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
         exit_reasons: exit_reasons(&sorted),
         yearly: yearly_metrics(&sorted),
         chronological,
+        cost_stress: cost_stress_metrics(&sorted),
     }
 }
 
@@ -1528,6 +1544,88 @@ fn max_drawdown(trades: &[ResearchTrade]) -> f64 {
         .max(1.0);
     for trade in trades {
         equity += trade.pnl;
+        if equity > high_water {
+            high_water = equity;
+        }
+        let current = high_water - equity;
+        if current > drawdown {
+            drawdown = current;
+        }
+    }
+    drawdown / risk
+}
+
+fn cost_stress_metrics(trades: &[ResearchTrade]) -> Vec<CostStressMetrics> {
+    COST_STRESS_PER_TRADE
+        .into_iter()
+        .map(|per_trade_cost| cost_stress_metric(trades, per_trade_cost))
+        .collect()
+}
+
+fn cost_stress_metric(trades: &[ResearchTrade], per_trade_cost: f64) -> CostStressMetrics {
+    let mut sorted = trades.to_vec();
+    sorted.sort_by(trade_chronological_order);
+    if sorted.is_empty() {
+        return CostStressMetrics {
+            per_trade_cost,
+            trades: 0,
+            total_pnl: 0.0,
+            avg_return_on_risk: 0.0,
+            win_rate: 0.0,
+            profit_factor: 0.0,
+            max_drawdown: 0.0,
+            score: -1_000_000.0,
+        };
+    }
+
+    let adjusted_pnls = sorted
+        .iter()
+        .map(|trade| trade.pnl - per_trade_cost)
+        .collect::<Vec<_>>();
+    let total_pnl = adjusted_pnls.iter().sum::<f64>();
+    let total_max_loss = sorted.iter().map(|trade| trade.max_loss).sum::<f64>();
+    let wins = adjusted_pnls.iter().filter(|pnl| **pnl > 0.0).count();
+    let gross_profit = adjusted_pnls.iter().filter(|pnl| **pnl > 0.0).sum::<f64>();
+    let gross_loss = adjusted_pnls
+        .iter()
+        .filter(|pnl| **pnl < 0.0)
+        .map(|pnl| pnl.abs())
+        .sum::<f64>();
+    let returns = sorted
+        .iter()
+        .zip(adjusted_pnls.iter())
+        .map(|(trade, pnl)| pnl / trade.max_loss)
+        .collect::<Vec<_>>();
+    let max_drawdown = adjusted_max_drawdown(&sorted, per_trade_cost);
+    let score = total_pnl / total_max_loss.max(1.0) - 2.0 * max_drawdown;
+
+    CostStressMetrics {
+        per_trade_cost,
+        trades: sorted.len(),
+        total_pnl,
+        avg_return_on_risk: mean(&returns),
+        win_rate: wins as f64 / sorted.len() as f64,
+        profit_factor: if gross_loss == 0.0 {
+            gross_profit
+        } else {
+            gross_profit / gross_loss
+        },
+        max_drawdown,
+        score,
+    }
+}
+
+fn adjusted_max_drawdown(trades: &[ResearchTrade], per_trade_cost: f64) -> f64 {
+    let mut equity = 0.0;
+    let mut high_water = 0.0;
+    let mut drawdown = 0.0;
+    let risk = trades
+        .iter()
+        .map(|trade| trade.max_loss)
+        .sum::<f64>()
+        .max(1.0);
+    for trade in trades {
+        equity += trade.pnl - per_trade_cost;
         if equity > high_water {
             high_water = equity;
         }
@@ -1786,6 +1884,25 @@ fn research_markdown(report: &ResearchReport) -> String {
             ));
         }
     }
+    out.push_str("\n## Cost Stress\n\n");
+    out.push_str("| Profile | Extra Cost/Trade | Trades | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Score |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for result in report.profiles.iter().take(10) {
+        for stress in &result.metrics.cost_stress {
+            out.push_str(&format!(
+                "| {} | {:.2} | {} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} |\n",
+                result.profile.name,
+                stress.per_trade_cost,
+                stress.trades,
+                stress.total_pnl,
+                stress.avg_return_on_risk,
+                stress.win_rate * 100.0,
+                stress.profit_factor,
+                stress.max_drawdown,
+                stress.score
+            ));
+        }
+    }
     if let Some(best) = report.profiles.first() {
         out.push_str("\n## Best Profile Yearly\n\n");
         out.push_str("| Year | Trades | PnL | Win Rate | Avg ROR |\n");
@@ -2024,6 +2141,27 @@ mod tests {
         assert!(!robust_ranking_eligible(true, 75.0, &periods));
         assert!(!robust_ranking_eligible(false, 75.0, &periods));
         assert!(!robust_ranking_eligible(true, -1.0, &periods));
+    }
+
+    #[test]
+    fn cost_stress_subtracts_cost_from_each_trade() {
+        let win = trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2020, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2020, 1, 9).unwrap(),
+            20.0,
+        );
+        let small_win = trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2020, 1, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2020, 1, 17).unwrap(),
+            5.0,
+        );
+
+        let stress = cost_stress_metric(&[small_win, win], 10.0);
+
+        assert_eq!(stress.trades, 2);
+        assert_eq!(stress.total_pnl, 5.0);
+        assert_eq!(stress.win_rate, 0.5);
+        assert!(stress.profit_factor > 0.0);
     }
 
     #[test]
