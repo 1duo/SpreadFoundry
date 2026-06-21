@@ -156,6 +156,8 @@ pub struct ResearchReport {
     pub to: NaiveDate,
     pub expirations_discovered: usize,
     pub expirations_loaded: usize,
+    pub expirations_failed: usize,
+    pub expiration_load_failures: Vec<ExpirationLoadFailure>,
     pub rows_loaded: usize,
     pub latest_signal: Option<ResearchSignal>,
     pub deployment_gate: DeploymentGate,
@@ -165,6 +167,12 @@ pub struct ResearchReport {
     pub holdout: HoldoutResult,
     pub fixed_profile_walk_forward: Vec<FixedProfileWalkForwardResult>,
     pub profiles: Vec<ProfileResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExpirationLoadFailure {
+    pub expiration: NaiveDate,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,6 +558,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
 
     let mut rows_by_expiration = BTreeMap::new();
     let mut rows_loaded = 0;
+    let mut expiration_load_failures = Vec::new();
     let fetch_concurrency = request.fetch_concurrency.max(1);
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
         let fetches = chunk.iter().copied().filter_map(|expiration| {
@@ -569,13 +578,25 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
                 load_expiration_rows(&symbol, expiration, start, end, &raw_dir, force_refresh)
                     .await
                     .map(|rows| (expiration, rows))
+                    .map_err(|error| (expiration, error))
             })
         });
         for result in join_all(fetches).await {
-            let (expiration, rows) = result?;
-            rows_loaded += rows.len();
-            if !rows.is_empty() {
-                rows_by_expiration.insert(expiration, rows);
+            match result {
+                Ok((expiration, rows)) => {
+                    rows_loaded += rows.len();
+                    if !rows.is_empty() {
+                        rows_by_expiration.insert(expiration, rows);
+                    }
+                }
+                Err((expiration, error)) => {
+                    let failure = expiration_load_failure_from_error(expiration, &error);
+                    eprintln!(
+                        "skipping {} after expiration load failure: {}",
+                        failure.expiration, failure.message
+                    );
+                    expiration_load_failures.push(failure);
+                }
             }
         }
     }
@@ -618,6 +639,8 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         to: request.to,
         expirations_discovered: expirations.len(),
         expirations_loaded: rows_by_expiration.len(),
+        expirations_failed: expiration_load_failures.len(),
+        expiration_load_failures,
         rows_loaded,
         latest_signal,
         deployment_gate,
@@ -636,6 +659,26 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     fs::write(run_dir.join("report.md"), research_markdown(&report))?;
     println!("{}", run_dir.display());
     Ok(report)
+}
+
+fn expiration_load_failure_from_error(
+    expiration: NaiveDate,
+    error: &anyhow::Error,
+) -> ExpirationLoadFailure {
+    let message = compact_error_message(&format!("{error:#}"));
+    ExpirationLoadFailure {
+        expiration,
+        message,
+    }
+}
+
+fn compact_error_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn evenly_spaced<T: Copy>(items: Vec<T>, max: usize) -> Vec<T> {
@@ -2548,7 +2591,7 @@ async fn load_open_interest_map(
         );
         match fetch_cached_json(&oi_url, &oi_path, force_refresh).await {
             Ok(oi) => out.extend(parse_oi_map(&oi)?),
-            Err(error) if chunk_start < chunk_end => {
+            Err(error) if chunk_start < chunk_end && !is_non_retryable_thetadata_error(&error) => {
                 split_oi_remainder_to_daily(
                     &mut chunks,
                     raw_dir,
@@ -2630,6 +2673,10 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
                 return Ok(json);
             }
             Err(error) => {
+                if is_non_retryable_thetadata_error(&error) {
+                    return Err(error)
+                        .with_context(|| format!("ThetaData non-retryable request failed: {url}"));
+                }
                 last_error = Some(error);
                 if attempt < FETCH_ATTEMPTS {
                     sleep(StdDuration::from_millis(250 * attempt as u64)).await;
@@ -2640,6 +2687,13 @@ async fn fetch_cached_json(url: &str, path: &Path, force_refresh: bool) -> Resul
     let error = last_error.context("ThetaData request failed without an error payload")?;
     Err(error)
         .with_context(|| format!("ThetaData request failed after {FETCH_ATTEMPTS} attempts: {url}"))
+}
+
+fn is_non_retryable_thetadata_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("HTTP 403 Forbidden")
+        && message.contains("PROFESSIONAL subscription")
+        && message.contains("STANDARD subscription")
 }
 
 fn read_cached_json(path: &Path) -> Result<Option<Value>> {
@@ -3697,11 +3751,12 @@ fn research_markdown(report: &ResearchReport) -> String {
         report.symbol, report.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
+        "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- Expirations failed: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
         report.from,
         report.to,
         report.expirations_discovered,
         report.expirations_loaded,
+        report.expirations_failed,
         report.rows_loaded,
         report
             .profiles
@@ -3709,6 +3764,25 @@ fn research_markdown(report: &ResearchReport) -> String {
             .map(|result| result.metrics.required_trades)
             .unwrap_or(MIN_RANKING_TRADES)
     ));
+    if !report.expiration_load_failures.is_empty() {
+        out.push_str("## Expiration Load Failures\n\n");
+        out.push_str("| Expiration | Error |\n");
+        out.push_str("|---|---|\n");
+        for failure in report.expiration_load_failures.iter().take(25) {
+            out.push_str(&format!(
+                "| {} | {} |\n",
+                failure.expiration,
+                markdown_cell(&failure.message)
+            ));
+        }
+        if report.expiration_load_failures.len() > 25 {
+            out.push_str(&format!(
+                "\n_{} additional expiration failures omitted from this Markdown table; see `research.json` for the full list._\n",
+                report.expiration_load_failures.len() - 25
+            ));
+        }
+        out.push('\n');
+    }
 
     let gate = &report.deployment_gate;
     out.push_str("## Research Deployment Gate\n\n");
@@ -4241,6 +4315,10 @@ fn format_list(items: &[String]) -> String {
     }
 }
 
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|")
+}
+
 fn yyyymmdd(date: NaiveDate) -> String {
     date.format("%Y%m%d").to_string()
 }
@@ -4686,6 +4764,29 @@ mod tests {
     }
 
     #[test]
+    fn expiration_load_failure_keeps_expiration_and_compacts_error() {
+        let expiration = NaiveDate::from_ymd_opt(2012, 6, 1).unwrap();
+        let error = anyhow::anyhow!("ThetaData 403\nsubscription required");
+
+        let failure = expiration_load_failure_from_error(expiration, &error);
+
+        assert_eq!(failure.expiration, expiration);
+        assert_eq!(failure.message, "ThetaData 403 | subscription required");
+        assert_eq!(markdown_cell("a | b"), "a \\| b");
+    }
+
+    #[test]
+    fn subscription_denied_errors_are_non_retryable() {
+        let denied = anyhow::anyhow!(
+            "ThetaData returned HTTP 403 Forbidden for url: Requesting options history requiring a PROFESSIONAL subscription, but you only have a STANDARD subscription"
+        );
+        let transient = anyhow::anyhow!("ThetaData returned HTTP 500 Internal Server Error");
+
+        assert!(is_non_retryable_thetadata_error(&denied));
+        assert!(!is_non_retryable_thetadata_error(&transient));
+    }
+
+    #[test]
     fn out_of_sample_gate_requires_positive_score() {
         let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
@@ -4731,6 +4832,8 @@ mod tests {
             to,
             expirations_discovered: 1,
             expirations_loaded: 1,
+            expirations_failed: 0,
+            expiration_load_failures: Vec::new(),
             rows_loaded: 2,
             latest_signal: Some(test_signal(to, "best")),
             deployment_gate,
