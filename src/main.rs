@@ -8,8 +8,9 @@ use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
 use spreadfoundry::research::{
-    DEFAULT_PLATEAU_UNIVERSE_SYMBOLS, DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV, ResearchMetrics,
-    ResearchReport, ResearchRequest, run_symbol_research,
+    DEFAULT_PLATEAU_UNIVERSE_SYMBOLS, DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV,
+    DetectorStrategySummary, ExecutionStrategySummary, ResearchMetrics, ResearchReport,
+    ResearchRequest, run_symbol_research,
 };
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
@@ -255,6 +256,8 @@ struct UniverseSymbolSummary {
     best_profile: String,
     best_detector: String,
     best_execution: String,
+    best_detector_details: Option<DetectorStrategySummary>,
+    best_execution_details: Option<ExecutionStrategySummary>,
     detector_score: f64,
     execution_oos_score: f64,
     trades: usize,
@@ -271,6 +274,8 @@ struct UniverseSymbolSummary {
     best_fixed_profile: String,
     best_fixed_detector: String,
     best_fixed_execution: String,
+    best_fixed_detector_details: Option<DetectorStrategySummary>,
+    best_fixed_execution_details: Option<ExecutionStrategySummary>,
     best_fixed_trades: usize,
     best_fixed_pnl: f64,
     best_fixed_score: f64,
@@ -1023,6 +1028,8 @@ fn universe_symbol_summary(
         best_execution: best
             .map(|result| result.execution_strategy.name.clone())
             .unwrap_or_default(),
+        best_detector_details: best.map(|result| result.detector_strategy.clone()),
+        best_execution_details: best.map(|result| result.execution_strategy.clone()),
         detector_score,
         execution_oos_score,
         trades: best.map(|result| result.metrics.trades).unwrap_or_default(),
@@ -1049,6 +1056,8 @@ fn universe_symbol_summary(
         best_fixed_execution: best_fixed
             .map(|result| result.execution_strategy.name.clone())
             .unwrap_or_default(),
+        best_fixed_detector_details: best_fixed.map(|result| result.detector_strategy.clone()),
+        best_fixed_execution_details: best_fixed.map(|result| result.execution_strategy.clone()),
         best_fixed_trades: best_fixed
             .map(|result| result.metrics.trades)
             .unwrap_or_default(),
@@ -1123,6 +1132,8 @@ fn universe_symbol_error_summary(
         best_profile: String::new(),
         best_detector: String::new(),
         best_execution: String::new(),
+        best_detector_details: None,
+        best_execution_details: None,
         detector_score: 0.0,
         execution_oos_score: 0.0,
         trades: 0,
@@ -1139,6 +1150,8 @@ fn universe_symbol_error_summary(
         best_fixed_profile: String::new(),
         best_fixed_detector: String::new(),
         best_fixed_execution: String::new(),
+        best_fixed_detector_details: None,
+        best_fixed_execution_details: None,
         best_fixed_trades: 0,
         best_fixed_pnl: 0.0,
         best_fixed_score: 0.0,
@@ -1215,6 +1228,53 @@ fn optional_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "all".to_owned())
+}
+
+fn detector_strategy_details(strategy: Option<&DetectorStrategySummary>) -> String {
+    let Some(strategy) = strategy else {
+        return "n/a".to_owned();
+    };
+    let filters = if strategy.filters.is_empty() {
+        "none".to_owned()
+    } else {
+        strategy.filters.join("; ")
+    };
+    format!(
+        "dte {}-{}; delta {:.2}-{:.2}; width {:.0}-{:.0}; credit/width >= {:.2}; quote width <= max({:.0}% mid, ${:.2}); OI short >= {}, long >= {}; filters: {}",
+        strategy.min_dte,
+        strategy.max_dte,
+        strategy.min_short_delta_abs,
+        strategy.max_short_delta_abs,
+        strategy.min_width,
+        strategy.max_width,
+        strategy.min_credit_width,
+        strategy.max_quote_width_pct_of_mid * 100.0,
+        strategy.max_quote_width_abs,
+        strategy.min_short_oi,
+        strategy.min_long_oi,
+        filters
+    )
+}
+
+fn execution_strategy_details(strategy: Option<&ExecutionStrategySummary>) -> String {
+    let Some(strategy) = strategy else {
+        return "n/a".to_owned();
+    };
+    let max_hold = strategy
+        .max_hold_days
+        .map(|days| format!("{days}d"))
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "selector {}; entry {}; exit {}; take profit {:.0}%; stop {:.1}x credit; force close {} DTE; max hold {}; stop cooldown {}d",
+        strategy.candidate_selector,
+        strategy.entry_fill_model,
+        strategy.exit_fill_model,
+        strategy.take_profit_pct * 100.0,
+        strategy.stop_loss_multiple,
+        strategy.force_close_dte,
+        max_hold,
+        strategy.stop_loss_cooldown_days
+    )
 }
 
 fn universe_markdown(summary: &UniverseResearchSummary) -> String {
@@ -1323,6 +1383,30 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
             result.expirations_loaded,
             result.rows_loaded,
             result.latest_signal_status.as_deref().unwrap_or("none")
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## Strategy Details\n\n");
+    out.push_str("| Rank | Symbol | Best Detector Rules | Best Execution Rules | Best Fixed Detector Rules | Best Fixed Execution Rules |\n");
+    out.push_str("|---:|---|---|---|---|---|\n");
+    for result in &summary.results {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            result.suitability_rank,
+            result.symbol,
+            markdown_cell(&detector_strategy_details(
+                result.best_detector_details.as_ref()
+            )),
+            markdown_cell(&execution_strategy_details(
+                result.best_execution_details.as_ref()
+            )),
+            markdown_cell(&detector_strategy_details(
+                result.best_fixed_detector_details.as_ref()
+            )),
+            markdown_cell(&execution_strategy_details(
+                result.best_fixed_execution_details.as_ref()
+            ))
         ));
     }
     out
@@ -1686,6 +1770,10 @@ mod tests {
         assert!(markdown.contains("Best Fixed Detector"));
         assert!(markdown.contains("put_spread_detector_test"));
         assert!(markdown.contains("put_spread_execution_test"));
+        assert!(markdown.contains("## Strategy Details"));
+        assert!(markdown.contains("quote width <= max(10% mid, $0.10)"));
+        assert!(markdown.contains("filters: short_iv<=0.450"));
+        assert!(markdown.contains("selector farther_otm_then_credit"));
     }
 
     #[test]
@@ -1802,6 +1890,8 @@ mod tests {
             best_profile: "best_profile".to_owned(),
             best_detector: "put_spread_detector_test".to_owned(),
             best_execution: "put_spread_execution_test".to_owned(),
+            best_detector_details: Some(test_detector_strategy()),
+            best_execution_details: Some(test_execution_strategy()),
             detector_score: input.robust_score,
             execution_oos_score: input.walk_forward_score.min(input.holdout_score),
             trades: 10,
@@ -1818,11 +1908,45 @@ mod tests {
             best_fixed_profile: "best_fixed_profile".to_owned(),
             best_fixed_detector: "put_spread_detector_test".to_owned(),
             best_fixed_execution: "put_spread_execution_test".to_owned(),
+            best_fixed_detector_details: Some(test_detector_strategy()),
+            best_fixed_execution_details: Some(test_execution_strategy()),
             best_fixed_trades: 4,
             best_fixed_pnl: 40.0,
             best_fixed_score: input.walk_forward_score,
             best_fixed_robust_score: input.robust_score,
             latest_signal_status: Some("research_only".to_owned()),
+        }
+    }
+
+    fn test_detector_strategy() -> DetectorStrategySummary {
+        DetectorStrategySummary {
+            name: "put_spread_detector_test".to_owned(),
+            min_dte: 30,
+            max_dte: 45,
+            min_short_delta_abs: 0.20,
+            max_short_delta_abs: 0.30,
+            min_width: 5.0,
+            max_width: 15.0,
+            min_credit_width: 0.20,
+            max_quote_width_pct_of_mid: 0.10,
+            max_quote_width_abs: 0.10,
+            min_short_oi: 500,
+            min_long_oi: 250,
+            filters: vec!["short_iv<=0.450".to_owned()],
+        }
+    }
+
+    fn test_execution_strategy() -> ExecutionStrategySummary {
+        ExecutionStrategySummary {
+            name: "put_spread_execution_test".to_owned(),
+            candidate_selector: "farther_otm_then_credit".to_owned(),
+            entry_fill_model: "short_bid_minus_long_ask".to_owned(),
+            exit_fill_model: "short_ask_minus_long_bid".to_owned(),
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 21,
+            max_hold_days: None,
+            stop_loss_cooldown_days: 10,
         }
     }
 
