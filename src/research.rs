@@ -3730,8 +3730,12 @@ fn metrics(trades: &[ResearchTrade], from: NaiveDate, to: NaiveDate) -> Research
 }
 
 fn required_trades_for_ranking(from: NaiveDate, to: NaiveDate) -> usize {
+    MIN_RANKING_TRADES.max(required_period_trades_for_ranking(from, to))
+}
+
+fn required_period_trades_for_ranking(from: NaiveDate, to: NaiveDate) -> usize {
     let years = ((to - from).num_days().max(1) as f64) / 365.25;
-    MIN_RANKING_TRADES.max((years * MIN_RANKING_TRADES_PER_YEAR).ceil() as usize)
+    ((years * MIN_RANKING_TRADES_PER_YEAR).ceil() as usize).max(1)
 }
 
 fn trade_chronological_order(a: &ResearchTrade, b: &ResearchTrade) -> Ordering {
@@ -3903,7 +3907,7 @@ fn period_metrics(
 ) -> PeriodMetrics {
     let mut sorted = trades.to_vec();
     sorted.sort_by(trade_chronological_order);
-    let required_trades = required_trades_for_ranking(from, to);
+    let required_trades = required_period_trades_for_ranking(from, to);
     if sorted.is_empty() {
         return PeriodMetrics {
             name: name.to_owned(),
@@ -5214,6 +5218,31 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 6, 18).unwrap()
             ),
             20
+        );
+    }
+
+    #[test]
+    fn period_ranking_trades_use_rate_without_full_window_floor() {
+        assert_eq!(
+            required_period_trades_for_ranking(
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 12, 31).unwrap()
+            ),
+            2
+        );
+        assert_eq!(
+            required_period_trades_for_ranking(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 21).unwrap()
+            ),
+            1
+        );
+        assert_eq!(
+            required_trades_for_ranking(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 21).unwrap()
+            ),
+            10
         );
     }
 
