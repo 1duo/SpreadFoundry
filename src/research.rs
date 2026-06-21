@@ -120,6 +120,7 @@ pub struct WalkForwardYear {
     pub train_to: NaiveDate,
     pub test_from: NaiveDate,
     pub test_to: NaiveDate,
+    pub active: bool,
     pub selected_profile: String,
     pub train_metrics: WalkForwardTrainMetrics,
     pub test_metrics: PeriodMetrics,
@@ -447,17 +448,20 @@ fn walk_forward(
             continue;
         };
 
-        let mut test_trades =
-            filter_trades_by_entry_date(&selection.result.trades, test_from, test_to);
-        test_trades.sort_by(trade_chronological_order);
-
+        let active = selection.metrics.robust_ranking_eligible;
         let mut accepted = Vec::new();
-        for trade in test_trades {
-            if trade.entry_date < next_entry_date {
-                continue;
+        if active {
+            let mut test_trades =
+                filter_trades_by_entry_date(&selection.result.trades, test_from, test_to);
+            test_trades.sort_by(trade_chronological_order);
+
+            for trade in test_trades {
+                if trade.entry_date < next_entry_date {
+                    continue;
+                }
+                next_entry_date = next_entry_date_after_trade(&trade, &selection.result.profile);
+                accepted.push(trade);
             }
-            next_entry_date = next_entry_date_after_trade(&trade, &selection.result.profile);
-            accepted.push(trade);
         }
 
         *selected_profile_counts
@@ -470,6 +474,7 @@ fn walk_forward(
             train_to,
             test_from,
             test_to,
+            active,
             selected_profile: selection.result.profile.name.clone(),
             train_metrics: train_metrics_summary(&selection.metrics),
             test_metrics: period_metrics("out_of_sample", &accepted, test_from, test_to),
@@ -2076,11 +2081,13 @@ fn research_markdown(report: &ResearchReport) -> String {
             .unwrap_or(MIN_RANKING_TRADES)
     ));
     let wf = &report.walk_forward;
+    let active_years = wf.years.iter().filter(|year| year.active).count();
     out.push_str("## Walk-Forward Selector\n\n");
     out.push_str(&format!(
-        "- Minimum training window: `{}` days\n- OOS years: `{}`\n- OOS trades: `{}`\n- OOS PnL: `{:.2}`\n- OOS win rate: `{:.1}%`\n- OOS profit factor: `{:.2}`\n- OOS max DD: `{:.3}`\n- OOS score: `{:.4}`\n- Selected profiles: `{}`\n\n",
+        "- Minimum training window: `{}` days\n- OOS years: `{}`\n- Active OOS years: `{}`\n- OOS trades: `{}`\n- OOS PnL: `{:.2}`\n- OOS win rate: `{:.1}%`\n- OOS profit factor: `{:.2}`\n- OOS max DD: `{:.3}`\n- OOS score: `{:.4}`\n- Selected profiles: `{}`\n\n",
         wf.min_train_days,
         wf.years.len(),
+        active_years,
         wf.metrics.trades,
         wf.metrics.total_pnl,
         wf.metrics.win_rate * 100.0,
@@ -2089,16 +2096,17 @@ fn research_markdown(report: &ResearchReport) -> String {
         wf.metrics.score,
         format_profile_counts(&wf.selected_profile_counts)
     ));
-    out.push_str("| Test Year | Train Window | Test Window | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
-    out.push_str("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for year in &wf.years {
         out.push_str(&format!(
-            "| {} | {} to {} | {} to {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
             year.test_year,
             year.train_from,
             year.train_to,
             year.test_from,
             year.test_to,
+            if year.active { "yes" } else { "no" },
             year.selected_profile,
             if year.train_metrics.robust_ranking_eligible {
                 "yes"
@@ -2621,8 +2629,10 @@ mod tests {
 
         assert_eq!(result.years.len(), 2);
         assert_eq!(result.years[0].test_year, 2023);
+        assert!(result.years[0].active);
         assert_eq!(result.years[0].selected_profile, "better");
         assert_eq!(result.years[1].test_year, 2024);
+        assert!(result.years[1].active);
         assert_eq!(result.years[1].selected_profile, "better");
         assert_eq!(result.trades.len(), 2);
         assert_eq!(
@@ -2634,6 +2644,35 @@ mod tests {
             NaiveDate::from_ymd_opt(2024, 2, 1).unwrap()
         );
         assert_eq!(result.years[1].test_metrics.trades, 1);
+    }
+
+    #[test]
+    fn walk_forward_stays_inactive_without_robust_training_profile() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        let trades = vec![
+            trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2020, 1, 2).unwrap(),
+                NaiveDate::from_ymd_opt(2020, 1, 9).unwrap(),
+                50.0,
+            ),
+            trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2023, 2, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2023, 2, 8).unwrap(),
+                50.0,
+            ),
+        ];
+        let results = vec![profile_result("thin_profile", trades, from, to)];
+
+        let result = walk_forward(&results, from, to);
+
+        assert_eq!(result.years.len(), 1);
+        assert_eq!(result.years[0].test_year, 2023);
+        assert_eq!(result.years[0].selected_profile, "thin_profile");
+        assert!(!result.years[0].active);
+        assert!(!result.years[0].train_metrics.robust_ranking_eligible);
+        assert_eq!(result.years[0].test_metrics.trades, 0);
+        assert!(result.trades.is_empty());
     }
 
     #[test]
