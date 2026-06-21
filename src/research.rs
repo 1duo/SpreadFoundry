@@ -20,6 +20,7 @@ const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
 const PLATEAU_MIN_PROFILE_VARIANTS: usize = 75;
 const PLATEAU_MIN_WALK_FORWARD_YEARS: usize = 3;
 const RECENT_TRAIN_ACTIVITY_DAYS: i64 = 365;
+const MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE: f64 = 0.005;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -272,6 +273,8 @@ pub struct WalkForwardTrainMetrics {
     pub robust_score: f64,
     pub ranking_eligible: bool,
     pub robust_ranking_eligible: bool,
+    pub min_deployable_robust_score: f64,
+    pub robust_score_gate: bool,
     pub recent_activity_window_days: i64,
     pub recent_trades: usize,
     pub recent_activity_gate: bool,
@@ -1234,7 +1237,7 @@ fn rank_walk_forward_profiles<'a>(
 }
 
 fn deployable_training_profile(metrics: &ResearchMetrics) -> bool {
-    metrics.robust_ranking_eligible && metrics.robust_score > 0.0
+    metrics.robust_ranking_eligible && metrics.robust_score >= MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE
 }
 
 fn deployable_training_selection(
@@ -1504,6 +1507,8 @@ fn train_metrics_summary(
         robust_score: metrics.robust_score,
         ranking_eligible: metrics.ranking_eligible,
         robust_ranking_eligible: metrics.robust_ranking_eligible,
+        min_deployable_robust_score: MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE,
+        robust_score_gate: metrics.robust_score >= MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE,
         recent_activity_window_days: RECENT_TRAIN_ACTIVITY_DAYS,
         recent_trades,
         recent_activity_gate: recent_trades > 0,
@@ -3845,13 +3850,13 @@ fn research_markdown(report: &ResearchReport) -> String {
         wf.metrics.score,
         format_profile_counts(&wf.selected_profile_counts)
     ));
-    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Edge Gate | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
     out.push_str(
-        "|---:|---|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for year in &wf.years {
         out.push_str(&format!(
-            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
             year.test_year,
             year.train_from,
             year.train_to,
@@ -3860,6 +3865,11 @@ fn research_markdown(report: &ResearchReport) -> String {
             if year.active { "yes" } else { "no" },
             year.selected_profile,
             if year.train_metrics.robust_ranking_eligible {
+                "yes"
+            } else {
+                "no"
+            },
+            if year.train_metrics.robust_score_gate {
                 "yes"
             } else {
                 "no"
@@ -3895,13 +3905,13 @@ fn research_markdown(report: &ResearchReport) -> String {
         rolling.metrics.score,
         format_profile_counts(&rolling.selected_profile_counts)
     ));
-    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Edge Gate | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
     out.push_str(
-        "|---:|---|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for year in &rolling.years {
         out.push_str(&format!(
-            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
             year.test_year,
             year.train_from,
             year.train_to,
@@ -3910,6 +3920,11 @@ fn research_markdown(report: &ResearchReport) -> String {
             if year.active { "yes" } else { "no" },
             year.selected_profile,
             if year.train_metrics.robust_ranking_eligible {
+                "yes"
+            } else {
+                "no"
+            },
+            if year.train_metrics.robust_score_gate {
                 "yes"
             } else {
                 "no"
@@ -3930,16 +3945,26 @@ fn research_markdown(report: &ResearchReport) -> String {
     out.push('\n');
 
     out.push_str("## Walk-Forward Selection Diagnostics\n\n");
-    out.push_str("| Test Year | Rank | Active | Profile | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
-    out.push_str("|---:|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Test Year | Rank | Active | Profile | Train Robust Eligible | Train Edge Gate | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
+    out.push_str("|---:|---:|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
     for year in &wf.years {
         for candidate in &year.selection_candidates {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} |\n",
                 year.test_year,
                 candidate.rank,
                 if candidate.active { "yes" } else { "no" },
                 candidate.profile,
+                if candidate.train_metrics.robust_ranking_eligible {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if candidate.train_metrics.robust_score_gate {
+                    "yes"
+                } else {
+                    "no"
+                },
                 candidate.train_metrics.trades,
                 candidate.train_metrics.recent_trades,
                 format_optional_date(candidate.train_metrics.last_entry_date),
@@ -3957,7 +3982,7 @@ fn research_markdown(report: &ResearchReport) -> String {
     let holdout = &report.holdout;
     out.push_str("## Half-Window Holdout Selector\n\n");
     out.push_str(&format!(
-        "- Train window: `{}` to `{}`\n- Test window: `{}` to `{}`\n- Active: `{}`\n- Selected profile: `{}`\n- Train robust eligible: `{}`\n- Train trades: `{}`\n- Recent 365D train trades: `{}`\n- Last train entry: `{}`\n- Days since last train entry: `{}`\n- Train PnL: `{:.2}`\n- Train robust score: `{:.4}`\n- Test trades: `{}`\n- Test PnL: `{:.2}`\n- Test win rate: `{:.1}%`\n- Test profit factor: `{:.2}`\n- Test max DD: `{:.3}`\n- Test score: `{:.4}`\n\n",
+        "- Train window: `{}` to `{}`\n- Test window: `{}` to `{}`\n- Active: `{}`\n- Selected profile: `{}`\n- Train robust eligible: `{}`\n- Train robust score gate: `{}` (min `{:.4}`)\n- Train trades: `{}`\n- Recent 365D train trades: `{}`\n- Last train entry: `{}`\n- Days since last train entry: `{}`\n- Train PnL: `{:.2}`\n- Train robust score: `{:.4}`\n- Test trades: `{}`\n- Test PnL: `{:.2}`\n- Test win rate: `{:.1}%`\n- Test profit factor: `{:.2}`\n- Test max DD: `{:.3}`\n- Test score: `{:.4}`\n\n",
         holdout.train_from,
         holdout.train_to,
         holdout.test_from,
@@ -3969,6 +3994,8 @@ fn research_markdown(report: &ResearchReport) -> String {
         } else {
             "no"
         },
+        format_gate(holdout.train_metrics.robust_score_gate),
+        holdout.train_metrics.min_deployable_robust_score,
         holdout.train_metrics.trades,
         holdout.train_metrics.recent_trades,
         format_optional_date(holdout.train_metrics.last_entry_date),
@@ -4624,6 +4651,38 @@ mod tests {
         assert!(metrics.robust_ranking_eligible);
         assert!(metrics.robust_score < 0.0);
         assert!(!deployable_training_profile(&metrics));
+    }
+
+    #[test]
+    fn deployable_training_profile_requires_robust_score_margin() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let mut metrics = metrics(&training_trades(40.0), from, to);
+        metrics.robust_score = MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE / 2.0;
+
+        assert!(metrics.robust_score > 0.0);
+        assert!(metrics.robust_ranking_eligible);
+        assert!(!deployable_training_profile(&metrics));
+
+        metrics.robust_score = MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE;
+        assert!(deployable_training_profile(&metrics));
+    }
+
+    #[test]
+    fn train_metrics_summary_reports_robust_score_gate() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let train_to = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let trades = training_trades(40.0);
+        let mut metrics = metrics(&trades, from, train_to);
+        metrics.robust_score = MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE / 2.0;
+
+        let summary = train_metrics_summary(&metrics, &trades, train_to);
+
+        assert_eq!(
+            summary.min_deployable_robust_score,
+            MIN_DEPLOYABLE_TRAINING_ROBUST_SCORE
+        );
+        assert!(!summary.robust_score_gate);
     }
 
     #[test]
