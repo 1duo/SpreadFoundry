@@ -116,6 +116,8 @@ enum Commands {
         fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
+        #[arg(long, default_value_t = false)]
+        allow_pre_plateau: bool,
     },
 }
 
@@ -223,6 +225,18 @@ struct UniverseSymbolSummary {
     latest_signal_status: Option<String>,
 }
 
+#[derive(Debug)]
+struct UniverseResearchArgs {
+    symbols: Vec<String>,
+    plateau_run: Option<PathBuf>,
+    from: NaiveDate,
+    to: NaiveDate,
+    max_expirations: Option<usize>,
+    fetch_concurrency: usize,
+    force_refresh: bool,
+    allow_pre_plateau: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct PlateauRunGate {
     plateau_status: PlateauRunStatus,
@@ -324,8 +338,9 @@ async fn main() -> Result<()> {
             max_expirations,
             fetch_concurrency,
             force_refresh,
+            allow_pre_plateau,
         } => {
-            research_universe(
+            research_universe(UniverseResearchArgs {
                 symbols,
                 plateau_run,
                 from,
@@ -333,7 +348,8 @@ async fn main() -> Result<()> {
                 max_expirations,
                 fetch_concurrency,
                 force_refresh,
-            )
+                allow_pre_plateau,
+            })
             .await
         }
     }
@@ -502,34 +518,23 @@ fn shadow_live(symbol: &str, strategy: StrategyArg) -> Result<()> {
     Ok(())
 }
 
-async fn research_universe(
-    symbols: Vec<String>,
-    plateau_run: Option<PathBuf>,
-    from: NaiveDate,
-    to: NaiveDate,
-    max_expirations: Option<usize>,
-    fetch_concurrency: usize,
-    force_refresh: bool,
-) -> Result<()> {
+async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
+    let UniverseResearchArgs {
+        symbols,
+        plateau_run,
+        from,
+        to,
+        max_expirations,
+        fetch_concurrency,
+        force_refresh,
+        allow_pre_plateau,
+    } = args;
     let symbols = normalize_symbols(symbols);
     if symbols.is_empty() {
         anyhow::bail!("research-universe requires at least one symbol");
     }
 
-    let plateau_run = if let Some(path) = plateau_run {
-        let report_path = research_report_path(&path);
-        let plateau_status = read_plateau_run_gate(&report_path)?;
-        if !plateau_status.expansion_ready {
-            anyhow::bail!(
-                "plateau run {} is not expansion-ready; status={}",
-                report_path.display(),
-                plateau_status.status
-            );
-        }
-        Some(report_path)
-    } else {
-        None
-    };
+    let plateau_run = checked_plateau_run(plateau_run, allow_pre_plateau)?;
 
     let run_dir = next_run_dir("universe-research")?;
     fs::create_dir_all(&run_dir)?;
@@ -659,6 +664,31 @@ fn research_report_path(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+fn checked_plateau_run(
+    plateau_run: Option<PathBuf>,
+    allow_pre_plateau: bool,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = plateau_run else {
+        if allow_pre_plateau {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "research-universe requires --plateau-run with expansion_ready=true; pass --allow-pre-plateau for manual exploratory universe research"
+        );
+    };
+
+    let report_path = research_report_path(&path);
+    let plateau_status = read_plateau_run_gate(&report_path)?;
+    if !plateau_status.expansion_ready {
+        anyhow::bail!(
+            "plateau run {} is not expansion-ready; status={}",
+            report_path.display(),
+            plateau_status.status
+        );
+    }
+    Ok(Some(report_path))
 }
 
 fn read_plateau_run_gate(path: &Path) -> Result<PlateauRunStatus> {
@@ -1047,6 +1077,42 @@ mod tests {
     }
 
     #[test]
+    fn universe_research_requires_plateau_run_unless_explicitly_overridden() {
+        let err = checked_plateau_run(None, false).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("requires --plateau-run with expansion_ready=true")
+        );
+        assert!(checked_plateau_run(None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn universe_research_accepts_only_expansion_ready_plateau_run() {
+        let run_dir = unique_main_test_path("plateau-run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("research.json"),
+            r#"{"plateau_status":{"status":"continue_symbol_research","expansion_ready":false}}"#,
+        )
+        .unwrap();
+
+        let err = checked_plateau_run(Some(run_dir.clone()), false).unwrap_err();
+        assert!(err.to_string().contains("is not expansion-ready"));
+
+        fs::write(
+            run_dir.join("research.json"),
+            r#"{"plateau_status":{"status":"plateau_expand_universe","expansion_ready":true}}"#,
+        )
+        .unwrap();
+
+        let checked = checked_plateau_run(Some(run_dir.clone()), false).unwrap();
+        assert_eq!(checked, Some(run_dir.join("research.json")));
+
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
     fn universe_results_rank_by_oos_evidence_not_seed_order() {
         let mut results = vec![
             universe_summary_row(TestUniverseRow {
@@ -1252,5 +1318,13 @@ mod tests {
             best_fixed_robust_score: input.robust_score,
             latest_signal_status: Some("research_only".to_owned()),
         }
+    }
+
+    fn unique_main_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "spreadfoundry-main-test-{}-{}-{name}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ))
     }
 }

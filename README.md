@@ -23,7 +23,7 @@ cargo run -- research-symbol --symbol AAPL --from 2024-01-01 --to 2026-06-18 --m
 cargo run -- research-universe --plateau-run runs/<nvda-run>/research.json --from 2024-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 ```
 
-`research-universe` is plateau-gated when `--plateau-run` is supplied. Its default expansion seed is five liquid non-NVDA single stocks for put credit spread research:
+`research-universe` requires an expansion-ready `--plateau-run` by default. Use `--allow-pre-plateau` only for manual exploratory runs before NVDA reaches plateau. Its default expansion seed is five liquid non-NVDA single stocks for put credit spread research:
 
 ```text
 TSLA,AMD,META,AMZN,AAPL
