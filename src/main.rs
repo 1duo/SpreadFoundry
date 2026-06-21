@@ -185,6 +185,8 @@ struct UniverseSymbolSummary {
     seed_rank: Option<usize>,
     seed_role: Option<String>,
     seed_rationale: Option<String>,
+    research_status: String,
+    error_message: Option<String>,
     report_dir: String,
     deployment_status: String,
     plateau_status: String,
@@ -537,16 +539,21 @@ async fn research_universe(
     let mut results = Vec::new();
     for symbol in &symbols {
         println!("researching {symbol}");
-        let report = run_symbol_research(ResearchRequest {
+        let request = ResearchRequest {
             symbol: symbol.clone(),
             from,
             to,
             max_expirations,
             fetch_concurrency,
             force_refresh,
-        })
-        .await?;
-        results.push(universe_symbol_summary(&report, &expansion_seed));
+        };
+        match run_symbol_research(request).await {
+            Ok(report) => results.push(universe_symbol_summary(&report, &expansion_seed)),
+            Err(err) => {
+                eprintln!("research failed for {symbol}: {err:#}");
+                results.push(universe_symbol_error_summary(symbol, &expansion_seed, &err));
+            }
+        }
     }
     rank_universe_results(&mut results);
 
@@ -681,6 +688,8 @@ fn universe_symbol_summary(
         seed_rank: seed.map(|seed| seed.rank),
         seed_role: seed.map(|seed| seed.role.clone()),
         seed_rationale: seed.map(|seed| seed.rationale.clone()),
+        research_status: "ok".to_owned(),
+        error_message: None,
         report_dir: PathBuf::from("runs")
             .join(&report.run_id)
             .display()
@@ -745,6 +754,64 @@ fn universe_symbol_summary(
     }
 }
 
+fn universe_symbol_error_summary(
+    symbol: &str,
+    expansion_seed: &[UniverseSeedSymbol],
+    err: &anyhow::Error,
+) -> UniverseSymbolSummary {
+    let symbol = symbol.to_uppercase();
+    let seed = expansion_seed.iter().find(|seed| seed.symbol == symbol);
+    UniverseSymbolSummary {
+        suitability_rank: 0,
+        symbol,
+        seed_rank: seed.map(|seed| seed.rank),
+        seed_role: seed.map(|seed| seed.role.clone()),
+        seed_rationale: seed.map(|seed| seed.rationale.clone()),
+        research_status: "error".to_owned(),
+        error_message: Some(compact_error_message(&format!("{err:#}"))),
+        report_dir: "n/a".to_owned(),
+        deployment_status: "error".to_owned(),
+        plateau_status: "error".to_owned(),
+        detector_status: "not_run".to_owned(),
+        execution_strategy_status: "not_run".to_owned(),
+        expansion_ready: false,
+        expirations_loaded: 0,
+        rows_loaded: 0,
+        profiles_evaluated: 0,
+        best_profile: String::new(),
+        best_detector: String::new(),
+        best_execution: String::new(),
+        trades: 0,
+        total_pnl: 0.0,
+        score: 0.0,
+        robust_score: 0.0,
+        walk_forward_trades: 0,
+        walk_forward_pnl: 0.0,
+        walk_forward_score: 0.0,
+        holdout_trades: 0,
+        holdout_pnl: 0.0,
+        holdout_score: 0.0,
+        fixed_profile_oos_passes: 0,
+        best_fixed_profile: String::new(),
+        best_fixed_detector: String::new(),
+        best_fixed_execution: String::new(),
+        best_fixed_trades: 0,
+        best_fixed_pnl: 0.0,
+        best_fixed_score: 0.0,
+        best_fixed_robust_score: 0.0,
+        latest_signal_status: None,
+    }
+}
+
+fn compact_error_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn research_metrics_oos_passes(metrics: &ResearchMetrics) -> bool {
     metrics.ranking_eligible && metrics.total_pnl > 0.0 && metrics.score > 0.0
 }
@@ -757,8 +824,9 @@ fn rank_universe_results(results: &mut [UniverseSymbolSummary]) {
 }
 
 fn universe_result_order(a: &UniverseSymbolSummary, b: &UniverseSymbolSummary) -> Ordering {
-    universe_deployment_passes(b)
-        .cmp(&universe_deployment_passes(a))
+    universe_research_succeeded(b)
+        .cmp(&universe_research_succeeded(a))
+        .then_with(|| universe_deployment_passes(b).cmp(&universe_deployment_passes(a)))
         .then_with(|| b.fixed_profile_oos_passes.cmp(&a.fixed_profile_oos_passes))
         .then_with(|| b.walk_forward_score.total_cmp(&a.walk_forward_score))
         .then_with(|| b.holdout_score.total_cmp(&a.holdout_score))
@@ -774,8 +842,16 @@ fn universe_result_order(a: &UniverseSymbolSummary, b: &UniverseSymbolSummary) -
         .then_with(|| a.symbol.cmp(&b.symbol))
 }
 
+fn universe_research_succeeded(summary: &UniverseSymbolSummary) -> bool {
+    summary.research_status == "ok"
+}
+
 fn universe_deployment_passes(summary: &UniverseSymbolSummary) -> bool {
     summary.deployment_status == "pass"
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|")
 }
 
 fn universe_markdown(summary: &UniverseResearchSummary) -> String {
@@ -805,19 +881,25 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     out.push('\n');
 
     out.push_str("## Symbol Suitability Ranking\n\n");
-    out.push_str("| Rank | Seed Rank | Symbol | Report | Deployment | Plateau | Detector Status | Execution Status | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
+    out.push_str("| Rank | Seed Rank | Symbol | Research | Error | Report | Deployment | Plateau | Detector Status | Execution Status | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
     out.push_str(
-        "|---:|---:|---|---|---|---|---|---|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "|---:|---:|---|---|---|---|---|---|---|---|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     for result in &summary.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
             result.suitability_rank,
             result
                 .seed_rank
                 .map(|rank| rank.to_string())
                 .unwrap_or_else(|| "n/a".to_owned()),
             result.symbol,
+            result.research_status,
+            result
+                .error_message
+                .as_deref()
+                .map(markdown_cell)
+                .unwrap_or_else(|| "none".to_owned()),
             result.report_dir,
             result.deployment_status,
             result.plateau_status,
@@ -1002,6 +1084,39 @@ mod tests {
         assert!(markdown.contains("put_spread_execution_test"));
     }
 
+    #[test]
+    fn universe_results_keep_symbol_errors_and_rank_them_last() {
+        let expansion_seed = expansion_seed_for_symbols(&["TSLA".to_owned(), "AAPL".to_owned()]);
+        let mut results = vec![
+            universe_symbol_error_summary(
+                "TSLA",
+                &expansion_seed,
+                &anyhow::anyhow!("ThetaData 403\nsubscription required"),
+            ),
+            universe_summary_row(TestUniverseRow {
+                symbol: "AAPL",
+                seed_rank: Some(2),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 0,
+                walk_forward_score: -1.0,
+                holdout_score: -1.0,
+                robust_score: 0.1,
+                rows_loaded: 10_000,
+            }),
+        ];
+
+        rank_universe_results(&mut results);
+
+        assert_eq!(results[0].symbol, "AAPL");
+        assert_eq!(results[0].research_status, "ok");
+        assert_eq!(results[1].symbol, "TSLA");
+        assert_eq!(results[1].research_status, "error");
+        assert_eq!(
+            results[1].error_message.as_deref(),
+            Some("ThetaData 403 | subscription required")
+        );
+    }
+
     struct TestUniverseRow {
         symbol: &'static str,
         seed_rank: Option<usize>,
@@ -1020,6 +1135,8 @@ mod tests {
             seed_rank: input.seed_rank,
             seed_role: Some("test".to_owned()),
             seed_rationale: Some("test".to_owned()),
+            research_status: "ok".to_owned(),
+            error_message: None,
             report_dir: format!("runs/{}", input.symbol),
             deployment_status: input.deployment_status.to_owned(),
             plateau_status: "plateau_expand_universe".to_owned(),
