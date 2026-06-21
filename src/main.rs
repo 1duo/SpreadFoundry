@@ -7,7 +7,7 @@ use spreadfoundry::broker::RobinhoodBrokerAdapter;
 use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
-use spreadfoundry::research::{ResearchRequest, run_nvda_research};
+use spreadfoundry::research::{ResearchRequest, run_symbol_research};
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
 use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
@@ -65,6 +65,20 @@ enum Commands {
         run: PathBuf,
     },
     ResearchNvda {
+        #[arg(long, default_value = "2012-01-01")]
+        from: NaiveDate,
+        #[arg(long)]
+        to: NaiveDate,
+        #[arg(long)]
+        max_expirations: Option<usize>,
+        #[arg(long, default_value_t = 4)]
+        fetch_concurrency: usize,
+        #[arg(long, default_value_t = false)]
+        force_refresh: bool,
+    },
+    ResearchSymbol {
+        #[arg(long)]
+        symbol: String,
         #[arg(long, default_value = "2012-01-01")]
         from: NaiveDate,
         #[arg(long)]
@@ -152,8 +166,36 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             force_refresh,
         } => {
-            let report = run_nvda_research(ResearchRequest {
+            let report = run_symbol_research(ResearchRequest {
                 symbol: "NVDA".to_owned(),
+                from,
+                to,
+                max_expirations,
+                fetch_concurrency,
+                force_refresh,
+            })
+            .await?;
+            if let Some(best) = report.profiles.first() {
+                println!(
+                    "best={} trades={} pnl={:.2} score={:.4}",
+                    best.profile.name,
+                    best.metrics.trades,
+                    best.metrics.total_pnl,
+                    best.metrics.score
+                );
+            }
+            Ok(())
+        }
+        Commands::ResearchSymbol {
+            symbol,
+            from,
+            to,
+            max_expirations,
+            fetch_concurrency,
+            force_refresh,
+        } => {
+            let report = run_symbol_research(ResearchRequest {
+                symbol: symbol.to_uppercase(),
                 from,
                 to,
                 max_expirations,

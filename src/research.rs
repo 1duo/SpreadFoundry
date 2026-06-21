@@ -423,9 +423,13 @@ struct EntryRegime {
     underlying_realized_vol: Option<f64>,
 }
 
-pub async fn run_nvda_research(request: ResearchRequest) -> Result<ResearchReport> {
+pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchReport> {
     let raw_dir = PathBuf::from("data/raw/theta").join(&request.symbol);
-    let run_id = format!("nvda-research-{}", Utc::now().format("%Y%m%dT%H%M%S%.9fZ"));
+    let run_id = format!(
+        "{}-research-{}",
+        symbol_slug(&request.symbol),
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ")
+    );
     let run_dir = PathBuf::from("runs").join(&run_id);
     fs::create_dir_all(&raw_dir)?;
     fs::create_dir_all(&run_dir)?;
@@ -574,6 +578,19 @@ fn evenly_spaced<T: Copy>(items: Vec<T>, max: usize) -> Vec<T> {
         .map(|idx| {
             let selected = idx * last / denominator;
             items[selected]
+        })
+        .collect()
+}
+
+fn symbol_slug(symbol: &str) -> String {
+    symbol
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
         })
         .collect()
 }
@@ -3253,8 +3270,8 @@ fn median(mut values: Vec<f64>) -> f64 {
 fn research_markdown(report: &ResearchReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# SpreadFoundry NVDA Research {}\n\n",
-        report.run_id
+        "# SpreadFoundry {} Research {}\n\n",
+        report.symbol, report.run_id
     ));
     out.push_str(&format!(
         "- Window: `{}` to `{}`\n- Expirations discovered: `{}`\n- Expirations loaded: `{}`\n- EOD rows loaded: `{}`\n- Ranking gate: profiles need at least `{}` trades for this window\n\n",
@@ -3618,6 +3635,12 @@ mod tests {
         assert_eq!(evenly_spaced(vec![1, 2, 3], 0), Vec::<i32>::new());
         assert_eq!(evenly_spaced(vec![1, 2, 3], 1), vec![1]);
         assert_eq!(evenly_spaced(vec![1, 2, 3], 4), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn symbol_slug_is_filesystem_safe() {
+        assert_eq!(symbol_slug("NVDA"), "nvda");
+        assert_eq!(symbol_slug("BRK.B"), "brk-b");
     }
 
     #[test]
