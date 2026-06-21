@@ -1525,6 +1525,14 @@ fn research_profiles() -> Vec<ResearchProfile> {
             0.003,
         ),
         (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew40bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.004,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew45bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.0045,
+        ),
+        (
             "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew50bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
             0.005,
         ),
@@ -4395,6 +4403,14 @@ mod tests {
             (
                 "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew30bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
                 0.003,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew40bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.004,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew45bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.0045,
             ),
             (
                 "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew50bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
