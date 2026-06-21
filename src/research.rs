@@ -905,7 +905,7 @@ fn execution_strategy_summary(profile: &ResearchProfile) -> ExecutionStrategySum
     let candidate_selector = if profile.prefer_farther_otm {
         "farther_otm_then_credit"
     } else {
-        "highest_credit"
+        "highest_return_on_risk"
     };
     ExecutionStrategySummary {
         name: format!(
@@ -4680,6 +4680,14 @@ mod tests {
     }
 
     #[test]
+    fn default_execution_summary_matches_return_on_risk_selector() {
+        let summary = execution_strategy_summary(&ResearchProfile::baseline());
+
+        assert_eq!(summary.candidate_selector, "highest_return_on_risk");
+        assert!(summary.name.contains("highest_return_on_risk"));
+    }
+
+    #[test]
     fn underlying_return_uses_only_dates_at_or_before_lookback_target() {
         let mut underlying = BTreeMap::new();
         underlying.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), 100.0);
@@ -6636,7 +6644,7 @@ mod tests {
     }
 
     #[test]
-    fn farther_otm_selector_does_not_change_default_credit_chasing() {
+    fn farther_otm_selector_overrides_default_return_on_risk_ordering() {
         let date = NaiveDate::from_ymd_opt(2026, 1, 11).unwrap();
         let close_high_credit = candidate_for_ordering(date, 95.0, 90.0, 1.25, -0.30, 0.05);
         let far_lower_credit = candidate_for_ordering(date, 90.0, 85.0, 1.05, -0.20, 0.10);
