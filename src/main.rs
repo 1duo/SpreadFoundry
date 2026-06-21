@@ -87,8 +87,14 @@ enum Commands {
         fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "single_symbol_only")]
         expand_on_plateau: bool,
+        #[arg(
+            long = "single-symbol-only",
+            alias = "no-expand-on-plateau",
+            default_value_t = false
+        )]
+        single_symbol_only: bool,
     },
     ResearchSymbol {
         #[arg(long)]
@@ -103,8 +109,14 @@ enum Commands {
         fetch_concurrency: usize,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "single_symbol_only")]
         expand_on_plateau: bool,
+        #[arg(
+            long = "single-symbol-only",
+            alias = "no-expand-on-plateau",
+            default_value_t = false
+        )]
+        single_symbol_only: bool,
     },
     ResearchUniverse {
         #[arg(
@@ -323,6 +335,7 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             force_refresh,
             expand_on_plateau,
+            single_symbol_only,
         } => {
             research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: "NVDA".to_owned(),
@@ -331,7 +344,7 @@ async fn main() -> Result<()> {
                 max_expirations,
                 fetch_concurrency,
                 force_refresh,
-                expand_on_plateau,
+                expand_on_plateau: should_expand_on_plateau(expand_on_plateau, single_symbol_only),
             })
             .await
         }
@@ -343,6 +356,7 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             force_refresh,
             expand_on_plateau,
+            single_symbol_only,
         } => {
             research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: symbol.to_uppercase(),
@@ -351,7 +365,7 @@ async fn main() -> Result<()> {
                 max_expirations,
                 fetch_concurrency,
                 force_refresh,
-                expand_on_plateau,
+                expand_on_plateau: should_expand_on_plateau(expand_on_plateau, single_symbol_only),
             })
             .await
         }
@@ -453,6 +467,10 @@ async fn research_symbol_and_optional_universe(args: ResearchCommandArgs) -> Res
 
 fn automatic_expansion_plateau_run(run_id: &str, expansion_ready: bool) -> Option<PathBuf> {
     expansion_ready.then(|| PathBuf::from("runs").join(run_id).join("research.json"))
+}
+
+fn should_expand_on_plateau(expand_on_plateau: bool, single_symbol_only: bool) -> bool {
+    expand_on_plateau || !single_symbol_only
 }
 
 async fn ingest_theta(
@@ -1460,10 +1478,75 @@ mod tests {
             Commands::ResearchSymbol {
                 symbol,
                 expand_on_plateau,
+                single_symbol_only,
                 ..
             } => {
                 assert_eq!(symbol, "nvda");
                 assert!(expand_on_plateau);
+                assert!(!single_symbol_only);
+                assert!(should_expand_on_plateau(
+                    expand_on_plateau,
+                    single_symbol_only
+                ));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn research_symbol_expands_on_plateau_by_default() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "research-symbol",
+            "--symbol",
+            "nvda",
+            "--to",
+            "2026-06-21",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResearchSymbol {
+                expand_on_plateau,
+                single_symbol_only,
+                ..
+            } => {
+                assert!(!expand_on_plateau);
+                assert!(!single_symbol_only);
+                assert!(should_expand_on_plateau(
+                    expand_on_plateau,
+                    single_symbol_only
+                ));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn research_symbol_can_disable_plateau_expansion() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "research-symbol",
+            "--symbol",
+            "nvda",
+            "--to",
+            "2026-06-21",
+            "--single-symbol-only",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResearchSymbol {
+                expand_on_plateau,
+                single_symbol_only,
+                ..
+            } => {
+                assert!(!expand_on_plateau);
+                assert!(single_symbol_only);
+                assert!(!should_expand_on_plateau(
+                    expand_on_plateau,
+                    single_symbol_only
+                ));
             }
             other => panic!("unexpected command: {other:?}"),
         }
