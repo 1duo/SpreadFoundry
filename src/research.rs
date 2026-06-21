@@ -1006,8 +1006,8 @@ fn profile_rank_order(
     b_metrics
         .robust_ranking_eligible
         .cmp(&a_metrics.robust_ranking_eligible)
-        .then_with(|| b_metrics.robust_score.total_cmp(&a_metrics.robust_score))
         .then_with(|| b_metrics.score.total_cmp(&a_metrics.score))
+        .then_with(|| b_metrics.robust_score.total_cmp(&a_metrics.robust_score))
         .then_with(|| {
             risk_regime_cooldown_tiebreak_score(b_profile)
                 .cmp(&risk_regime_cooldown_tiebreak_score(a_profile))
@@ -6054,6 +6054,26 @@ mod tests {
         assert_eq!(results[0].profile.name, "c_cooldown_20d");
         assert_eq!(results[1].profile.name, "b_cooldown_10d");
         assert_eq!(results[2].profile.name, "a_simple");
+    }
+
+    #[test]
+    fn profile_ranking_prefers_primary_score_after_robust_gate() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let trades = training_trades(50.0);
+        let mut higher_score = profile_result("higher_score", trades.clone(), from, to);
+        higher_score.metrics.score = 0.15;
+        higher_score.metrics.robust_score = 0.10;
+        higher_score.metrics.robust_ranking_eligible = true;
+        let mut higher_robust_score = profile_result("higher_robust", trades, from, to);
+        higher_robust_score.metrics.score = 0.13;
+        higher_robust_score.metrics.robust_score = 0.12;
+        higher_robust_score.metrics.robust_ranking_eligible = true;
+
+        let mut results = [higher_robust_score, higher_score];
+        results.sort_by(profile_result_order);
+
+        assert_eq!(results[0].profile.name, "higher_score");
     }
 
     #[test]
