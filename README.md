@@ -20,6 +20,7 @@ cargo run -- train-ranker --config configs/nvda_ranker.toml
 cargo run -- shadow-live --symbol NVDA --strategy put-spread
 cargo run -- research-nvda --from 2024-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 cargo run -- research-symbol --symbol AAPL --from 2024-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
+cargo run -- research-universe --plateau-run runs/<nvda-run>/research.json --from 2024-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 ```
 
 ThetaData universe ingest requires Theta Terminal running locally:

@@ -7,7 +7,7 @@ use spreadfoundry::broker::RobinhoodBrokerAdapter;
 use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
-use spreadfoundry::research::{ResearchRequest, run_symbol_research};
+use spreadfoundry::research::{ResearchReport, ResearchRequest, run_symbol_research};
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
 use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
@@ -90,6 +90,22 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
     },
+    ResearchUniverse {
+        #[arg(long, value_delimiter = ',', default_value = "TSLA,AAPL,AMZN,AMD,META")]
+        symbols: Vec<String>,
+        #[arg(long)]
+        plateau_run: Option<PathBuf>,
+        #[arg(long, default_value = "2012-01-01")]
+        from: NaiveDate,
+        #[arg(long)]
+        to: NaiveDate,
+        #[arg(long)]
+        max_expirations: Option<usize>,
+        #[arg(long, default_value_t = 4)]
+        fetch_concurrency: usize,
+        #[arg(long, default_value_t = false)]
+        force_refresh: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -130,6 +146,40 @@ struct OptimizationConfig {
 struct GridParams {
     min_credit_width_ratio: Decimal,
     max_width: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+struct UniverseResearchSummary {
+    run_id: String,
+    from: NaiveDate,
+    to: NaiveDate,
+    symbols: Vec<String>,
+    plateau_run: Option<String>,
+    selection_basis: String,
+    results: Vec<UniverseSymbolSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct UniverseSymbolSummary {
+    symbol: String,
+    report_dir: String,
+    deployment_status: String,
+    plateau_status: String,
+    expansion_ready: bool,
+    best_profile: String,
+    best_detector: String,
+    best_execution: String,
+    trades: usize,
+    total_pnl: f64,
+    score: f64,
+    robust_score: f64,
+    walk_forward_trades: usize,
+    walk_forward_pnl: f64,
+    walk_forward_score: f64,
+    holdout_trades: usize,
+    holdout_pnl: f64,
+    holdout_score: f64,
+    latest_signal_status: Option<String>,
 }
 
 #[tokio::main]
@@ -213,6 +263,26 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(())
+        }
+        Commands::ResearchUniverse {
+            symbols,
+            plateau_run,
+            from,
+            to,
+            max_expirations,
+            fetch_concurrency,
+            force_refresh,
+        } => {
+            research_universe(
+                symbols,
+                plateau_run,
+                from,
+                to,
+                max_expirations,
+                fetch_concurrency,
+                force_refresh,
+            )
+            .await
         }
     }
 }
@@ -380,6 +450,186 @@ fn shadow_live(symbol: &str, strategy: StrategyArg) -> Result<()> {
     Ok(())
 }
 
+async fn research_universe(
+    symbols: Vec<String>,
+    plateau_run: Option<PathBuf>,
+    from: NaiveDate,
+    to: NaiveDate,
+    max_expirations: Option<usize>,
+    fetch_concurrency: usize,
+    force_refresh: bool,
+) -> Result<()> {
+    let symbols = normalize_symbols(symbols);
+    if symbols.is_empty() {
+        anyhow::bail!("research-universe requires at least one symbol");
+    }
+
+    let plateau_run = if let Some(path) = plateau_run {
+        let report_path = research_report_path(&path);
+        let report = read_research_report(&report_path)?;
+        if !report.plateau_status.expansion_ready {
+            anyhow::bail!(
+                "plateau run {} is not expansion-ready; status={}",
+                report_path.display(),
+                report.plateau_status.status
+            );
+        }
+        Some(report_path)
+    } else {
+        None
+    };
+
+    let run_dir = next_run_dir("universe-research")?;
+    fs::create_dir_all(&run_dir)?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("universe-research")
+        .to_owned();
+    let mut results = Vec::new();
+    for symbol in &symbols {
+        println!("researching {symbol}");
+        let report = run_symbol_research(ResearchRequest {
+            symbol: symbol.clone(),
+            from,
+            to,
+            max_expirations,
+            fetch_concurrency,
+            force_refresh,
+        })
+        .await?;
+        results.push(universe_symbol_summary(&report));
+    }
+
+    let summary = UniverseResearchSummary {
+        run_id,
+        from,
+        to,
+        symbols,
+        plateau_run: plateau_run
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        selection_basis: "Liquidity-first single-stock expansion seed; rerank with ThetaData chain liquidity, OI, spreads, and out-of-sample strategy results before any live use.".to_owned(),
+        results,
+    };
+    fs::write(
+        run_dir.join("summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    fs::write(run_dir.join("report.md"), universe_markdown(&summary))?;
+    println!("wrote {}", run_dir.display());
+    Ok(())
+}
+
+fn normalize_symbols(symbols: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for symbol in symbols {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.is_empty() && !normalized.contains(&symbol) {
+            normalized.push(symbol);
+        }
+    }
+    normalized
+}
+
+fn research_report_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("research.json")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn read_research_report(path: &Path) -> Result<ResearchReport> {
+    let body = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn universe_symbol_summary(report: &ResearchReport) -> UniverseSymbolSummary {
+    let best = report.profiles.first();
+    UniverseSymbolSummary {
+        symbol: report.symbol.clone(),
+        report_dir: PathBuf::from("runs")
+            .join(&report.run_id)
+            .display()
+            .to_string(),
+        deployment_status: report.deployment_gate.status.clone(),
+        plateau_status: report.plateau_status.status.clone(),
+        expansion_ready: report.plateau_status.expansion_ready,
+        best_profile: best
+            .map(|result| result.profile.name.clone())
+            .unwrap_or_default(),
+        best_detector: best
+            .map(|result| result.detector_strategy.name.clone())
+            .unwrap_or_default(),
+        best_execution: best
+            .map(|result| result.execution_strategy.name.clone())
+            .unwrap_or_default(),
+        trades: best.map(|result| result.metrics.trades).unwrap_or_default(),
+        total_pnl: best
+            .map(|result| result.metrics.total_pnl)
+            .unwrap_or_default(),
+        score: best.map(|result| result.metrics.score).unwrap_or_default(),
+        robust_score: best
+            .map(|result| result.metrics.robust_score)
+            .unwrap_or_default(),
+        walk_forward_trades: report.walk_forward.metrics.trades,
+        walk_forward_pnl: report.walk_forward.metrics.total_pnl,
+        walk_forward_score: report.walk_forward.metrics.score,
+        holdout_trades: report.holdout.metrics.trades,
+        holdout_pnl: report.holdout.metrics.total_pnl,
+        holdout_score: report.holdout.metrics.score,
+        latest_signal_status: report
+            .latest_signal
+            .as_ref()
+            .map(|signal| signal.status.clone()),
+    }
+}
+
+fn universe_markdown(summary: &UniverseResearchSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# SpreadFoundry Universe Research {}\n\n",
+        summary.run_id
+    ));
+    out.push_str(&format!(
+        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Selection basis: {}\n\n",
+        summary.from,
+        summary.to,
+        summary.symbols.join(", "),
+        summary.plateau_run.as_deref().unwrap_or("not provided"),
+        summary.selection_basis
+    ));
+    out.push_str("| Symbol | Report | Deployment | Plateau | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Latest Signal |\n");
+    out.push_str(
+        "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+    );
+    for result in &summary.results {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} |\n",
+            result.symbol,
+            result.report_dir,
+            result.deployment_status,
+            result.plateau_status,
+            result.best_profile,
+            result.best_detector,
+            result.best_execution,
+            result.trades,
+            result.total_pnl,
+            result.score,
+            result.robust_score,
+            result.walk_forward_trades,
+            result.walk_forward_pnl,
+            result.walk_forward_score,
+            result.holdout_trades,
+            result.holdout_pnl,
+            result.holdout_score,
+            result.latest_signal_status.as_deref().unwrap_or("none")
+        ));
+    }
+    out
+}
+
 fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let body = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&body).with_context(|| format!("parsing {}", path.display()))
@@ -407,4 +657,22 @@ fn fixture_exit_quotes(name: Option<&str>) -> Result<Vec<SpreadExitQuote>> {
 fn next_run_dir(prefix: &str) -> Result<PathBuf> {
     let run_id = format!("{}-{}", prefix, Utc::now().format("%Y%m%dT%H%M%S%.9fZ"));
     Ok(PathBuf::from("runs").join(run_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_symbols_uppercases_deduplicates_and_drops_empty_values() {
+        assert_eq!(
+            normalize_symbols(vec![
+                " tsla ".to_owned(),
+                "AAPL".to_owned(),
+                "".to_owned(),
+                "tsla".to_owned(),
+            ]),
+            vec!["TSLA".to_owned(), "AAPL".to_owned()]
+        );
+    }
 }
