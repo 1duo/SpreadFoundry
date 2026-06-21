@@ -1368,11 +1368,22 @@ fn fixed_profile_walk_forward_result_order(
 ) -> Ordering {
     out_of_sample_gate_passes(&b.metrics)
         .cmp(&out_of_sample_gate_passes(&a.metrics))
-        .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
+        .then_with(|| fixed_profile_oos_score_order(a, b))
         .then_with(|| b.metrics.total_pnl.total_cmp(&a.metrics.total_pnl))
         .then_with(|| b.metrics.trades.cmp(&a.metrics.trades))
         .then_with(|| profile_complexity(&a.profile).cmp(&profile_complexity(&b.profile)))
         .then_with(|| a.profile.name.cmp(&b.profile.name))
+}
+
+fn fixed_profile_oos_score_order(
+    a: &FixedProfileWalkForwardResult,
+    b: &FixedProfileWalkForwardResult,
+) -> Ordering {
+    if a.metrics.ranking_eligible && b.metrics.ranking_eligible {
+        b.metrics.score.total_cmp(&a.metrics.score)
+    } else {
+        Ordering::Equal
+    }
 }
 
 struct WalkForwardSelection<'a> {
@@ -6535,6 +6546,52 @@ mod tests {
         assert_eq!(fixed[0].trades.len(), 2);
         assert!(fixed[0].metrics.total_pnl > fixed[1].metrics.total_pnl);
         assert_eq!(fixed[1].profile.name, "bad");
+    }
+
+    #[test]
+    fn fixed_profile_walk_forward_ranks_thin_oos_by_pnl_before_synthetic_score() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut profitable_thin = training_trades(50.0);
+        profitable_thin.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        profitable_thin.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 9).unwrap(),
+            80.0,
+        ));
+
+        let mut losing_more_trades = training_trades(50.0);
+        losing_more_trades.push(trade_with_entry_exit(
+            NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 12, 8).unwrap(),
+            25.0,
+        ));
+        for month in 1..=6 {
+            losing_more_trades.push(trade_with_entry_exit(
+                NaiveDate::from_ymd_opt(2024, month, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2024, month, 8).unwrap(),
+                -20.0,
+            ));
+        }
+        let results = vec![
+            profile_result("losing_more_trades", losing_more_trades, from, to),
+            profile_result("profitable_thin", profitable_thin, from, to),
+        ];
+
+        let fixed = fixed_profile_walk_forward(&results, from, to);
+
+        assert_eq!(fixed[0].profile.name, "profitable_thin");
+        assert_eq!(fixed[0].metrics.trades, 2);
+        assert_eq!(fixed[0].metrics.total_pnl, 105.0);
+        assert!(!fixed[0].metrics.ranking_eligible);
+        assert_eq!(fixed[1].profile.name, "losing_more_trades");
+        assert_eq!(fixed[1].metrics.trades, 7);
+        assert_eq!(fixed[1].metrics.total_pnl, -95.0);
+        assert!(fixed[1].metrics.score > fixed[0].metrics.score);
     }
 
     #[test]
