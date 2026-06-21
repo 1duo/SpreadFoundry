@@ -74,6 +74,7 @@ pub struct ResearchProfile {
     pub min_short_otm_pct: Option<f64>,
     pub min_short_iv: Option<f64>,
     pub max_short_iv: Option<f64>,
+    pub min_long_short_iv_diff: Option<f64>,
     pub low_delta_width_cap_delta_abs: Option<f64>,
     pub low_delta_width_cap: Option<f64>,
     pub prefer_farther_otm: bool,
@@ -111,6 +112,7 @@ impl ResearchProfile {
             min_short_otm_pct: None,
             min_short_iv: None,
             max_short_iv: None,
+            min_long_short_iv_diff: None,
             low_delta_width_cap_delta_abs: None,
             low_delta_width_cap: None,
             prefer_farther_otm: false,
@@ -602,6 +604,10 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
     complexity += option_complexity(&profile.min_short_otm_pct, &baseline.min_short_otm_pct);
     complexity += option_complexity(&profile.min_short_iv, &baseline.min_short_iv);
     complexity += option_complexity(&profile.max_short_iv, &baseline.max_short_iv);
+    complexity += option_complexity(
+        &profile.min_long_short_iv_diff,
+        &baseline.min_long_short_iv_diff,
+    );
     complexity += option_complexity(
         &profile.low_delta_width_cap_delta_abs,
         &baseline.low_delta_width_cap_delta_abs,
@@ -1513,6 +1519,39 @@ fn research_profiles() -> Vec<ResearchProfile> {
         profiles.push(profile);
     }
 
+    for (name, min_iv_diff) in [
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew30bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.003,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew50bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.005,
+        ),
+        (
+            "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew80bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+            0.008,
+        ),
+    ] {
+        let mut profile = baseline.clone();
+        profile.name = name.to_owned();
+        profile.prefer_farther_otm = true;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = Some(60);
+        profile.min_underlying_return = Some(0.12);
+        profile.max_short_iv = Some(0.45);
+        profile.min_long_short_iv_diff = Some(min_iv_diff);
+        profile.max_width = 15.0;
+        profile.low_delta_width_cap_delta_abs = Some(0.23);
+        profile.low_delta_width_cap = Some(10.0);
+        profile.drawdown_lookback_days = Some(20);
+        profile.return_or_drawdown_gate = Some(ReturnOrDrawdownGate {
+            min_underlying_return: Some(0.25),
+            min_underlying_drawdown: Some(0.02),
+        });
+        profiles.push(profile);
+    }
+
     for (name, max_realized_vol) in [
         (
             "select_farther_otm_cooldown10_trend60d_min5_ivcap45_width15_lowdelta23_width10_rv20max45_delta20_30_credit20",
@@ -2067,6 +2106,7 @@ fn generate_candidates(
                     if long.strike >= short.strike
                         || long.open_interest < profile.min_long_oi
                         || !quote_width_allowed(long, profile)
+                        || !iv_skew_allowed(short, long, profile)
                     {
                         continue;
                     }
@@ -2448,6 +2488,16 @@ fn iv_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
         return false;
     }
     true
+}
+
+fn iv_skew_allowed(short: &OptionDay, long: &OptionDay, profile: &ResearchProfile) -> bool {
+    let Some(min_diff) = profile.min_long_short_iv_diff else {
+        return true;
+    };
+    if short.implied_vol <= 0.0 || long.implied_vol <= 0.0 {
+        return false;
+    }
+    long.implied_vol - short.implied_vol >= min_diff
 }
 
 fn width_allowed(width: f64, short_delta_abs: f64, profile: &ResearchProfile) -> bool {
@@ -3750,6 +3800,39 @@ mod tests {
     }
 
     #[test]
+    fn iv_skew_filter_requires_long_iv_above_short_iv() {
+        let mut profile = ResearchProfile::baseline();
+        profile.min_long_short_iv_diff = Some(0.005);
+        let short = option_day(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            95.0,
+            1.0,
+            1.1,
+            -0.25,
+            105.0,
+        );
+        let mut long = option_day(
+            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap(),
+            90.0,
+            0.1,
+            0.2,
+            -0.15,
+            105.0,
+        );
+
+        let mut short = short;
+        short.implied_vol = 0.40;
+        long.implied_vol = 0.406;
+        assert!(iv_skew_allowed(&short, &long, &profile));
+
+        long.implied_vol = 0.404;
+        assert!(!iv_skew_allowed(&short, &long, &profile));
+
+        long.implied_vol = 0.0;
+        assert!(!iv_skew_allowed(&short, &long, &profile));
+    }
+
+    #[test]
     fn low_delta_width_cap_only_rejects_wide_low_delta_spreads() {
         let mut profile = ResearchProfile::baseline();
         profile.max_width = 15.0;
@@ -4299,6 +4382,47 @@ mod tests {
                 profile.return_or_drawdown_gate,
                 Some(ReturnOrDrawdownGate {
                     min_underlying_return: Some(gate_min_return),
+                    min_underlying_drawdown: Some(0.02),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn skew_profiles_keep_current_best_risk_gates() {
+        let profiles = research_profiles();
+        for (name, min_iv_diff) in [
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew30bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.003,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew50bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.005,
+            ),
+            (
+                "select_farther_otm_cooldown10_trend60d_min12_trend25_or_dd20d_min2_skew80bps_ivcap45_width15_lowdelta23_width10_delta20_30_credit20",
+                0.008,
+            ),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert_eq!(profile.trend_lookback_days, Some(60));
+            assert_eq!(profile.min_underlying_return, Some(0.12));
+            assert_eq!(profile.max_short_iv, Some(0.45));
+            assert_eq!(profile.min_long_short_iv_diff, Some(min_iv_diff));
+            assert_eq!(profile.max_width, 15.0);
+            assert!(profile.prefer_farther_otm);
+            assert_eq!(profile.stop_loss_cooldown_days, 10);
+            assert_eq!(profile.low_delta_width_cap_delta_abs, Some(0.23));
+            assert_eq!(profile.low_delta_width_cap, Some(10.0));
+            assert_eq!(profile.drawdown_lookback_days, Some(20));
+            assert_eq!(
+                profile.return_or_drawdown_gate,
+                Some(ReturnOrDrawdownGate {
+                    min_underlying_return: Some(0.25),
                     min_underlying_drawdown: Some(0.02),
                 })
             );
