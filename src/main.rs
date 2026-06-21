@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses five non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
+const UNIVERSE_SEED_SCORE_BASIS: &str = "Static pre-research seed score: 3x option liquidity + 2x premium + 2x spread quality + price-fit + diversification + event-risk discipline. Used only to choose the default candidate symbols; actual suitability ranking is research-evidence driven.";
 const UNIVERSE_DETECTOR_SCORE_BASIS: &str =
     "Best in-sample detector robust score after chronological and annual stability checks.";
 const UNIVERSE_EXECUTION_SCORE_BASIS: &str =
@@ -179,6 +180,7 @@ struct UniverseResearchSummary {
     strategy: String,
     selection_basis: String,
     research_method: String,
+    seed_score_basis: String,
     detector_score_basis: String,
     execution_score_basis: String,
     expansion_seed: Vec<UniverseSeedSymbol>,
@@ -191,6 +193,26 @@ struct UniverseSeedSymbol {
     symbol: String,
     role: String,
     rationale: String,
+    suitability_score: Option<u16>,
+    liquidity_score: Option<u8>,
+    premium_score: Option<u8>,
+    spread_quality_score: Option<u8>,
+    price_fit_score: Option<u8>,
+    diversification_score: Option<u8>,
+    event_risk_score: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UniverseSeedCandidate {
+    symbol: &'static str,
+    role: &'static str,
+    rationale: &'static str,
+    liquidity_score: u8,
+    premium_score: u8,
+    spread_quality_score: u8,
+    price_fit_score: u8,
+    diversification_score: u8,
+    event_risk_score: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,6 +220,7 @@ struct UniverseSymbolSummary {
     suitability_rank: usize,
     symbol: String,
     seed_rank: Option<usize>,
+    seed_suitability_score: Option<u16>,
     seed_role: Option<String>,
     seed_rationale: Option<String>,
     research_status: String,
@@ -645,6 +668,7 @@ async fn research_universe(args: UniverseResearchArgs) -> Result<()> {
         strategy: "put_credit_spread".to_owned(),
         selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
         research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
+        seed_score_basis: UNIVERSE_SEED_SCORE_BASIS.to_owned(),
         detector_score_basis: UNIVERSE_DETECTOR_SCORE_BASIS.to_owned(),
         execution_score_basis: UNIVERSE_EXECUTION_SCORE_BASIS.to_owned(),
         expansion_seed,
@@ -689,6 +713,13 @@ fn expansion_seed_for_symbols(symbols: &[String]) -> Vec<UniverseSeedSymbol> {
                     symbol: symbol.clone(),
                     role: "manual_override".to_owned(),
                     rationale: "Manual universe override; must still pass ThetaData liquidity, detector, execution, and out-of-sample gates before promotion.".to_owned(),
+                    suitability_score: None,
+                    liquidity_score: None,
+                    premium_score: None,
+                    spread_quality_score: None,
+                    price_fit_score: None,
+                    diversification_score: None,
+                    event_risk_score: None,
                 }
             }
         })
@@ -696,39 +727,162 @@ fn expansion_seed_for_symbols(symbols: &[String]) -> Vec<UniverseSeedSymbol> {
 }
 
 fn default_universe_seed() -> Vec<UniverseSeedSymbol> {
-    let metadata = [
-        (
-            "premium_liquidity_leader",
-            "High-liquidity, premium-rich single-stock option chain; tests whether rich credits survive gap and drawdown risk.",
-        ),
-        (
-            "semiconductor_beta_peer",
-            "Liquid semiconductor chain with NVDA-adjacent beta; tests whether the detector is sector-specific or transferable.",
-        ),
-        (
-            "mega_cap_premium_growth",
-            "Deep mega-cap growth chain with active weeklies and historically usable premium; tests a non-semiconductor high-beta large cap.",
-        ),
-        (
-            "commerce_cloud_growth",
-            "Large, liquid growth stock with active weeklies; adds a different earnings and volatility profile than semiconductors and social ads.",
-        ),
-        (
-            "liquidity_quality_anchor",
-            "Deep, tight option chain with lower relative premium; useful as an execution-quality control for conservative fills.",
-        ),
-    ];
-    DEFAULT_PLATEAU_UNIVERSE_SYMBOLS
+    let mut seed = universe_seed_candidates()
         .iter()
-        .zip(metadata.iter())
-        .enumerate()
-        .map(|(idx, (symbol, (role, rationale)))| UniverseSeedSymbol {
-            rank: idx + 1,
-            symbol: (*symbol).to_owned(),
-            role: (*role).to_owned(),
-            rationale: (*rationale).to_owned(),
-        })
-        .collect()
+        .map(universe_seed_from_candidate)
+        .collect::<Vec<_>>();
+    seed.sort_by(universe_seed_order);
+    seed.truncate(DEFAULT_PLATEAU_UNIVERSE_SYMBOLS.len());
+    for (idx, symbol) in seed.iter_mut().enumerate() {
+        symbol.rank = idx + 1;
+    }
+    seed
+}
+
+fn universe_seed_candidates() -> Vec<UniverseSeedCandidate> {
+    vec![
+        UniverseSeedCandidate {
+            symbol: "TSLA",
+            role: "premium_liquidity_leader",
+            rationale: "High-liquidity, premium-rich single-stock option chain; tests whether rich credits survive gap and drawdown risk.",
+            liquidity_score: 5,
+            premium_score: 5,
+            spread_quality_score: 4,
+            price_fit_score: 5,
+            diversification_score: 5,
+            event_risk_score: 2,
+        },
+        UniverseSeedCandidate {
+            symbol: "AMD",
+            role: "semiconductor_beta_peer",
+            rationale: "Liquid semiconductor chain with NVDA-adjacent beta; tests whether the detector is sector-specific or transferable.",
+            liquidity_score: 5,
+            premium_score: 4,
+            spread_quality_score: 4,
+            price_fit_score: 5,
+            diversification_score: 4,
+            event_risk_score: 4,
+        },
+        UniverseSeedCandidate {
+            symbol: "META",
+            role: "mega_cap_premium_growth",
+            rationale: "Deep mega-cap growth chain with active weeklies and historically usable premium; tests a non-semiconductor high-beta large cap.",
+            liquidity_score: 5,
+            premium_score: 4,
+            spread_quality_score: 4,
+            price_fit_score: 4,
+            diversification_score: 5,
+            event_risk_score: 4,
+        },
+        UniverseSeedCandidate {
+            symbol: "AMZN",
+            role: "commerce_cloud_growth",
+            rationale: "Large, liquid growth stock with active weeklies; adds a different earnings and volatility profile than semiconductors and social ads.",
+            liquidity_score: 5,
+            premium_score: 3,
+            spread_quality_score: 4,
+            price_fit_score: 4,
+            diversification_score: 5,
+            event_risk_score: 4,
+        },
+        UniverseSeedCandidate {
+            symbol: "AAPL",
+            role: "liquidity_quality_anchor",
+            rationale: "Deep, tight option chain with lower relative premium; useful as an execution-quality control for conservative fills.",
+            liquidity_score: 5,
+            premium_score: 2,
+            spread_quality_score: 4,
+            price_fit_score: 4,
+            diversification_score: 5,
+            event_risk_score: 5,
+        },
+        UniverseSeedCandidate {
+            symbol: "MSFT",
+            role: "liquidity_quality_candidate",
+            rationale: "Deep option market with high execution quality, but usually less premium than the default growth candidates.",
+            liquidity_score: 5,
+            premium_score: 2,
+            spread_quality_score: 5,
+            price_fit_score: 3,
+            diversification_score: 4,
+            event_risk_score: 5,
+        },
+        UniverseSeedCandidate {
+            symbol: "GOOGL",
+            role: "mega_cap_quality_candidate",
+            rationale: "Liquid mega-cap option chain that can validate whether the spread detector works outside higher-premium beta names.",
+            liquidity_score: 5,
+            premium_score: 2,
+            spread_quality_score: 4,
+            price_fit_score: 4,
+            diversification_score: 4,
+            event_risk_score: 5,
+        },
+        UniverseSeedCandidate {
+            symbol: "AVGO",
+            role: "semiconductor_quality_candidate",
+            rationale: "High-quality semiconductor beta candidate, but higher share price can make fixed-width put-spread selection less ergonomic.",
+            liquidity_score: 4,
+            premium_score: 4,
+            spread_quality_score: 3,
+            price_fit_score: 2,
+            diversification_score: 4,
+            event_risk_score: 3,
+        },
+        UniverseSeedCandidate {
+            symbol: "NFLX",
+            role: "premium_growth_candidate",
+            rationale: "Premium-rich growth chain with useful non-semiconductor exposure, but execution and event gaps need strict OOS proof.",
+            liquidity_score: 4,
+            premium_score: 3,
+            spread_quality_score: 3,
+            price_fit_score: 3,
+            diversification_score: 4,
+            event_risk_score: 3,
+        },
+        UniverseSeedCandidate {
+            symbol: "COIN",
+            role: "high_premium_candidate",
+            rationale: "Very premium-rich chain, but gap risk and spread quality make it a lower-confidence expansion seed for conservative credit spreads.",
+            liquidity_score: 3,
+            premium_score: 5,
+            spread_quality_score: 2,
+            price_fit_score: 5,
+            diversification_score: 4,
+            event_risk_score: 1,
+        },
+    ]
+}
+
+fn universe_seed_from_candidate(candidate: &UniverseSeedCandidate) -> UniverseSeedSymbol {
+    UniverseSeedSymbol {
+        rank: 0,
+        symbol: candidate.symbol.to_owned(),
+        role: candidate.role.to_owned(),
+        rationale: candidate.rationale.to_owned(),
+        suitability_score: Some(universe_seed_suitability_score(candidate)),
+        liquidity_score: Some(candidate.liquidity_score),
+        premium_score: Some(candidate.premium_score),
+        spread_quality_score: Some(candidate.spread_quality_score),
+        price_fit_score: Some(candidate.price_fit_score),
+        diversification_score: Some(candidate.diversification_score),
+        event_risk_score: Some(candidate.event_risk_score),
+    }
+}
+
+fn universe_seed_suitability_score(candidate: &UniverseSeedCandidate) -> u16 {
+    3 * candidate.liquidity_score as u16
+        + 2 * candidate.premium_score as u16
+        + 2 * candidate.spread_quality_score as u16
+        + candidate.price_fit_score as u16
+        + candidate.diversification_score as u16
+        + candidate.event_risk_score as u16
+}
+
+fn universe_seed_order(a: &UniverseSeedSymbol, b: &UniverseSeedSymbol) -> Ordering {
+    b.suitability_score
+        .cmp(&a.suitability_score)
+        .then_with(|| a.symbol.cmp(&b.symbol))
 }
 
 fn research_report_path(path: &Path) -> PathBuf {
@@ -798,6 +952,7 @@ fn universe_symbol_summary(
         suitability_rank: 0,
         symbol: report.symbol.clone(),
         seed_rank: seed.map(|seed| seed.rank),
+        seed_suitability_score: seed.and_then(|seed| seed.suitability_score),
         seed_role: seed.map(|seed| seed.role.clone()),
         seed_rationale: seed.map(|seed| seed.rationale.clone()),
         research_status,
@@ -906,6 +1061,7 @@ fn universe_symbol_error_summary(
         suitability_rank: 0,
         symbol,
         seed_rank: seed.map(|seed| seed.rank),
+        seed_suitability_score: seed.and_then(|seed| seed.suitability_score),
         seed_role: seed.map(|seed| seed.role.clone()),
         seed_rationale: seed.map(|seed| seed.rationale.clone()),
         research_status: "error".to_owned(),
@@ -971,6 +1127,7 @@ fn universe_result_order(a: &UniverseSymbolSummary, b: &UniverseSymbolSummary) -
         .cmp(&universe_research_succeeded(a))
         .then_with(|| universe_deployment_passes(b).cmp(&universe_deployment_passes(a)))
         .then_with(|| b.fixed_profile_oos_passes.cmp(&a.fixed_profile_oos_passes))
+        .then_with(|| b.execution_oos_score.total_cmp(&a.execution_oos_score))
         .then_with(|| b.walk_forward_score.total_cmp(&a.walk_forward_score))
         .then_with(|| b.holdout_score.total_cmp(&a.holdout_score))
         .then_with(|| b.best_fixed_score.total_cmp(&a.best_fixed_score))
@@ -997,6 +1154,18 @@ fn markdown_cell(value: &str) -> String {
     value.replace('|', "\\|")
 }
 
+fn optional_u8(value: Option<u8>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn optional_u16(value: Option<u16>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
 fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1004,13 +1173,14 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
         summary.run_id
     ));
     out.push_str(&format!(
-        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Research method: {}\n\n",
+        "- Window: `{}` to `{}`\n- Symbols: `{}`\n- Plateau run: `{}`\n- Strategy: `{}`\n- Selection basis: {}\n- Seed score basis: {}\n- Research method: {}\n\n",
         summary.from,
         summary.to,
         summary.symbols.join(", "),
         summary.plateau_run.as_deref().unwrap_or("not provided"),
         summary.strategy,
         summary.selection_basis,
+        summary.seed_score_basis,
         summary.research_method
     ));
 
@@ -1024,29 +1194,40 @@ fn universe_markdown(summary: &UniverseResearchSummary) -> String {
     out.push_str("- Promotion rule: seed order never promotes a symbol; fixed-profile OOS passes, walk-forward evidence, holdout evidence, and deployment gates drive the suitability ranking.\n\n");
 
     out.push_str("## Expansion Seed\n\n");
-    out.push_str("| Rank | Symbol | Role | Rationale |\n");
-    out.push_str("|---:|---|---|---|\n");
+    out.push_str("| Rank | Symbol | Score | Liquidity | Premium | Spread Quality | Price Fit | Diversification | Event Risk Discipline | Role | Rationale |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n");
     for seed in &summary.expansion_seed {
         out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            seed.rank, seed.symbol, seed.role, seed.rationale
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            seed.rank,
+            seed.symbol,
+            optional_u16(seed.suitability_score),
+            optional_u8(seed.liquidity_score),
+            optional_u8(seed.premium_score),
+            optional_u8(seed.spread_quality_score),
+            optional_u8(seed.price_fit_score),
+            optional_u8(seed.diversification_score),
+            optional_u8(seed.event_risk_score),
+            seed.role,
+            seed.rationale
         ));
     }
     out.push('\n');
 
     out.push_str("## Symbol Suitability Ranking\n\n");
-    out.push_str("| Rank | Seed Rank | Symbol | Research | Error | Report | Deployment | Plateau | Detector Status | Execution Status | Detector Score | Execution OOS Score | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
+    out.push_str("| Rank | Seed Rank | Seed Score | Symbol | Research | Error | Report | Deployment | Plateau | Detector Status | Execution Status | Detector Score | Execution OOS Score | Fixed OOS Passes | Best Fixed Profile | Best Fixed Detector | Best Fixed Execution | Fixed Trades | Fixed PnL | Fixed Score | Fixed Robust | Best Profile | Detector | Execution | Trades | PnL | Score | Robust Score | WF Trades | WF PnL | WF Score | Holdout Trades | Holdout PnL | Holdout Score | Expirations | Rows | Latest Signal |\n");
     out.push_str(
-        "|---:|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "|---:|---:|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     for result in &summary.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} | {} | {} | {} |\n",
             result.suitability_rank,
             result
                 .seed_rank
                 .map(|rank| rank.to_string())
                 .unwrap_or_else(|| "n/a".to_owned()),
+            optional_u16(result.seed_suitability_score),
             result.symbol,
             result.research_status,
             result
@@ -1149,6 +1330,17 @@ mod tests {
         );
         assert!(!seed.iter().any(|symbol| symbol.symbol == "NVDA"));
         assert!(seed.iter().all(|symbol| !symbol.rationale.is_empty()));
+        assert!(seed.iter().all(|symbol| symbol.suitability_score.is_some()));
+        assert!(
+            seed.windows(2)
+                .all(|pair| pair[0].suitability_score >= pair[1].suitability_score)
+        );
+        assert_eq!(
+            seed[0].suitability_score,
+            Some(universe_seed_suitability_score(
+                &universe_seed_candidates()[0]
+            ))
+        );
     }
 
     #[test]
@@ -1158,9 +1350,11 @@ mod tests {
         assert_eq!(seed[0].rank, 1);
         assert_eq!(seed[0].symbol, "AAPL");
         assert_eq!(seed[0].role, "liquidity_quality_anchor");
+        assert!(seed[0].suitability_score.is_some());
         assert_eq!(seed[1].rank, 2);
         assert_eq!(seed[1].symbol, "GOOGL");
         assert_eq!(seed[1].role, "manual_override");
+        assert_eq!(seed[1].suitability_score, None);
     }
 
     #[test]
@@ -1283,6 +1477,39 @@ mod tests {
     }
 
     #[test]
+    fn universe_results_rank_by_conservative_execution_oos_score() {
+        let mut results = vec![
+            universe_summary_row(TestUniverseRow {
+                symbol: "AAPL",
+                seed_rank: Some(1),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 0,
+                walk_forward_score: 10.0,
+                holdout_score: -5.0,
+                robust_score: 0.4,
+                rows_loaded: 20_000,
+            }),
+            universe_summary_row(TestUniverseRow {
+                symbol: "TSLA",
+                seed_rank: Some(2),
+                deployment_status: "blocked",
+                fixed_profile_oos_passes: 0,
+                walk_forward_score: 1.0,
+                holdout_score: 1.0,
+                robust_score: 0.1,
+                rows_loaded: 10_000,
+            }),
+        ];
+
+        rank_universe_results(&mut results);
+
+        assert_eq!(results[0].symbol, "TSLA");
+        assert_eq!(results[0].execution_oos_score, 1.0);
+        assert_eq!(results[1].symbol, "AAPL");
+        assert_eq!(results[1].execution_oos_score, -5.0);
+    }
+
+    #[test]
     fn universe_report_surfaces_fixed_profile_and_strategy_statuses() {
         let mut results = vec![universe_summary_row(TestUniverseRow {
             symbol: "TSLA",
@@ -1305,6 +1532,7 @@ mod tests {
             selection_basis: UNIVERSE_SELECTION_BASIS.to_owned(),
             research_method: UNIVERSE_RESEARCH_METHOD.to_owned(),
             detector_score_basis: UNIVERSE_DETECTOR_SCORE_BASIS.to_owned(),
+            seed_score_basis: UNIVERSE_SEED_SCORE_BASIS.to_owned(),
             execution_score_basis: UNIVERSE_EXECUTION_SCORE_BASIS.to_owned(),
             expansion_seed: Vec::new(),
             results,
@@ -1314,7 +1542,9 @@ mod tests {
 
         assert!(markdown.contains("Strategy: `put_credit_spread`"));
         assert!(markdown.contains("same Rust put-credit-spread profile grid"));
+        assert!(markdown.contains("Seed score basis"));
         assert!(markdown.contains("## Research Protocol"));
+        assert!(markdown.contains("Seed Score"));
         assert!(markdown.contains("Detector search: each symbol gets its own"));
         assert!(markdown.contains("Execution strategy search: take-profit"));
         assert!(markdown.contains("## Symbol Suitability Ranking"));
@@ -1423,6 +1653,7 @@ mod tests {
             suitability_rank: 0,
             symbol: input.symbol.to_owned(),
             seed_rank: input.seed_rank,
+            seed_suitability_score: Some(1),
             seed_role: Some("test".to_owned()),
             seed_rationale: Some("test".to_owned()),
             research_status: "ok".to_owned(),
