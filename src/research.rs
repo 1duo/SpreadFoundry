@@ -3506,6 +3506,57 @@ fn research_markdown(report: &ResearchReport) -> String {
         out.push('\n');
     }
 
+    if let Some(best) = report.profiles.first() {
+        let baseline_name = ResearchProfile::baseline().name;
+        if let Some(baseline) = report
+            .profiles
+            .iter()
+            .find(|result| result.profile.name == baseline_name)
+        {
+            let best_metrics = &best.metrics;
+            let baseline_metrics = &baseline.metrics;
+            out.push_str("## Baseline Comparison\n\n");
+            out.push_str("| Profile | Trades | Trades/Yr | PnL | Avg ROR | Win Rate | Profit Factor | Max DD | Score | Robust Score |\n");
+            out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+            out.push_str(&format!(
+                "| Baseline | {} | {:.1} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} | {:.4} |\n",
+                baseline_metrics.trades,
+                baseline_metrics.trades_per_year,
+                baseline_metrics.total_pnl,
+                baseline_metrics.avg_return_on_risk,
+                baseline_metrics.win_rate * 100.0,
+                baseline_metrics.profit_factor,
+                baseline_metrics.max_drawdown,
+                baseline_metrics.score,
+                baseline_metrics.robust_score
+            ));
+            out.push_str(&format!(
+                "| Best | {} | {:.1} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} | {:.4} |\n",
+                best_metrics.trades,
+                best_metrics.trades_per_year,
+                best_metrics.total_pnl,
+                best_metrics.avg_return_on_risk,
+                best_metrics.win_rate * 100.0,
+                best_metrics.profit_factor,
+                best_metrics.max_drawdown,
+                best_metrics.score,
+                best_metrics.robust_score
+            ));
+            out.push_str(&format!(
+                "| Delta | {} | {:.1} | {:.2} | {:.3} | {:.1}% | {:.2} | {:.3} | {:.4} | {:.4} |\n\n",
+                best_metrics.trades as i64 - baseline_metrics.trades as i64,
+                best_metrics.trades_per_year - baseline_metrics.trades_per_year,
+                best_metrics.total_pnl - baseline_metrics.total_pnl,
+                best_metrics.avg_return_on_risk - baseline_metrics.avg_return_on_risk,
+                (best_metrics.win_rate - baseline_metrics.win_rate) * 100.0,
+                best_metrics.profit_factor - baseline_metrics.profit_factor,
+                best_metrics.max_drawdown - baseline_metrics.max_drawdown,
+                best_metrics.score - baseline_metrics.score,
+                best_metrics.robust_score - baseline_metrics.robust_score
+            ));
+        }
+    }
+
     let plateau = &report.plateau_status;
     out.push_str("## Research Plateau Status\n\n");
     out.push_str(&format!(
