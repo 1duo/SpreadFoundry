@@ -19,6 +19,7 @@ const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
 const PLATEAU_MIN_PROFILE_VARIANTS: usize = 75;
 const PLATEAU_MIN_WALK_FORWARD_YEARS: usize = 3;
+const RECENT_TRAIN_ACTIVITY_DAYS: i64 = 365;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
@@ -270,6 +271,11 @@ pub struct WalkForwardTrainMetrics {
     pub robust_score: f64,
     pub ranking_eligible: bool,
     pub robust_ranking_eligible: bool,
+    pub recent_activity_window_days: i64,
+    pub recent_trades: usize,
+    pub recent_activity_gate: bool,
+    pub last_entry_date: Option<NaiveDate>,
+    pub days_since_last_entry: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -964,7 +970,11 @@ fn walk_forward_with_mode(
                     rank: idx + 1,
                     profile: candidate.result.profile.name.clone(),
                     active: candidate_active,
-                    train_metrics: train_metrics_summary(&candidate.metrics),
+                    train_metrics: train_metrics_summary(
+                        &candidate.metrics,
+                        &candidate.train_trades,
+                        train_to,
+                    ),
                     test_metrics: period_metrics(
                         "out_of_sample_candidate",
                         &test_trades,
@@ -987,7 +997,11 @@ fn walk_forward_with_mode(
             test_to,
             active,
             selected_profile: selection.result.profile.name.clone(),
-            train_metrics: train_metrics_summary(&selection.metrics),
+            train_metrics: train_metrics_summary(
+                &selection.metrics,
+                &selection.train_trades,
+                train_to,
+            ),
             test_metrics: period_metrics("out_of_sample", &accepted, test_from, test_to),
             selection_candidates,
         });
@@ -1021,7 +1035,7 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
             test_to: to,
             active: false,
             selected_profile: String::new(),
-            train_metrics: train_metrics_summary(&metrics(&[], from, train_to)),
+            train_metrics: train_metrics_summary(&metrics(&[], from, train_to), &[], train_to),
             trades: Vec::new(),
             metrics: metrics(&[], test_from, to),
         };
@@ -1041,7 +1055,7 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
         test_to: to,
         active,
         selected_profile: selection.result.profile.name.clone(),
-        train_metrics: train_metrics_summary(&selection.metrics),
+        train_metrics: train_metrics_summary(&selection.metrics, &selection.train_trades, train_to),
         metrics: metrics(&trades, test_from, to),
         trades,
     }
@@ -1049,6 +1063,7 @@ fn holdout(profile_results: &[ProfileResult], from: NaiveDate, to: NaiveDate) ->
 
 struct WalkForwardSelection<'a> {
     result: &'a ProfileResult,
+    train_trades: Vec<ResearchTrade>,
     metrics: ResearchMetrics,
 }
 
@@ -1072,9 +1087,11 @@ fn rank_walk_forward_profiles<'a>(
         .map(|result| {
             let train_trades =
                 filter_closed_trades_by_entry_date(&result.trades, train_from, train_to);
+            let metrics = metrics(&train_trades, train_from, train_to);
             WalkForwardSelection {
                 result,
-                metrics: metrics(&train_trades, train_from, train_to),
+                train_trades,
+                metrics,
             }
         })
         .collect::<Vec<_>>();
@@ -1321,7 +1338,18 @@ fn signal_from_candidate(
     }
 }
 
-fn train_metrics_summary(metrics: &ResearchMetrics) -> WalkForwardTrainMetrics {
+fn train_metrics_summary(
+    metrics: &ResearchMetrics,
+    train_trades: &[ResearchTrade],
+    train_to: NaiveDate,
+) -> WalkForwardTrainMetrics {
+    let recent_from = train_to - Duration::days(RECENT_TRAIN_ACTIVITY_DAYS - 1);
+    let recent_trades = train_trades
+        .iter()
+        .filter(|trade| trade.entry_date >= recent_from && trade.entry_date <= train_to)
+        .count();
+    let last_entry_date = train_trades.iter().map(|trade| trade.entry_date).max();
+    let days_since_last_entry = last_entry_date.map(|date| (train_to - date).num_days());
     WalkForwardTrainMetrics {
         trades: metrics.trades,
         total_pnl: metrics.total_pnl,
@@ -1329,6 +1357,11 @@ fn train_metrics_summary(metrics: &ResearchMetrics) -> WalkForwardTrainMetrics {
         robust_score: metrics.robust_score,
         ranking_eligible: metrics.ranking_eligible,
         robust_ranking_eligible: metrics.robust_ranking_eligible,
+        recent_activity_window_days: RECENT_TRAIN_ACTIVITY_DAYS,
+        recent_trades,
+        recent_activity_gate: recent_trades > 0,
+        last_entry_date,
+        days_since_last_entry,
     }
 }
 
@@ -3623,11 +3656,13 @@ fn research_markdown(report: &ResearchReport) -> String {
         wf.metrics.score,
         format_profile_counts(&wf.selected_profile_counts)
     ));
-    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
-    out.push_str("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str(
+        "|---:|---|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    );
     for year in &wf.years {
         out.push_str(&format!(
-            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
             year.test_year,
             year.train_from,
             year.train_to,
@@ -3641,6 +3676,9 @@ fn research_markdown(report: &ResearchReport) -> String {
                 "no"
             },
             year.train_metrics.trades,
+            year.train_metrics.recent_trades,
+            format_optional_date(year.train_metrics.last_entry_date),
+            format_optional_i64(year.train_metrics.days_since_last_entry),
             year.train_metrics.total_pnl,
             year.train_metrics.robust_score,
             year.test_metrics.trades,
@@ -3668,11 +3706,13 @@ fn research_markdown(report: &ResearchReport) -> String {
         rolling.metrics.score,
         format_profile_counts(&rolling.selected_profile_counts)
     ));
-    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
-    out.push_str("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Test Year | Train Window | Test Window | Active | Selected Profile | Train Robust Eligible | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Win Rate | OOS Profit Factor | OOS Score |\n");
+    out.push_str(
+        "|---:|---|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    );
     for year in &rolling.years {
         out.push_str(&format!(
-            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
+            "| {} | {} to {} | {} to {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.1}% | {:.2} | {:.4} |\n",
             year.test_year,
             year.train_from,
             year.train_to,
@@ -3686,6 +3726,9 @@ fn research_markdown(report: &ResearchReport) -> String {
                 "no"
             },
             year.train_metrics.trades,
+            year.train_metrics.recent_trades,
+            format_optional_date(year.train_metrics.last_entry_date),
+            format_optional_i64(year.train_metrics.days_since_last_entry),
             year.train_metrics.total_pnl,
             year.train_metrics.robust_score,
             year.test_metrics.trades,
@@ -3698,17 +3741,20 @@ fn research_markdown(report: &ResearchReport) -> String {
     out.push('\n');
 
     out.push_str("## Walk-Forward Selection Diagnostics\n\n");
-    out.push_str("| Test Year | Rank | Active | Profile | Train Trades | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
-    out.push_str("|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Test Year | Rank | Active | Profile | Train Trades | Recent 365D Trades | Last Train Entry | Days Since Last Entry | Train PnL | Train Robust Score | OOS Trades | OOS PnL | OOS Score |\n");
+    out.push_str("|---:|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|\n");
     for year in &wf.years {
         for candidate in &year.selection_candidates {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {} | {:.2} | {:.4} |\n",
                 year.test_year,
                 candidate.rank,
                 if candidate.active { "yes" } else { "no" },
                 candidate.profile,
                 candidate.train_metrics.trades,
+                candidate.train_metrics.recent_trades,
+                format_optional_date(candidate.train_metrics.last_entry_date),
+                format_optional_i64(candidate.train_metrics.days_since_last_entry),
                 candidate.train_metrics.total_pnl,
                 candidate.train_metrics.robust_score,
                 candidate.test_metrics.trades,
@@ -3722,7 +3768,7 @@ fn research_markdown(report: &ResearchReport) -> String {
     let holdout = &report.holdout;
     out.push_str("## Half-Window Holdout Selector\n\n");
     out.push_str(&format!(
-        "- Train window: `{}` to `{}`\n- Test window: `{}` to `{}`\n- Active: `{}`\n- Selected profile: `{}`\n- Train robust eligible: `{}`\n- Train trades: `{}`\n- Train PnL: `{:.2}`\n- Train robust score: `{:.4}`\n- Test trades: `{}`\n- Test PnL: `{:.2}`\n- Test win rate: `{:.1}%`\n- Test profit factor: `{:.2}`\n- Test max DD: `{:.3}`\n- Test score: `{:.4}`\n\n",
+        "- Train window: `{}` to `{}`\n- Test window: `{}` to `{}`\n- Active: `{}`\n- Selected profile: `{}`\n- Train robust eligible: `{}`\n- Train trades: `{}`\n- Recent 365D train trades: `{}`\n- Last train entry: `{}`\n- Days since last train entry: `{}`\n- Train PnL: `{:.2}`\n- Train robust score: `{:.4}`\n- Test trades: `{}`\n- Test PnL: `{:.2}`\n- Test win rate: `{:.1}%`\n- Test profit factor: `{:.2}`\n- Test max DD: `{:.3}`\n- Test score: `{:.4}`\n\n",
         holdout.train_from,
         holdout.train_to,
         holdout.test_from,
@@ -3735,6 +3781,9 @@ fn research_markdown(report: &ResearchReport) -> String {
             "no"
         },
         holdout.train_metrics.trades,
+        holdout.train_metrics.recent_trades,
+        format_optional_date(holdout.train_metrics.last_entry_date),
+        format_optional_i64(holdout.train_metrics.days_since_last_entry),
         holdout.train_metrics.total_pnl,
         holdout.train_metrics.robust_score,
         holdout.metrics.trades,
@@ -3890,6 +3939,18 @@ fn research_markdown(report: &ResearchReport) -> String {
 fn format_optional_pct(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_optional_date(value: Option<NaiveDate>) -> String {
+    value
+        .map(|date| date.to_string())
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
@@ -4417,7 +4478,7 @@ mod tests {
                 test_to: to,
                 active: true,
                 selected_profile: "best".to_owned(),
-                train_metrics: train_metrics_summary(&best.metrics),
+                train_metrics: train_metrics_summary(&best.metrics, &best.trades, from),
                 trades: Vec::new(),
                 metrics: passing_oos,
             },
@@ -5331,6 +5392,16 @@ mod tests {
         assert_eq!(result.years[1].test_year, 2024);
         assert!(result.years[1].active);
         assert_eq!(result.years[1].selected_profile, "better");
+        assert_eq!(result.years[1].train_metrics.recent_trades, 0);
+        assert!(!result.years[1].train_metrics.recent_activity_gate);
+        assert_eq!(
+            result.years[1].train_metrics.last_entry_date,
+            Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap())
+        );
+        assert_eq!(
+            result.years[1].train_metrics.days_since_last_entry,
+            Some(456)
+        );
         assert_eq!(result.trades.len(), 2);
         assert_eq!(
             result.trades[0].entry_date,
