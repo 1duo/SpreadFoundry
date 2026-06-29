@@ -96,7 +96,7 @@ run_research_with_timeout() {
   ) &
   watchdog_pid="$!"
 
-  wait "$child_pid"
+  wait "$child_pid" 2>/dev/null
   exit_code="$?"
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
