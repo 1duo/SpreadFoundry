@@ -2,26 +2,26 @@ import AppKit
 import SwiftUI
 
 enum MenubarIcon {
-    static func statusImage(status: String, isHealthy: Bool) -> NSImage {
+    static func statusImage(status: String) -> NSImage {
         let image = draw(
             size: CGSize(width: 28, height: 28),
             status: status,
             template: true,
-            statusDotHealthy: isHealthy
+            forceWhiteGlyph: true
         )
         image.isTemplate = false
         return image
     }
 
     static func brandImage(status: String) -> NSImage {
-        draw(size: CGSize(width: 44, height: 44), status: status, template: false, statusDotHealthy: nil)
+        draw(size: CGSize(width: 44, height: 44), status: status, template: false, forceWhiteGlyph: false)
     }
 
     private static func draw(
         size: CGSize,
         status: String,
         template: Bool,
-        statusDotHealthy: Bool?
+        forceWhiteGlyph: Bool
     ) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
@@ -30,9 +30,7 @@ enum MenubarIcon {
         let rect = CGRect(origin: .zero, size: size)
         let scale = min(size.width, size.height) / 44.0
         let yOffset = template ? -2.0 * scale : 0.0
-        let ink = statusDotHealthy == nil
-            ? (template ? NSColor.black : statusColor(status))
-            : NSColor.white
+        let ink = forceWhiteGlyph ? NSColor.white : (template ? NSColor.black : statusColor(status))
         let background = template ? NSColor.clear : NSColor(red: 0.04, green: 0.07, blue: 0.06, alpha: 1.0)
 
         let badge = NSBezierPath(roundedRect: rect.insetBy(dx: 2 * scale, dy: 2 * scale), xRadius: 11 * scale, yRadius: 11 * scale)
@@ -70,22 +68,6 @@ enum MenubarIcon {
         let upperBar = CGRect(x: 19 * scale, y: 21.5 * scale + yOffset, width: 13 * scale, height: 3.8 * scale)
         NSBezierPath(roundedRect: lowerBar, xRadius: 1.9 * scale, yRadius: 1.9 * scale).fill()
         NSBezierPath(roundedRect: upperBar, xRadius: 1.9 * scale, yRadius: 1.9 * scale).fill()
-
-        if let statusDotHealthy {
-            let dotRadius = min(size.width, size.height) * (22.0 / 128.0)
-            let dotCenter = CGPoint(
-                x: size.width - size.width * (27.0 / 128.0),
-                y: size.height * (20.0 / 128.0)
-            )
-            let dotRect = CGRect(
-                x: dotCenter.x - dotRadius,
-                y: dotCenter.y - dotRadius,
-                width: dotRadius * 2,
-                height: dotRadius * 2
-            )
-            (statusDotHealthy ? NSColor.systemGreen : NSColor.systemRed).setFill()
-            NSBezierPath(ovalIn: dotRect).fill()
-        }
 
         return image
     }

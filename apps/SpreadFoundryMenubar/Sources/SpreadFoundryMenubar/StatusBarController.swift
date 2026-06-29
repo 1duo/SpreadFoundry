@@ -21,11 +21,7 @@ final class StatusBarController {
     }
 
     private func configureButton(for snapshot: CanarySnapshot) {
-        let isHealthy = snapshot.workerRunning
-            && snapshot.healthReadable
-            && !snapshot.healthStale
-            && snapshot.status != "unhealthy"
-        statusItem.button?.image = MenubarIcon.statusImage(status: snapshot.status, isHealthy: isHealthy)
+        statusItem.button?.image = MenubarIcon.statusImage(status: snapshot.status)
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.title = ""
         statusItem.button?.toolTip = snapshot.trayTooltip
