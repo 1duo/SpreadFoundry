@@ -21,3 +21,4 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "fs", "time"] }
 toml = "0.8"
+wait-timeout = "0.2"

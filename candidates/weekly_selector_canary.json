@@ -1,0 +1,263 @@
+{
+  "ablation_summary": [
+    {
+      "cost_25_pnl": 47685.99999999999,
+      "gate_reason": "aggregate cadence, robustness, friction, and drawdown gates passed",
+      "gate_status": "research_pass",
+      "label": "remove_symbol:CRWV",
+      "total_pnl": 78461.0,
+      "trades": 1231
+    },
+    {
+      "cost_25_pnl": 47870.99999999999,
+      "gate_reason": "aggregate cadence, robustness, friction, and drawdown gates passed",
+      "gate_status": "research_pass",
+      "label": "remove_symbol:IREN",
+      "total_pnl": 77696.0,
+      "trades": 1193
+    },
+    {
+      "cost_25_pnl": 51675.99999999999,
+      "gate_reason": "aggregate cadence failed: 1024 trades versus required 1091",
+      "gate_status": "blocked",
+      "label": "remove_symbol:ORCL",
+      "total_pnl": 77276.0,
+      "trades": 1024
+    },
+    {
+      "cost_25_pnl": 43672.99999999999,
+      "gate_reason": "aggregate cadence failed: 943 trades versus required 1091",
+      "gate_status": "blocked",
+      "label": "remove_symbol:PLTR",
+      "total_pnl": 67248.0,
+      "trades": 943
+    },
+    {
+      "cost_25_pnl": 7830.000000000004,
+      "gate_reason": "aggregate cadence failed: 769 trades versus required 1091",
+      "gate_status": "blocked",
+      "label": "remove_symbol:TSLA",
+      "total_pnl": 27055.0,
+      "trades": 769
+    },
+    {
+      "cost_25_pnl": 8405.999999999998,
+      "gate_reason": "aggregate cadence failed: 852 trades versus required 1091",
+      "gate_status": "blocked",
+      "label": "remove_strategy:put_debit_spread",
+      "total_pnl": 29706.0,
+      "trades": 852
+    },
+    {
+      "cost_25_pnl": 33336.0,
+      "gate_reason": "aggregate cadence failed: 885 trades versus required 1091",
+      "gate_status": "blocked",
+      "label": "remove_strategy:call_debit_spread",
+      "total_pnl": 55460.99999999999,
+      "trades": 885
+    },
+    {
+      "cost_25_pnl": 27391.0,
+      "gate_reason": "aggregate cadence, robustness, friction, and drawdown gates passed",
+      "gate_status": "research_pass",
+      "label": "remove_strategy:wheel",
+      "total_pnl": 63641.0,
+      "trades": 1450
+    }
+  ],
+  "candidate_id": "weekly_selector_canary_20260628",
+  "concentration": {
+    "max_symbol": "TSLA",
+    "max_symbol_pnl_share": 0.6541108333975623,
+    "strategy_ablation_passes": 1,
+    "symbol_ablation_passes": 2
+  },
+  "data_note": "Symbols with zero rows in symbols_loaded did not contribute to this cache-backed candidate.",
+  "decision": {
+    "action_policy": "wait_for_fresh_entry_or_open_candidate",
+    "canary_ready": true,
+    "canary_status": "canary_only",
+    "current_action_state": "fresh_entry_or_open_candidate_present_as_of_2026-06-26",
+    "full_promotion_ready": false,
+    "reason": "research gate passed, but concentration remains: max symbol PnL share 65.4%, symbol ablation passes 2, strategy ablation passes 1",
+    "recommended_capital_fraction": 0.05,
+    "research_gate": "research_pass"
+  },
+  "decision_metrics": {
+    "assignment_rate": 0.1879432624113475,
+    "cost_25_pnl_per_max_capital_used": 0.9281312887072368,
+    "cost_25_pnl_to_drawdown_capital": 142.7307888888889,
+    "marked_stock_loss_to_pnl": 0.20981931491615377,
+    "pnl_per_avg_capital_used_on_entry": 5.937873022523734,
+    "pnl_per_max_capital_used": 1.4167979657738328,
+    "pnl_to_drawdown_capital": 217.87940328220012,
+    "professional_risk_flag": "inventory_risk_contained"
+  },
+  "effective_symbols": [
+    "IREN",
+    "PLTR",
+    "ORCL",
+    "TSLA",
+    "CRWV"
+  ],
+  "frozen_on": "2026-06-28",
+  "latest_action_summary": [
+    {
+      "count": 1,
+      "status": "entry_candidate"
+    },
+    {
+      "count": 2,
+      "status": "recent_closed"
+    }
+  ],
+  "latest_actions": [
+    {
+      "days_held": 0,
+      "dte_entry": 14,
+      "entry_credit": 1.12,
+      "entry_date": "2026-06-26",
+      "exit_date": "2026-06-26",
+      "exit_reason": "put_expired",
+      "expiration": "2026-07-10",
+      "max_loss": 7888.0,
+      "pnl": 112.0,
+      "short_delta": -0.1271,
+      "status": "entry_candidate",
+      "strategy": "wheel",
+      "symbol": "CRWV",
+      "underlying_price": 96.58
+    },
+    {
+      "days_held": 1,
+      "dte_entry": 7,
+      "entry_credit": -1.0,
+      "entry_date": "2026-06-25",
+      "exit_date": "2026-06-26",
+      "exit_reason": "stop_loss",
+      "expiration": "2026-07-02",
+      "max_loss": 100.0,
+      "pnl": -50.0,
+      "short_delta": -0.3177,
+      "status": "recent_closed",
+      "strategy": "put_debit_spread",
+      "symbol": "TSLA",
+      "underlying_price": 375.12
+    },
+    {
+      "days_held": 1,
+      "dte_entry": 2,
+      "entry_credit": -3.35,
+      "entry_date": "2026-06-22",
+      "exit_date": "2026-06-23",
+      "exit_reason": "take_profit",
+      "expiration": "2026-06-24",
+      "max_loss": 335.0,
+      "pnl": 1337.0,
+      "short_delta": -0.0363,
+      "status": "recent_closed",
+      "strategy": "put_debit_spread",
+      "symbol": "TSLA",
+      "underlying_price": 405.05
+    }
+  ],
+  "metrics": {
+    "cost_10_pnl": 78291.0,
+    "cost_25_pnl": 59496.0,
+    "max_drawdown": 0.004168406863239271,
+    "profit_factor": 1.868020644174711,
+    "required_trades": 1091,
+    "total_pnl": 90821.0,
+    "trades": 1253,
+    "trades_per_year": 119.5242230347349
+  },
+  "portfolio_constraints": {
+    "capital_budget": 100000.0,
+    "max_open_positions": 8,
+    "max_positions_per_symbol": 2,
+    "max_symbol_allocation_pct": 0.2,
+    "max_total_trades_per_symbol": null
+  },
+  "pre_canary_requirements": [
+    "Regenerate the selector report on fresh option-chain data.",
+    "Require latest_actions to contain an entry_candidate or open_candidate before considering action.",
+    "Keep canary capital at or below the recommended capital fraction.",
+    "Do not upgrade to full promotion while concentration and strategy-sleeve ablation diagnostics remain weak."
+  ],
+  "profile": "selector_economic_wheel_plus_crash_put_and_call_debits",
+  "regeneration_command": "cargo run --quiet -- research-portfolio-selector --symbols IREN,PLTR,ORCL,TSLA,CRWV,AMD --from 2016-01-01 --to 2026-06-26 --cache-only --fetch-concurrency 8 --symbol-concurrency 6 --capital-budget 100000 --max-symbol-allocation-pct 0.2 --max-open-positions 8 --max-positions-per-symbol 2",
+  "requested_symbols": [
+    "IREN",
+    "PLTR",
+    "ORCL",
+    "TSLA",
+    "CRWV",
+    "AMD"
+  ],
+  "research_window": {
+    "from": "2016-01-01",
+    "to": "2026-06-26"
+  },
+  "risk_summary": {
+    "assigned_cycles": 53,
+    "assignment_rate": 0.1879432624113475,
+    "avg_assigned_days_held": 50.16981132075472,
+    "avg_wheel_days_held": 16.343971631205672,
+    "call_credit_pnl": -0.0,
+    "call_debit_pnl": 26026.0,
+    "called_away_cycles": 31,
+    "marked_stock_cycles": 22,
+    "marked_stock_loss_cycles": 20,
+    "marked_stock_pnl": -19056.0,
+    "put_credit_pnl": -0.0,
+    "put_debit_pnl": 43782.0,
+    "total_pnl": 90821.0,
+    "wheel_pnl": 21012.999999999993,
+    "wheel_trades": 282,
+    "worst_marked_stock_loss": -3915.999999999999,
+    "worst_trade_loss": -3915.999999999999
+  },
+  "source_markdown_report": "runs/portfolio-weekly-selector-research-20260628T103134.311416000Z/report.md",
+  "source_report": "runs/portfolio-weekly-selector-research-20260628T103134.311416000Z/portfolio_research.json",
+  "source_run_id": "portfolio-weekly-selector-research-20260628T103134.311416000Z",
+  "status": "canary_only",
+  "strategy": "portfolio_weekly_selector",
+  "strategy_summaries": [
+    {
+      "assigned_cycles": 0,
+      "avg_days_held": 2.126530612244898,
+      "avg_pnl": 89.35102040816327,
+      "marked_stock_cycles": 0,
+      "pnl": 43782.0,
+      "profit_factor": 1.9006788726599464,
+      "strategy": "put_debit_spread",
+      "trades": 490,
+      "win_rate": 0.3877551020408163,
+      "worst_trade_pnl": -774.9999999999999
+    },
+    {
+      "assigned_cycles": 0,
+      "avg_days_held": 2.2058212058212057,
+      "avg_pnl": 54.108108108108105,
+      "marked_stock_cycles": 0,
+      "pnl": 26026.0,
+      "profit_factor": 1.70466237071533,
+      "strategy": "call_debit_spread",
+      "trades": 481,
+      "win_rate": 0.42203742203742206,
+      "worst_trade_pnl": -586.0
+    },
+    {
+      "assigned_cycles": 53,
+      "avg_days_held": 16.343971631205672,
+      "avg_pnl": 74.51418439716309,
+      "marked_stock_cycles": 22,
+      "pnl": 21012.999999999993,
+      "profit_factor": 2.1009640574242896,
+      "strategy": "wheel",
+      "trades": 282,
+      "win_rate": 0.9290780141843972,
+      "worst_trade_pnl": -3915.999999999999
+    }
+  ]
+}
