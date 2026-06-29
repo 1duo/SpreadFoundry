@@ -67,6 +67,8 @@ pub enum ExecutionError {
     MismatchedLegSymbol,
     #[error("cash-secured put intent must be one sell-to-open put")]
     UnsupportedCashSecuredPut,
+    #[error("credit spread intent must be two legs with the same symbol, expiration, and right")]
+    UnsupportedCreditSpread,
     #[error("debit spread intent must be two legs with the same symbol, expiration, and right")]
     UnsupportedDebitSpread,
 }
@@ -78,11 +80,19 @@ pub fn conservative_credit_spread_entry_credit(
     short_quote.bid - long_quote.ask
 }
 
+pub fn conservative_credit_spread_entry_credit_f64(short_bid: f64, long_ask: f64) -> f64 {
+    short_bid - long_ask
+}
+
 pub fn conservative_debit_spread_entry_debit(
     long_quote: &OptionQuote,
     short_quote: &OptionQuote,
 ) -> Decimal {
     (long_quote.ask - short_quote.bid).max(Decimal::ZERO)
+}
+
+pub fn conservative_debit_spread_entry_debit_f64(long_ask: f64, short_bid: f64) -> f64 {
+    (long_ask - short_bid).max(0.0)
 }
 
 pub fn conservative_short_spread_exit_debit(
@@ -92,6 +102,18 @@ pub fn conservative_short_spread_exit_debit(
 ) -> Decimal {
     let debit = short_exit.ask - long_exit.bid;
     debit.max(Decimal::ZERO).min(width)
+}
+
+pub fn conservative_short_spread_exit_debit_f64(short_ask: f64, long_bid: f64, width: f64) -> f64 {
+    (short_ask - long_bid).clamp(0.0, width)
+}
+
+pub fn conservative_long_spread_exit_credit_f64(long_bid: f64, short_ask: f64, width: f64) -> f64 {
+    (long_bid - short_ask).clamp(0.0, width)
+}
+
+pub fn cash_secured_put_max_loss_per_share(strike: f64, credit: f64) -> f64 {
+    strike - credit
 }
 
 pub fn short_put_spread_expiration_debit(
@@ -127,6 +149,38 @@ pub fn cash_secured_put_open_intent(
         }],
     };
     validate_cash_secured_put_intent(&intent)?;
+    Ok(intent)
+}
+
+pub fn credit_spread_open_intent(
+    short_key: OptionKey,
+    long_key: OptionKey,
+    quantity: u32,
+    limit_credit: Decimal,
+    strategy: impl Into<String>,
+) -> Result<OptionOrderIntent, ExecutionError> {
+    let intent = OptionOrderIntent {
+        symbol: short_key.underlying.clone(),
+        strategy: strategy.into(),
+        order_effect: OptionOrderEffect::Credit,
+        limit_price: limit_credit,
+        time_in_force: TimeInForce::Day,
+        legs: vec![
+            OptionOrderLeg {
+                side: OptionOrderSide::Sell,
+                position_effect: PositionEffect::Open,
+                key: short_key,
+                quantity,
+            },
+            OptionOrderLeg {
+                side: OptionOrderSide::Buy,
+                position_effect: PositionEffect::Open,
+                key: long_key,
+                quantity,
+            },
+        ],
+    };
+    validate_credit_spread_intent(&intent)?;
     Ok(intent)
 }
 
@@ -204,6 +258,24 @@ fn validate_cash_secured_put_intent(intent: &OptionOrderIntent) -> Result<(), Ex
     Ok(())
 }
 
+fn validate_credit_spread_intent(intent: &OptionOrderIntent) -> Result<(), ExecutionError> {
+    validate_common_intent(intent)?;
+    let [short_leg, long_leg] = intent.legs.as_slice() else {
+        return Err(ExecutionError::UnsupportedCreditSpread);
+    };
+    if intent.order_effect != OptionOrderEffect::Credit
+        || short_leg.side != OptionOrderSide::Sell
+        || long_leg.side != OptionOrderSide::Buy
+        || short_leg.position_effect != PositionEffect::Open
+        || long_leg.position_effect != PositionEffect::Open
+        || short_leg.key.expiration != long_leg.key.expiration
+        || short_leg.key.right != long_leg.key.right
+    {
+        return Err(ExecutionError::UnsupportedCreditSpread);
+    }
+    Ok(())
+}
+
 fn validate_debit_spread_intent(intent: &OptionOrderIntent) -> Result<(), ExecutionError> {
     validate_common_intent(intent)?;
     let [long_leg, short_leg] = intent.legs.as_slice() else {
@@ -263,6 +335,10 @@ mod tests {
             conservative_short_spread_exit_debit(&short, &long, dec!(5.00)),
             dec!(2.30)
         );
+        assert!((conservative_credit_spread_entry_credit_f64(2.50, 0.50) - 2.00).abs() < 1e-9);
+        assert!((conservative_debit_spread_entry_debit_f64(5.30, 0.70) - 4.60).abs() < 1e-9);
+        assert!((conservative_short_spread_exit_debit_f64(2.70, 0.40, 5.00) - 2.30).abs() < 1e-9);
+        assert!((conservative_long_spread_exit_credit_f64(5.60, 2.10, 5.00) - 3.50).abs() < 1e-9);
     }
 
     #[test]

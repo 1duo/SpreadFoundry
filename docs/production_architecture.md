@@ -60,17 +60,20 @@ Success criteria:
 
 ### Phase 2: Simulator-First Research Refactor
 
-- Move weekly research fill construction onto `execution` primitives.
-- Make every strategy report its fill model, max loss, buying-power reserve, and
-  broker feasibility through shared types.
-- Add replay-vs-live parity tests for at least one debit spread and one
-  cash-secured put signal.
+Status: first slice implemented.
+
+- Weekly research candidate entry prices and exit fills now call `execution`
+  primitives for credit spreads, debit spreads, and cash-secured puts.
+- Replay/live parity tests now cover one put debit spread and one cash-secured
+  put candidate by mapping the research candidate to an `OptionOrderIntent`.
+- Remaining work: make every strategy report its fill model, max loss,
+  buying-power reserve, and broker feasibility through shared exported types.
 
 Success criteria:
 
 - No duplicate spread PnL math in research paths touched by canary candidates.
-- Research and live canary order previews agree on legs, price effect, limit
-  price, and max loss for the same signal.
+- Research and live canary order previews agree on legs, price effect, and
+  limit price for the tested debit and cash-secured put signals.
 
 ### Phase 3: Service Runtime
 

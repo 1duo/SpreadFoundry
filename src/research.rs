@@ -12,6 +12,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
+#[cfg(test)]
+use crate::execution::{
+    OptionOrderEffect, OptionOrderIntent, OptionOrderSide, cash_secured_put_open_intent,
+    credit_spread_open_intent, debit_spread_open_intent,
+};
+use crate::execution::{
+    cash_secured_put_max_loss_per_share, conservative_credit_spread_entry_credit_f64,
+    conservative_debit_spread_entry_debit_f64, conservative_long_spread_exit_credit_f64,
+    conservative_short_spread_exit_debit_f64,
+};
+#[cfg(test)]
+use crate::types::{OptionKey as ExecutionOptionKey, OptionRight as ExecutionOptionRight};
+#[cfg(test)]
+use rust_decimal::Decimal;
+
 const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
@@ -9159,7 +9174,7 @@ fn generate_put_credit_candidates_for_day(
             if !width_allowed(width, short_delta, profile) {
                 continue;
             }
-            let credit = short.bid - long.ask;
+            let credit = conservative_credit_spread_entry_credit_f64(short.bid, long.ask);
             if credit <= 0.0 {
                 continue;
             }
@@ -9228,7 +9243,7 @@ fn generate_call_credit_candidates_for_day(
             if !width_allowed(width, short_delta, profile) {
                 continue;
             }
-            let credit = short.bid - long.ask;
+            let credit = conservative_credit_spread_entry_credit_f64(short.bid, long.ask);
             if credit <= 0.0 {
                 continue;
             }
@@ -9288,7 +9303,7 @@ fn generate_wheel_put_candidates_for_day(
         if credit <= 0.0 {
             continue;
         }
-        let max_loss = short.strike - credit;
+        let max_loss = cash_secured_put_max_loss_per_share(short.strike, credit);
         if max_loss <= 0.0 {
             continue;
         }
@@ -9354,7 +9369,7 @@ fn generate_put_debit_candidates_for_day(
             if !width_allowed(width, long_delta, profile) {
                 continue;
             }
-            let debit = long.ask - short.bid;
+            let debit = conservative_debit_spread_entry_debit_f64(long.ask, short.bid);
             if debit <= 0.0 {
                 continue;
             }
@@ -9427,7 +9442,7 @@ fn generate_call_debit_candidates_for_day(
             if !width_allowed(width, long_delta, profile) {
                 continue;
             }
-            let debit = long.ask - short.bid;
+            let debit = conservative_debit_spread_entry_debit_f64(long.ask, short.bid);
             if debit <= 0.0 {
                 continue;
             }
@@ -10141,7 +10156,7 @@ fn simulate_put_credit_candidate(
         let Some(long) = long_rows.get(date) else {
             continue;
         };
-        let debit = (short.ask - long.bid).clamp(0.0, candidate.width);
+        let debit = conservative_short_spread_exit_debit_f64(short.ask, long.bid, candidate.width);
         let reason = if debit >= stop_debit {
             Some("stop_loss")
         } else if debit <= take_profit_debit {
@@ -10179,7 +10194,8 @@ fn simulate_put_debit_candidate(
         let Some(long) = long_rows.get(date) else {
             continue;
         };
-        let exit_credit = (long.bid - short.ask).clamp(0.0, candidate.width);
+        let exit_credit =
+            conservative_long_spread_exit_credit_f64(long.bid, short.ask, candidate.width);
         let reason = if exit_credit >= take_profit_credit {
             Some("take_profit")
         } else if exit_credit <= stop_credit {
@@ -10254,6 +10270,125 @@ fn build_trade(
         short_iv: candidate.short_iv,
         long_iv: candidate.long_iv,
     }
+}
+
+#[cfg(test)]
+fn candidate_order_intent(candidate: &Candidate, symbol: &str) -> Result<OptionOrderIntent> {
+    let quantity = 1_u32;
+    let strategy = candidate.structure.as_str();
+    let limit_price = research_decimal_from_f64(candidate.credit, "candidate credit")?;
+    match candidate.structure {
+        SpreadStructure::PutCreditSpread => credit_spread_open_intent(
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.short,
+                ExecutionOptionRight::Put,
+            )?,
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.long,
+                ExecutionOptionRight::Put,
+            )?,
+            quantity,
+            limit_price,
+            strategy,
+        )
+        .map_err(anyhow::Error::from),
+        SpreadStructure::CallCreditSpread => credit_spread_open_intent(
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.short,
+                ExecutionOptionRight::Call,
+            )?,
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.long,
+                ExecutionOptionRight::Call,
+            )?,
+            quantity,
+            limit_price,
+            strategy,
+        )
+        .map_err(anyhow::Error::from),
+        SpreadStructure::PutDebitSpread => debit_spread_open_intent(
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.long,
+                ExecutionOptionRight::Put,
+            )?,
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.short,
+                ExecutionOptionRight::Put,
+            )?,
+            quantity,
+            limit_price,
+            strategy,
+        )
+        .map_err(anyhow::Error::from),
+        SpreadStructure::CallDebitSpread => debit_spread_open_intent(
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.long,
+                ExecutionOptionRight::Call,
+            )?,
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.short,
+                ExecutionOptionRight::Call,
+            )?,
+            quantity,
+            limit_price,
+            strategy,
+        )
+        .map_err(anyhow::Error::from),
+        SpreadStructure::Wheel => cash_secured_put_open_intent(
+            execution_option_key(
+                symbol,
+                candidate,
+                &candidate.short,
+                ExecutionOptionRight::Put,
+            )?,
+            quantity,
+            limit_price,
+            strategy,
+        )
+        .map_err(anyhow::Error::from),
+    }
+}
+
+#[cfg(test)]
+fn execution_option_key(
+    symbol: &str,
+    candidate: &Candidate,
+    row: &OptionDay,
+    right: ExecutionOptionRight,
+) -> Result<ExecutionOptionKey> {
+    Ok(ExecutionOptionKey::new(
+        symbol,
+        candidate.expiration,
+        research_decimal_from_f64(row.strike, "strike")?,
+        right,
+    ))
+}
+
+#[cfg(test)]
+fn research_decimal_from_f64(value: f64, field: &str) -> Result<Decimal> {
+    if !value.is_finite() {
+        anyhow::bail!("{field} must be finite");
+    }
+    value
+        .to_string()
+        .parse::<Decimal>()
+        .with_context(|| format!("convert {field} to Decimal"))
 }
 
 fn quote_width_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
@@ -12073,6 +12208,20 @@ mod tests {
         assert!((candidate.max_profit_per_share - 2.60).abs() < 1e-9);
         assert!((candidate.max_loss_per_share - 2.40).abs() < 1e-9);
 
+        let intent = candidate_order_intent(candidate, "TSLA").unwrap();
+        assert_eq!(intent.symbol, "TSLA");
+        assert_eq!(intent.strategy, "put_debit_spread");
+        assert_eq!(intent.order_effect, OptionOrderEffect::Debit);
+        assert_eq!(
+            intent.limit_price,
+            research_decimal_from_f64(candidate.credit, "expected debit").unwrap()
+        );
+        assert_eq!(intent.legs.len(), 2);
+        assert_eq!(intent.legs[0].side, OptionOrderSide::Buy);
+        assert_eq!(intent.legs[0].key.strike.to_string(), "100");
+        assert_eq!(intent.legs[1].side, OptionOrderSide::Sell);
+        assert_eq!(intent.legs[1].key.strike.to_string(), "95");
+
         let lookup = build_lookup(&rows_by_expiration);
         let trade = simulate_candidate(candidate, &lookup, &profile).unwrap();
 
@@ -12239,6 +12388,18 @@ mod tests {
         assert_eq!(candidates[0].short.strike, 100.0);
         assert!((candidates[0].credit - 2.00).abs() < 1e-9);
         assert!((candidates[0].max_loss_per_share - 98.00).abs() < 1e-9);
+
+        let intent = candidate_order_intent(&candidates[0], "PLTR").unwrap();
+        assert_eq!(intent.symbol, "PLTR");
+        assert_eq!(intent.strategy, "wheel");
+        assert_eq!(intent.order_effect, OptionOrderEffect::Credit);
+        assert_eq!(
+            intent.limit_price,
+            research_decimal_from_f64(candidates[0].credit, "expected credit").unwrap()
+        );
+        assert_eq!(intent.legs.len(), 1);
+        assert_eq!(intent.legs[0].side, OptionOrderSide::Sell);
+        assert_eq!(intent.legs[0].key.strike.to_string(), "100");
 
         let trades = simulate_wheel_non_overlapping(
             &candidates,
