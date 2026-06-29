@@ -8,7 +8,7 @@ struct MenubarMenuContent: View {
             header
             panelDivider()
 
-            SectionHeaderRow(title: "Canary", systemImage: "waveform.path.ecg")
+            SectionHeaderRow(title: "Automation", systemImage: "waveform.path.ecg")
             ForEach(statusRows) { row in
                 StatusIndicatorRow(row: row)
             }
@@ -26,7 +26,7 @@ struct MenubarMenuContent: View {
             if !viewModel.snapshot.actionRows.isEmpty {
                 panelDivider()
 
-                SectionHeaderRow(title: "Action", systemImage: "scope")
+                SectionHeaderRow(title: "Signal", systemImage: "scope")
                 ForEach(viewModel.snapshot.actionRows) { row in
                     ValueRow(label: row.label, value: row.value, tone: RowTone(row.tone))
                 }
@@ -42,26 +42,14 @@ struct MenubarMenuContent: View {
             panelButton(title: "Refresh", systemImage: "arrow.clockwise") {
                 viewModel.refresh()
             }
-            panelButton(title: "Start Worker", systemImage: "play.fill") {
-                viewModel.startWorker()
-            }
             panelButton(title: "Restart Worker", systemImage: "arrow.triangle.2.circlepath") {
                 viewModel.restartWorker()
-            }
-            panelButton(title: "Stop Worker", systemImage: "stop.fill") {
-                viewModel.stopWorker()
             }
 
             panelDivider()
 
-            panelButton(title: "Open Log", systemImage: "doc.text.magnifyingglass") {
-                viewModel.openLog()
-            }
-            panelButton(title: "Open Runbook", systemImage: "book") {
-                viewModel.openDocs()
-            }
-            panelButton(title: "Quit Menubar", systemImage: "xmark.circle") {
-                NSApplication.shared.terminate(nil)
+            panelButton(title: "Stop All Services & Quit", systemImage: "power") {
+                viewModel.shutdownServicesAndQuit()
             }
         }
         .padding(.vertical, MenuLayoutMetrics.panelVerticalPadding)
@@ -131,7 +119,7 @@ struct MenubarMenuContent: View {
                     }
                 }
             )) {
-                ForEach(CanaryModeChoice.allCases) { mode in
+                ForEach(ExecutionModeChoice.allCases) { mode in
                     Text(mode.title).tag(Optional(mode))
                 }
             }
@@ -161,7 +149,7 @@ private struct BrokerValueRow: View {
     let row: SnapshotRow
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: MenuLayoutMetrics.columnSpacing) {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
             MenuRowIcon(systemName: systemImage)
             Text(row.label)
                 .lineLimit(1)
@@ -183,7 +171,7 @@ private struct BrokerValueRow: View {
             return "person.text.rectangle"
         case "Equity":
             return "chart.line.uptrend.xyaxis"
-        case "Buy Power":
+        case "Buying Power":
             return "bolt.circle"
         case "Cash":
             return "dollarsign.circle"

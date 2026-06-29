@@ -9,7 +9,7 @@ enum RootDirectory {
         var candidate = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for _ in 0..<8 {
             if FileManager.default.fileExists(atPath: candidate.appendingPathComponent("Cargo.toml").path),
-               FileManager.default.fileExists(atPath: candidate.appendingPathComponent("scripts/canary-service.sh").path) {
+               FileManager.default.fileExists(atPath: candidate.appendingPathComponent("scripts/execution-service.sh").path) {
                 return candidate
             }
             candidate.deleteLastPathComponent()

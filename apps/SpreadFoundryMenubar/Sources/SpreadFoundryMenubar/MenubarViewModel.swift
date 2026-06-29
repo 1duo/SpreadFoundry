@@ -1,7 +1,8 @@
+import AppKit
 import Foundation
 import SwiftUI
 
-enum CanaryModeChoice: String, CaseIterable, Identifiable {
+enum ExecutionModeChoice: String, CaseIterable, Identifiable {
     case monitor
     case review
     case live
@@ -22,7 +23,7 @@ enum CanaryModeChoice: String, CaseIterable, Identifiable {
 
 @MainActor
 final class MenubarViewModel: ObservableObject {
-    @Published private(set) var snapshot: CanarySnapshot = .unavailable
+    @Published private(set) var snapshot: ExecutionSnapshot = .unavailable
     @Published private(set) var errorMessage: String?
 
     private let snapshotService: SnapshotService
@@ -34,8 +35,8 @@ final class MenubarViewModel: ObservableObject {
         self.scriptRunner = scriptRunner
     }
 
-    var currentMode: CanaryModeChoice? {
-        snapshot.canaryMode
+    var currentMode: ExecutionModeChoice? {
+        snapshot.executionMode
     }
 
     var modeIsKnown: Bool {
@@ -61,31 +62,24 @@ final class MenubarViewModel: ObservableObject {
         }
     }
 
-    func startWorker() {
-        runThenRefresh("start")
-    }
-
-    func stopWorker() {
-        runThenRefresh("stop")
-    }
-
     func restartWorker() {
         runThenRefresh("restart")
     }
 
-    func setMode(_ mode: CanaryModeChoice) {
+    func shutdownServicesAndQuit() {
+        do {
+            _ = try scriptRunner.shutdownFromMenubar()
+            NSApplication.shared.terminate(nil)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func setMode(_ mode: ExecutionModeChoice) {
         guard currentMode != mode else {
             return
         }
         runThenRefresh("set-mode", arguments: [mode.rawValue])
-    }
-
-    func openLog() {
-        scriptRunner.openLog()
-    }
-
-    func openDocs() {
-        scriptRunner.openDocs()
     }
 
     private func runThenRefresh(_ command: String, arguments: [String] = []) {

@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 
 struct ScriptRunner {
@@ -6,10 +5,21 @@ struct ScriptRunner {
 
     @discardableResult
     func runServiceCommand(_ command: String, arguments: [String] = []) throws -> Data {
-        let script = rootDirectory.appendingPathComponent("scripts/canary-service.sh")
+        let script = rootDirectory.appendingPathComponent("scripts/execution-service.sh")
+        return try runScript(script, arguments: [command] + arguments)
+    }
+
+    @discardableResult
+    func shutdownFromMenubar() throws -> Data {
+        let script = rootDirectory.appendingPathComponent("scripts/spreadfoundry-service.sh")
+        return try runScript(script, arguments: ["shutdown-from-menubar"])
+    }
+
+    @discardableResult
+    private func runScript(_ script: URL, arguments: [String]) throws -> Data {
         let process = Process()
         process.executableURL = script
-        process.arguments = [command] + arguments
+        process.arguments = arguments
         process.currentDirectoryURL = rootDirectory
 
         let output = Pipe()
@@ -28,15 +38,5 @@ struct ScriptRunner {
             ])
         }
         return outputData
-    }
-
-    func openLog() {
-        let logURL = rootDirectory.appendingPathComponent("var/canary_worker.log")
-        NSWorkspace.shared.open(logURL)
-    }
-
-    func openDocs() {
-        let docsURL = rootDirectory.appendingPathComponent("docs/production_architecture.md")
-        NSWorkspace.shared.open(docsURL)
     }
 }

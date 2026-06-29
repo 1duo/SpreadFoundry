@@ -146,6 +146,64 @@ pub struct TradierBalancesResponse {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierPosition {
+    pub symbol: String,
+    pub quantity: f64,
+    pub cost_basis: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierPositionsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub raw: Value,
+    #[serde(default)]
+    pub positions: Vec<TradierPosition>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierOrder {
+    pub id: Option<String>,
+    pub symbol: Option<String>,
+    pub option_symbol: Option<String>,
+    pub status: Option<String>,
+    pub side: Option<String>,
+    pub quantity: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierOrdersResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub raw: Value,
+    #[serde(default)]
+    pub orders: Vec<TradierOrder>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierQuote {
+    pub symbol: String,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub last: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierQuotesResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub raw: Value,
+    #[serde(default)]
+    pub quotes: Vec<TradierQuote>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TradierClient {
     config: TradierConfig,
@@ -184,19 +242,7 @@ impl TradierClient {
             self.config.base_url.trim_end_matches('/'),
             self.config.account_id
         );
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(&self.config.token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()?;
-        let status = response.status();
-        let body = response.text()?;
-        let raw = if body.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&body).unwrap_or_else(|_| Value::String(body.clone()))
-        };
+        let (status, body, raw) = self.get_json(url)?;
         if status.is_success() {
             Ok(TradierBalancesResponse {
                 ok: true,
@@ -212,6 +258,105 @@ impl TradierClient {
                 error: Some(format!("Tradier API returned HTTP {status}: {body}")),
             })
         }
+    }
+
+    pub fn get_positions(&self) -> anyhow::Result<TradierPositionsResponse> {
+        let url = format!(
+            "{}/accounts/{}/positions",
+            self.config.base_url.trim_end_matches('/'),
+            self.config.account_id
+        );
+        let (status, body, raw) = self.get_json(url)?;
+        if status.is_success() {
+            Ok(TradierPositionsResponse {
+                ok: true,
+                positions: parse_tradier_positions(&raw),
+                raw,
+                error: None,
+            })
+        } else {
+            Ok(TradierPositionsResponse {
+                ok: false,
+                raw,
+                positions: Vec::new(),
+                error: Some(format!("Tradier API returned HTTP {status}: {body}")),
+            })
+        }
+    }
+
+    pub fn get_orders(&self) -> anyhow::Result<TradierOrdersResponse> {
+        let url = format!(
+            "{}/accounts/{}/orders",
+            self.config.base_url.trim_end_matches('/'),
+            self.config.account_id
+        );
+        let (status, body, raw) = self.get_json(url)?;
+        if status.is_success() {
+            Ok(TradierOrdersResponse {
+                ok: true,
+                orders: parse_tradier_orders(&raw),
+                raw,
+                error: None,
+            })
+        } else {
+            Ok(TradierOrdersResponse {
+                ok: false,
+                raw,
+                orders: Vec::new(),
+                error: Some(format!("Tradier API returned HTTP {status}: {body}")),
+            })
+        }
+    }
+
+    pub fn get_quotes(&self, symbols: &[String]) -> anyhow::Result<TradierQuotesResponse> {
+        if symbols.is_empty() {
+            anyhow::bail!("Tradier quotes request requires at least one symbol");
+        }
+        let url = format!(
+            "{}/markets/quotes",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.config.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .query(&[
+                ("symbols", symbols.join(",")),
+                ("greeks", "false".to_owned()),
+            ])
+            .send()?;
+        let status = response.status();
+        let body = response.text()?;
+        let raw = parse_json_body(&body);
+        if status.is_success() {
+            Ok(TradierQuotesResponse {
+                ok: true,
+                quotes: parse_tradier_quotes(&raw),
+                raw,
+                error: None,
+            })
+        } else {
+            Ok(TradierQuotesResponse {
+                ok: false,
+                raw,
+                quotes: Vec::new(),
+                error: Some(format!("Tradier API returned HTTP {status}: {body}")),
+            })
+        }
+    }
+
+    fn get_json(&self, url: String) -> anyhow::Result<(reqwest::StatusCode, String, Value)> {
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.config.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()?;
+        let status = response.status();
+        let body = response.text()?;
+        let raw = parse_json_body(&body);
+        Ok((status, body, raw))
     }
 
     fn submit_order(
@@ -235,11 +380,7 @@ impl TradierClient {
             .send()?;
         let status = response.status();
         let body = response.text()?;
-        let raw = if body.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&body).unwrap_or_else(|_| Value::String(body.clone()))
-        };
+        let raw = parse_json_body(&body);
         if status.is_success() {
             Ok(TradierOrderResponse {
                 ok: true,
@@ -253,6 +394,14 @@ impl TradierClient {
                 error: Some(format!("Tradier API returned HTTP {status}: {body}")),
             })
         }
+    }
+}
+
+fn parse_json_body(body: &str) -> Value {
+    if body.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_owned()))
     }
 }
 
@@ -279,6 +428,69 @@ fn parse_tradier_balances(value: &Value) -> Option<TradierAccountBalances> {
         option_requirement: number_field(balances, "option_requirement"),
         current_requirement: number_field(balances, "current_requirement"),
     })
+}
+
+fn parse_tradier_positions(value: &Value) -> Vec<TradierPosition> {
+    tradier_object_or_array(
+        value
+            .get("positions")
+            .and_then(|value| value.get("position")),
+    )
+    .into_iter()
+    .filter_map(|position| {
+        let map = position.as_object()?;
+        let symbol = string_field(map, "symbol")?;
+        let quantity = number_field(map, "quantity")?;
+        Some(TradierPosition {
+            symbol,
+            quantity,
+            cost_basis: number_field(map, "cost_basis"),
+        })
+    })
+    .collect()
+}
+
+fn parse_tradier_orders(value: &Value) -> Vec<TradierOrder> {
+    tradier_object_or_array(value.get("orders").and_then(|value| value.get("order")))
+        .into_iter()
+        .filter_map(|order| {
+            let map = order.as_object()?;
+            Some(TradierOrder {
+                id: string_field(map, "id"),
+                symbol: string_field(map, "symbol"),
+                option_symbol: string_field(map, "option_symbol"),
+                status: string_field(map, "status").map(|status| status.to_ascii_lowercase()),
+                side: string_field(map, "side").map(|side| side.to_ascii_lowercase()),
+                quantity: number_field(map, "quantity"),
+            })
+        })
+        .collect()
+}
+
+fn parse_tradier_quotes(value: &Value) -> Vec<TradierQuote> {
+    tradier_object_or_array(value.get("quotes").and_then(|value| value.get("quote")))
+        .into_iter()
+        .filter_map(|quote| {
+            let map = quote.as_object()?;
+            let symbol = string_field(map, "symbol")
+                .or_else(|| string_field(map, "option_symbol"))
+                .or_else(|| string_field(map, "root_symbols"))?;
+            Some(TradierQuote {
+                symbol,
+                bid: number_field(map, "bid"),
+                ask: number_field(map, "ask"),
+                last: number_field(map, "last"),
+            })
+        })
+        .collect()
+}
+
+fn tradier_object_or_array(value: Option<&Value>) -> Vec<&Value> {
+    match value {
+        Some(Value::Array(values)) => values.iter().collect(),
+        Some(Value::Object(_)) => value.into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -333,9 +545,9 @@ impl RobinhoodMcpCommandExecutor {
             .spawn()?;
 
         {
-            let stdin = child
+            let mut stdin = child
                 .stdin
-                .as_mut()
+                .take()
                 .ok_or_else(|| anyhow::anyhow!("Robinhood MCP bridge stdin is unavailable"))?;
             stdin.write_all(serde_json::to_string(request)?.as_bytes())?;
             stdin.write_all(b"\n")?;

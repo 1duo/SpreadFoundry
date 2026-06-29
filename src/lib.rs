@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod execution;
 pub mod fixture;
+pub mod live_signal;
 pub mod opt;
 pub mod report;
 pub mod research;

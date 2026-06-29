@@ -86,6 +86,12 @@ stop_menubar() {
   echo "menubar stopped"
 }
 
+prepare_quit_menubar() {
+  launchctl bootout "$launch_domain/$launch_label" >/dev/null 2>&1 || true
+  rm -f "$pid_file"
+  echo "menubar launchd unloaded; app will quit"
+}
+
 status_menubar() {
   local pid
   pid="$(read_pid || true)"
@@ -107,6 +113,9 @@ case "${1:-status}" in
     stop_menubar
     start_menubar
     ;;
+  prepare-quit)
+    prepare_quit_menubar
+    ;;
   status)
     status_menubar
     ;;
@@ -116,7 +125,7 @@ case "${1:-status}" in
     tail -n "${SPREAD_MENUBAR_LOG_LINES:-80}" "$log_file"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|log}" >&2
+    echo "usage: $0 {start|stop|restart|prepare-quit|status|log}" >&2
     exit 2
     ;;
 esac

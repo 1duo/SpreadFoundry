@@ -1807,6 +1807,23 @@ pub async fn run_portfolio_selector_research(
     .await
 }
 
+pub async fn run_portfolio_selector_research_for_profile(
+    request: PortfolioWheelResearchRequest,
+    profile_name: &str,
+) -> Result<PortfolioWheelReport> {
+    let profile = portfolio_selector_profiles()
+        .into_iter()
+        .find(|profile| profile.summary_profile.name == profile_name)
+        .with_context(|| format!("approved selector profile {profile_name} was not found"))?;
+    run_portfolio_research(
+        request,
+        "portfolio-weekly-signal-refresh",
+        "Portfolio Weekly Signal Refresh",
+        vec![profile],
+    )
+    .await
+}
+
 pub async fn audit_option_cache_coverage(
     request: OptionCacheCoverageRequest,
 ) -> Result<OptionCacheCoverageReport> {
@@ -3488,10 +3505,10 @@ fn portfolio_latest_actions(
         .iter()
         .filter(|trade| trade.trade.entry_date >= recent_from || trade.trade.exit_date > as_of)
         .map(|trade| {
-            let status = if trade.trade.exit_date > as_of {
-                "open_candidate"
-            } else if trade.trade.entry_date == as_of {
-                "entry_candidate"
+            let status = if trade.trade.entry_date == as_of {
+                "new_entry"
+            } else if trade.trade.exit_date > as_of {
+                "already_open"
             } else {
                 "recent_closed"
             };
@@ -5016,9 +5033,9 @@ fn latest_signal_for_profile(
     let (latest_entry_date, day_candidates) =
         latest_signal_day_candidates(&candidates, &result.profile)?;
     let status = if latest_entry_date == to {
-        "entry_candidate"
+        "new_entry"
     } else {
-        "open_candidate"
+        "already_open"
     };
     Some(signal_from_candidate(
         day_candidates[0],
@@ -16364,7 +16381,7 @@ mod tests {
 
         let signal = latest_signal_for_profile(&result, &rows, entry_date, entry_date).unwrap();
 
-        assert_eq!(signal.status, "entry_candidate");
+        assert_eq!(signal.status, "new_entry");
         assert_eq!(signal.as_of, entry_date);
         assert_eq!(signal.entry_date, entry_date);
         assert_eq!(signal.expiration, expiration);
@@ -16375,7 +16392,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_signal_labels_prior_entry_as_open_candidate() {
+    fn latest_signal_labels_prior_entry_as_already_open() {
         let entry_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
         let as_of = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         let expiration = entry_date + Duration::days(40);
@@ -16391,7 +16408,7 @@ mod tests {
 
         let signal = latest_signal_for_profile(&result, &rows, entry_date, as_of).unwrap();
 
-        assert_eq!(signal.status, "open_candidate");
+        assert_eq!(signal.status, "already_open");
         assert_eq!(signal.as_of, as_of);
         assert_eq!(signal.entry_date, entry_date);
     }
@@ -16565,7 +16582,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_regime_cooldown_skips_immediate_reentry_candidates() {
+    fn risk_regime_cooldown_skips_immediate_renew_entries() {
         let risk_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
         let skipped_date = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         let eligible_date = NaiveDate::from_ymd_opt(2026, 1, 22).unwrap();
@@ -16673,7 +16690,7 @@ mod tests {
     fn test_signal(as_of: NaiveDate, profile_name: &str) -> ResearchSignal {
         ResearchSignal {
             as_of,
-            status: "entry_candidate".to_owned(),
+            status: "new_entry".to_owned(),
             profile_name: profile_name.to_owned(),
             entry_date: as_of,
             expiration: as_of + Duration::days(40),

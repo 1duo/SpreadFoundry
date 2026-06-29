@@ -52,7 +52,7 @@ final class StatusBarController: NSObject {
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 
-    private func refreshStatusItem(_ snapshot: CanarySnapshot) {
+    private func refreshStatusItem(_ snapshot: ExecutionSnapshot) {
         guard let button = statusItem.button else {
             return
         }

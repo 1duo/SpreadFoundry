@@ -1,6 +1,6 @@
 import Foundation
 
-struct CanarySnapshot: Decodable {
+struct ExecutionSnapshot: Decodable {
     let updatedAt: String
     let healthPath: String
     let pidFile: String
@@ -15,10 +15,10 @@ struct CanarySnapshot: Decodable {
     let brokerRows: [SnapshotRow]
     let actionRows: [SnapshotRow]
 
-    static let unavailable = CanarySnapshot(
+    static let unavailable = ExecutionSnapshot(
         updatedAt: "",
-        healthPath: "var/canary_worker_health.json",
-        pidFile: "var/canary_worker.pid",
+        healthPath: "var/execution_worker_health.json",
+        pidFile: "var/execution_worker.pid",
         workerRunning: false,
         healthReadable: false,
         healthAgeSeconds: nil,
@@ -31,10 +31,10 @@ struct CanarySnapshot: Decodable {
         actionRows: []
     )
 
-    var canaryMode: CanaryModeChoice? {
+    var executionMode: ExecutionModeChoice? {
         rows
             .first { $0.label == "Mode" }
-            .flatMap { CanaryModeChoice(rawValue: $0.value) }
+            .flatMap { ExecutionModeChoice(rawValue: $0.value) }
     }
 
     var statusTitle: String {

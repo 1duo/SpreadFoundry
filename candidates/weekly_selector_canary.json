@@ -75,12 +75,12 @@
   "data_note": "Symbols with zero rows in symbols_loaded did not contribute to this cache-backed candidate.",
   "decision": {
     "action_policy": "wait_for_fresh_entry_or_open_candidate",
-    "canary_ready": true,
+    "canary_ready": false,
     "canary_status": "blocked",
     "current_action_state": "no_open_or_same_day_entry_actions_as_of_2026-06-29",
     "export_policy": "risk_controlled_live",
     "full_promotion_ready": false,
-    "reason": "risk-controlled live override: source canary status was blocked; runtime remains limited to same-day debit spreads with per-trade caps",
+    "reason": "risk-controlled live override: source canary status was blocked; runtime remains limited to supported same-day entries with per-strategy risk controls",
     "recommended_capital_fraction": 0.0,
     "research_gate": "research_pass",
     "source_canary_ready": false,
@@ -108,7 +108,7 @@
     "CRWV",
     "AMD"
   ],
-  "exported_at": "2026-06-29T18:49:05.275984Z",
+  "exported_at": "2026-06-29T20:16:21.903260Z",
   "frozen_on": "2026-06-29",
   "latest_action_summary": [
     {
@@ -282,10 +282,10 @@
     "worst_marked_stock_loss": 0.0,
     "worst_trade_loss": -574.9999999999999
   },
-  "source_markdown_report": "runs/portfolio-weekly-selector-research-20260629T184853.649711000Z/report.md",
-  "source_report": "runs/portfolio-weekly-selector-research-20260629T184853.649711000Z/portfolio_research.json",
-  "source_run_id": "portfolio-weekly-selector-research-20260629T184853.649711000Z",
-  "status": "canary_only",
+  "source_markdown_report": "runs/portfolio-weekly-selector-research-20260629T200130.978184000Z/report.md",
+  "source_report": "runs/portfolio-weekly-selector-research-20260629T200130.978184000Z/portfolio_research.json",
+  "source_run_id": "portfolio-weekly-selector-research-20260629T200130.978184000Z",
+  "status": "blocked",
   "strategy": "portfolio_weekly_selector",
   "strategy_summaries": [
     {

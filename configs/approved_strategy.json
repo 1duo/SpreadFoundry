@@ -1,0 +1,18 @@
+{
+  "strategy_id": "weekly_selector_approved_20260629",
+  "profile_name": "selector_crash_put_and_costaware_call_debits_only",
+  "symbols": ["IREN", "PLTR", "ORCL", "TSLA", "CRWV", "AMD"],
+  "portfolio_constraints": {
+    "capital_budget": 7897.67,
+    "max_symbol_allocation_pct": 0.2,
+    "max_open_positions": 4,
+    "max_positions_per_symbol": 2,
+    "max_total_trades_per_symbol": null,
+    "portfolio_drawdown_cooldown_trigger_pct": null,
+    "portfolio_drawdown_cooldown_days": 0,
+    "symbol_drawdown_cooldown_trigger_pct": null,
+    "symbol_drawdown_cooldown_days": 0
+  },
+  "allowed_live_strategies": ["put_debit_spread", "call_debit_spread"],
+  "canary_risk_policy_id": "tradier_canary_debit_v1"
+}

@@ -1,40 +1,54 @@
-# Tradier Canary Execution
+# Tradier Execution
 
-Tradier is the default broker for SpreadFoundry canary execution. Robinhood
-remains available by setting `SPREAD_CANARY_BROKER=robinhood` or
-`--broker robinhood`.
+Tradier is the default broker for SpreadFoundry execution. Robinhood remains in
+the broker adapter, but Tradier is the first broker path with direct REST
+preview/place support for atomic multi-leg option orders.
 
 Official references:
 
-- Trading API: `https://docs.tradier.com/docs/trading`
-- Orders API: `https://docs.tradier.com/docs/orders`
+- [Tradier Trading API](https://docs.tradier.com/docs/trading)
+- [Tradier Orders](https://docs.tradier.com/docs/orders)
 
 ## Scope
 
-V1 supports only one-contract defined-risk debit spreads:
+Current live scope:
 
 - `call_debit_spread`
 - `put_debit_spread`
+- one spread contract per order
+- `class=multileg`
+- `type=debit`
+- `duration=day`
+- current Tradier quote validation before preview
+- preview before any placement
 
-Wheel, cash-secured puts, assignment handling, stock inventory, covered calls,
-exits, and OCO lifecycle are intentionally not implemented for Tradier V1.
+Autonomous placement is currently blocked by the position-lifecycle safety gate.
+Wheel entries, assignment handling, covered-call lifecycle, exits, OCO orders,
+and account streaming are later phases. Until those exist, `live` mode remains
+fail-closed before order placement.
 
-## Modes
+## Required Inputs
 
-- `monitor`: local artifact/risk/broker-shape validation only. Tradier
-  credentials are not required and no HTTP request is made.
-- `review`: requires `SPREAD_TRADIER_ACCOUNT_ID` and `SPREAD_TRADIER_TOKEN`.
-  Sends one Tradier preview request with `preview=true`; never places. The
-  preview must include a Tradier order envelope with `status=ok` and
-  `result=true`.
-- `live`: requires credentials. Sends preview first, then places with
-  `preview=false` only if preview succeeds and the broker-specific order key is
-  absent from `var/canary_order_ledger.json`.
+The execution worker reads only:
 
-Preview network failures and Tradier rejections become `review_failed`. Clean
-place rejections become `live_rejected`. A transport failure after local live
-ledger reservation becomes `live_submit_unknown`; check Tradier before any
-manual retry. None of these paths crash the worker.
+```text
+var/live_signal.json
+```
+
+That artifact must come from signal refresh and must validate as
+`LiveSignalArtifact`. Research reports are not execution inputs.
+
+The order ledger defaults to:
+
+```text
+var/execution_order_ledger.json
+```
+
+The notification ledger defaults to:
+
+```text
+var/execution_notify_ledger.json
+```
 
 ## Configuration
 
@@ -43,7 +57,7 @@ Sandbox:
 ```bash
 export SPREAD_TRADIER_ACCOUNT_ID=...
 export SPREAD_TRADIER_TOKEN=...
-scripts/canary-service.sh configure-tradier sandbox
+scripts/execution-service.sh configure-tradier sandbox
 ```
 
 Production:
@@ -51,65 +65,70 @@ Production:
 ```bash
 export SPREAD_TRADIER_ACCOUNT_ID=...
 export SPREAD_TRADIER_TOKEN=...
-scripts/canary-service.sh configure-tradier production
+scripts/execution-service.sh configure-tradier production
 ```
 
-`configure-tradier` persists:
-
-- `SPREAD_CANARY_BROKER=tradier`
-- `SPREAD_TRADIER_ACCOUNT_ID`
-- `SPREAD_TRADIER_TOKEN`
-- `SPREAD_TRADIER_BASE_URL`
-
-When no Tradier base URL is configured, the runner defaults to
-`https://sandbox.tradier.com/v1`. Production uses `https://api.tradier.com/v1`
-and must be explicitly selected.
-
-## Order Shape
-
-The runner posts form-encoded orders to:
-
-```text
-POST /accounts/{account_id}/orders
-```
-
-The form uses Tradier's atomic multi-leg shape:
-
-```text
-class=multileg
-symbol=ORCL
-type=debit
-duration=day
-price=4.50
-option_symbol[0]=ORCL260702C00220000
-side[0]=buy_to_open
-quantity[0]=1
-option_symbol[1]=ORCL260702C00225000
-side[1]=sell_to_open
-quantity[1]=1
-preview=true|false
-```
-
-The live ledger stores structured order state. `pending_unknown` and
-`submitted` entries block duplicates; clean `rejected` entries do not. Order keys
-include the broker, account, base URL, action entry date, action status, and
-payload so a future same-spread signal on a different day is not suppressed by
-an older canary attempt.
-
-The canary runner derives OCC option symbols from the shared
-`OptionOrderIntent`, so Robinhood payload construction, Tradier payload
-construction, and simulator/research order intent validation share the same
-underlying order model.
-
-## Acceptance
+Execution mode is independent of broker configuration:
 
 ```bash
-cargo fmt
-cargo test
-cargo build --release
-bash -n scripts/canary-service.sh scripts/run_canary_worker.sh
-SPREAD_CANARY_MODE=monitor scripts/run_canary_worker.sh
+scripts/execution-service.sh set-mode monitor
+scripts/execution-service.sh set-mode review
+scripts/execution-service.sh set-mode live
 ```
 
-Run a sandbox `review` with real Tradier sandbox credentials before any
-production `live` configuration.
+## Mode Behavior
+
+`monitor`:
+
+- validates the live signal and local risk policy
+- does not require Tradier credentials
+- does not send preview or place requests
+- sends a notification if a signal is actionable
+
+`review`:
+
+- requires Tradier credentials
+- validates current option quotes for debit spreads
+- submits preview only
+- records reviewed/rejected order keys to avoid repeated preview loops
+- reports `reviewed` on preview success
+- never places an order
+
+`live`:
+
+- requires Tradier credentials
+- requires a fresh same-day live signal
+- validates current option quotes and broker state
+- currently blocks before placement until broker position reconciliation and
+  exit lifecycle are implemented
+
+## Failure Semantics
+
+Execution is fail-closed.
+
+- Local validation failures become `blocked`.
+- Tradier quote validation failures become `blocked`.
+- Tradier preview rejections become `rejected` and are recorded in the ledger.
+- Placement transport failures after ledger reservation become
+  `submit_unknown`.
+- Duplicate submitted ledger keys become `already_submitted`.
+- Duplicate rejected ledger keys stay `rejected` until an operator clears or
+  reconciles the ledger.
+- No selected signal becomes `no_signal`.
+
+Notifications are best-effort. Notification failure is logged but does not
+change the execution decision.
+
+## Acceptance Commands
+
+```bash
+cargo fmt -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+bash -n scripts/*.sh
+scripts/signal-refresh-service.sh once
+cargo run --quiet -- live-signal-status --live-signal var/live_signal.json
+scripts/execution-service.sh readiness
+cargo run --quiet -- execution-worker --mode monitor --once
+```

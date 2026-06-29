@@ -1,5 +1,9 @@
 # Weekly Selector Canary Workflow
 
+Historical research note only. Current production operations use
+`ApprovedStrategy`, `LiveSignalArtifact`, signal refresh, and the execution
+worker documented in `docs/production_architecture.md`.
+
 This note freezes the current professional decision for the frequent weekly-options research lane.
 
 ## Current Decision
