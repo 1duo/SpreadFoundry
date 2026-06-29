@@ -7,6 +7,8 @@ cd "$repo_root"
 candidate="${SPREAD_CANARY_CANDIDATE:-candidates/weekly_selector_canary.json}"
 health_output="${SPREAD_CANARY_HEALTH_OUTPUT:-target/canary_worker_health.json}"
 order_ledger="${SPREAD_CANARY_ORDER_LEDGER:-var/canary_order_ledger.json}"
+notify_command="${SPREAD_CANARY_NOTIFY_COMMAND:-}"
+notify_ledger="${SPREAD_CANARY_NOTIFY_LEDGER:-var/canary_notify_ledger.json}"
 max_order_age_seconds="${SPREAD_CANARY_MAX_ORDER_AGE_SECONDS:-1800}"
 poll_seconds="${SPREAD_CANARY_POLL_SECONDS:-60}"
 mode="${SPREAD_CANARY_MODE:-monitor}"
@@ -44,6 +46,9 @@ if [[ "${SPREAD_CANARY_BROKER_COVERED_CALLS:-0}" == "1" ]]; then
 fi
 if [[ -n "${SPREAD_ROBINHOOD_MCP_COMMAND:-}" ]]; then
   cli_args+=(--robinhood-mcp-command "$SPREAD_ROBINHOOD_MCP_COMMAND")
+fi
+if [[ -n "$notify_command" ]]; then
+  cli_args+=(--notify-command "$notify_command" --notify-ledger "$notify_ledger")
 fi
 if [[ "${SPREAD_CANARY_ONCE:-0}" == "1" ]]; then
   cli_args+=(--once)

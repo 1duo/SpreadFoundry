@@ -30,6 +30,8 @@ canary_env_names() {
     SPREAD_BINARY \
     SPREAD_CANARY_CANDIDATE \
     SPREAD_CANARY_ORDER_LEDGER \
+    SPREAD_CANARY_NOTIFY_COMMAND \
+    SPREAD_CANARY_NOTIFY_LEDGER \
     SPREAD_CANARY_MAX_ORDER_AGE_SECONDS \
     SPREAD_CANARY_POLL_SECONDS \
     SPREAD_CANARY_MODE \
@@ -41,6 +43,11 @@ canary_env_names() {
     SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS \
     SPREAD_CANARY_BROKER_CASH_SECURED_PUTS \
     SPREAD_CANARY_BROKER_COVERED_CALLS \
+    SPREAD_NTFY_URL \
+    SPREAD_NTFY_TOPIC \
+    SPREAD_NTFY_TOKEN \
+    SPREAD_NTFY_PRIORITY \
+    SPREAD_NTFY_TIMEOUT_SECONDS \
     SPREAD_ROBINHOOD_MCP_COMMAND
 }
 
@@ -86,6 +93,23 @@ set_worker_mode() {
   stop_worker
   start_worker
   echo "canary worker mode=$mode"
+}
+
+configure_ntfy() {
+  local topic="${1:-${SPREAD_NTFY_TOPIC:-}}"
+  if [[ -z "$topic" ]]; then
+    echo "usage: $0 configure-ntfy <topic>" >&2
+    exit 2
+  fi
+  load_saved_canary_env
+  export SPREAD_CANARY_NOTIFY_COMMAND="${SPREAD_CANARY_NOTIFY_COMMAND:-$repo_root/scripts/notify-ntfy.sh}"
+  export SPREAD_CANARY_NOTIFY_LEDGER="${SPREAD_CANARY_NOTIFY_LEDGER:-var/canary_notify_ledger.json}"
+  export SPREAD_NTFY_URL="${SPREAD_NTFY_URL:-https://ntfy.sh}"
+  export SPREAD_NTFY_TOPIC="$topic"
+  export SPREAD_NTFY_PRIORITY="${SPREAD_NTFY_PRIORITY:-high}"
+  export SPREAD_NTFY_TIMEOUT_SECONDS="${SPREAD_NTFY_TIMEOUT_SECONDS:-10}"
+  persist_canary_env
+  echo "configured ntfy topic=$SPREAD_NTFY_TOPIC command=$SPREAD_CANARY_NOTIFY_COMMAND"
 }
 
 start_worker() {
@@ -257,6 +281,9 @@ case "${1:-status}" in
   set-mode)
     set_worker_mode "${2:-}"
     ;;
+  configure-ntfy)
+    configure_ntfy "${2:-}"
+    ;;
   status|snapshot)
     snapshot_worker
     ;;
@@ -269,7 +296,7 @@ case "${1:-status}" in
     tail -n "${SPREAD_CANARY_LOG_LINES:-80}" "$log_file"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|set-mode|status|snapshot|readiness|log}" >&2
+    echo "usage: $0 {start|stop|restart|set-mode|configure-ntfy|status|snapshot|readiness|log}" >&2
     exit 2
     ;;
 esac

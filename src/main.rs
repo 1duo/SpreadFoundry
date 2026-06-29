@@ -32,9 +32,11 @@ use spreadfoundry::types::{OptionKey, OptionRight};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration as StdDuration;
+use wait_timeout::ChildExt;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses eight non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
@@ -206,6 +208,10 @@ enum Commands {
         robinhood_mcp_command: Option<String>,
         #[arg(long, default_value = "var/canary_order_ledger.json")]
         order_ledger: PathBuf,
+        #[arg(long)]
+        notify_command: Option<String>,
+        #[arg(long, default_value = "var/canary_notify_ledger.json")]
+        notify_ledger: PathBuf,
         #[arg(long, default_value_t = DEFAULT_MAX_ORDER_AGE_SECONDS)]
         max_order_age_seconds: u64,
         #[arg(long, default_value_t = 60)]
@@ -786,6 +792,8 @@ async fn main() -> Result<()> {
             broker_covered_calls,
             robinhood_mcp_command,
             order_ledger,
+            notify_command,
+            notify_ledger,
             max_order_age_seconds,
             poll_seconds,
             once,
@@ -811,6 +819,8 @@ async fn main() -> Result<()> {
                 mode,
                 robinhood_mcp_command,
                 order_ledger,
+                notify_command,
+                notify_ledger,
                 max_order_age_seconds,
                 poll_seconds,
                 once,
@@ -2740,6 +2750,8 @@ struct CanaryWorkerArgs {
     mode: CanaryMode,
     robinhood_mcp_command: Option<String>,
     order_ledger: PathBuf,
+    notify_command: Option<String>,
+    notify_ledger: PathBuf,
     max_order_age_seconds: u64,
     poll_seconds: u64,
     once: bool,
@@ -3059,6 +3071,9 @@ async fn run_canary_worker(args: CanaryWorkerArgs) -> Result<()> {
         if let Some(path) = &args.health_output {
             write_canary_worker_health(path, &health)?;
         }
+        if let Err(err) = maybe_notify_canary_decision(&health, &args) {
+            eprintln!("canary notification failed: {err:#}");
+        }
         if args.json {
             println!("{}", serde_json::to_string_pretty(&health)?);
         } else {
@@ -3081,6 +3096,139 @@ async fn run_canary_worker(args: CanaryWorkerArgs) -> Result<()> {
         tokio::time::sleep(StdDuration::from_secs(args.poll_seconds)).await;
     }
     Ok(())
+}
+
+fn maybe_notify_canary_decision(
+    health: &CanaryWorkerHealth,
+    args: &CanaryWorkerArgs,
+) -> Result<()> {
+    let Some(command) = args.notify_command.as_deref() else {
+        return Ok(());
+    };
+    let Some(key) = canary_notification_key(health) else {
+        return Ok(());
+    };
+    let mut ledger = read_canary_notify_ledger(&args.notify_ledger)?;
+    if ledger.contains(&key) {
+        return Ok(());
+    }
+    let payload = canary_notification_payload(health, &key)?;
+    execute_notify_command(command, &payload)?;
+    ledger.insert(key);
+    write_canary_notify_ledger(&args.notify_ledger, &ledger)
+}
+
+fn canary_notification_key(health: &CanaryWorkerHealth) -> Option<String> {
+    let decision = health.decision.as_ref()?;
+    if !canary_status_should_notify(&decision.status) {
+        return None;
+    }
+    let action = decision.selected_action.as_ref()?;
+    Some(
+        [
+            decision.status.as_str(),
+            canary_mode_label(decision.mode),
+            action.symbol.as_str(),
+            action.strategy.as_str(),
+            action.entry_date.as_deref().unwrap_or(""),
+            action.expiration.as_deref().unwrap_or(""),
+            &format_optional_f64(action.short_strike),
+            &format_optional_f64(action.long_strike),
+        ]
+        .join("|"),
+    )
+}
+
+fn canary_status_should_notify(status: &str) -> bool {
+    matches!(
+        status,
+        "monitor_ready"
+            | "monitor_risk_blocked"
+            | "monitor_broker_unsupported"
+            | "review_required"
+            | "review_ready"
+            | "review_failed"
+            | "live_submitted"
+            | "live_rejected"
+    )
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.4}")).unwrap_or_default()
+}
+
+fn canary_notification_payload(health: &CanaryWorkerHealth, key: &str) -> Result<String> {
+    let decision = health
+        .decision
+        .as_ref()
+        .context("notification requires canary decision")?;
+    let action = decision
+        .selected_action
+        .as_ref()
+        .context("notification requires selected action")?;
+    let payload = serde_json::json!({
+        "notification_key": key,
+        "checked_at": health.checked_at,
+        "status": decision.status,
+        "mode": canary_mode_label(decision.mode),
+        "reason": decision.reason,
+        "broker_review_ok": decision.broker_review_ok,
+        "action": action,
+    });
+    serde_json::to_string(&payload).context("serialize canary notification payload")
+}
+
+fn execute_notify_command(command: &str, payload: &str) -> Result<()> {
+    let mut child = ProcessCommand::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn notify command {command}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(payload.as_bytes())
+            .context("write notification payload to command stdin")?;
+    }
+    match child
+        .wait_timeout(StdDuration::from_secs(10))
+        .context("wait for notify command")?
+    {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => anyhow::bail!("notify command exited with {status}"),
+        None => {
+            child.kill().ok();
+            child.wait().ok();
+            anyhow::bail!("notify command timed out after 10s")
+        }
+    }
+}
+
+fn read_canary_notify_ledger(path: &Path) -> Result<BTreeSet<String>> {
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("read canary notify ledger {}", path.display()))?;
+    let entries = serde_json::from_str::<Vec<String>>(&body)
+        .with_context(|| format!("parse canary notify ledger {}", path.display()))?;
+    Ok(entries.into_iter().collect())
+}
+
+fn write_canary_notify_ledger(path: &Path, ledger: &BTreeSet<String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("create canary notify ledger directory {}", parent.display())
+        })?;
+    }
+    let entries = ledger.iter().cloned().collect::<Vec<_>>();
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, serde_json::to_string_pretty(&entries)?)
+        .with_context(|| format!("write canary notify ledger temp {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("replace canary notify ledger {}", path.display()))
 }
 
 fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
@@ -6087,6 +6235,8 @@ mod tests {
             mode: CanaryMode::Monitor,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger.json"),
+            notify_command: None,
+            notify_ledger: unique_main_test_path("canary-notify-ledger.json"),
             max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
             poll_seconds: 60,
             once: true,
@@ -6148,6 +6298,8 @@ mod tests {
             mode: CanaryMode::Review,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger-review-required.json"),
+            notify_command: None,
+            notify_ledger: unique_main_test_path("canary-notify-ledger-review-required.json"),
             max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
             poll_seconds: 60,
             once: true,
@@ -6166,6 +6318,74 @@ mod tests {
             Some("review_required")
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canary_notification_sends_once_for_actionable_signal() {
+        let path = unique_main_test_path("canary-worker-notify.json");
+        fs::write(
+            &path,
+            r#"{
+                "status":"canary_only",
+                "decision":{"canary_ready":true,"research_gate":"research_pass"},
+                "latest_actions":[{
+                    "status":"entry_candidate",
+                    "symbol":"ORCL",
+                    "strategy":"call_debit_spread",
+                    "entry_date":"2026-06-28",
+                    "exit_date":"2026-06-28",
+                    "expiration":"2026-07-02",
+                    "short_strike":225.0,
+                    "long_strike":220.0,
+                    "entry_credit":-4.50,
+                    "max_loss":450.0
+                }]
+            }"#,
+        )
+        .unwrap();
+        let payload_path = unique_main_test_path("canary-notify-payload.json");
+        let ledger_path = unique_main_test_path("canary-notify-ledger-once.json");
+        let args = CanaryWorkerArgs {
+            candidate: path.clone(),
+            as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            risk: test_canary_risk(),
+            broker: RobinhoodBrokerAdapter {
+                capabilities: BrokerCapabilities {
+                    single_leg_options: true,
+                    multi_leg_options: true,
+                    stock_option_combos: false,
+                    cash_secured_puts: false,
+                    covered_calls: false,
+                },
+                live_orders_enabled: false,
+            },
+            mode: CanaryMode::Monitor,
+            robinhood_mcp_command: None,
+            order_ledger: unique_main_test_path("canary-order-ledger-notify.json"),
+            notify_command: Some(format!("cat > {}", payload_path.display())),
+            notify_ledger: ledger_path.clone(),
+            max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
+            poll_seconds: 60,
+            once: true,
+            health_output: None,
+            json: true,
+        };
+        let health = canary_worker_health(&args);
+
+        maybe_notify_canary_decision(&health, &args).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&payload_path).unwrap()).unwrap();
+        assert_eq!(payload["status"], "monitor_ready");
+        assert_eq!(payload["action"]["symbol"], "ORCL");
+        assert_eq!(read_canary_notify_ledger(&ledger_path).unwrap().len(), 1);
+
+        let mut skip_args = args;
+        skip_args.notify_command = Some("exit 9".to_owned());
+        maybe_notify_canary_decision(&health, &skip_args).unwrap();
+
+        fs::remove_file(path).unwrap();
+        fs::remove_file(payload_path).unwrap();
+        fs::remove_file(ledger_path).unwrap();
     }
 
     #[test]

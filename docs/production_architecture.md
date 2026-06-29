@@ -115,6 +115,13 @@ for a fresh selected action. The raw `spreadfoundry canary-live-readiness`
 command has the same fail-closed default; use `--allow-blocked` only for
 exploratory reporting where a zero exit code is required despite blockers.
 
+Signal notifications are optional and run after the worker computes its local
+decision. `scripts/canary-service.sh configure-ntfy <topic>` persists
+`SPREAD_CANARY_NOTIFY_COMMAND=scripts/notify-ntfy.sh` and the ntfy topic in
+`var/canary_worker.env`. The worker sends compact JSON to the command on stdin,
+dedupes notifications in `var/canary_notify_ledger.json`, and never lets
+notification delivery failure block monitoring, review, or placement gates.
+
 ### Phase 4: Menubar
 
 Status: implemented.
