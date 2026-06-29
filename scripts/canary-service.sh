@@ -7,6 +7,7 @@ cd "$repo_root"
 pid_file="${SPREAD_CANARY_PID_FILE:-var/canary_worker.pid}"
 health_output="${SPREAD_CANARY_HEALTH_OUTPUT:-var/canary_worker_health.json}"
 log_file="${SPREAD_CANARY_LOG_FILE:-var/canary_worker.log}"
+env_file="${SPREAD_CANARY_ENV_FILE:-var/canary_worker.env}"
 spreadfoundry_bin="${SPREAD_BINARY:-target/release/spreadfoundry}"
 launch_label="com.spreadfoundry.canary-worker"
 launch_domain="gui/$(id -u)"
@@ -24,8 +25,56 @@ read_pid() {
   fi
 }
 
+canary_env_names() {
+  printf '%s\n' \
+    SPREAD_BINARY \
+    SPREAD_CANARY_CANDIDATE \
+    SPREAD_CANARY_ORDER_LEDGER \
+    SPREAD_CANARY_MAX_ORDER_AGE_SECONDS \
+    SPREAD_CANARY_POLL_SECONDS \
+    SPREAD_CANARY_MODE \
+    SPREAD_CANARY_ACCOUNT_CASH \
+    SPREAD_CANARY_DEBIT_MAX_LOSS \
+    SPREAD_CANARY_WHEEL_RESERVE_CAP \
+    SPREAD_CANARY_FREE_CASH_BUFFER \
+    SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL \
+    SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS \
+    SPREAD_CANARY_BROKER_CASH_SECURED_PUTS \
+    SPREAD_CANARY_BROKER_COVERED_CALLS \
+    SPREAD_ROBINHOOD_MCP_COMMAND
+}
+
+load_saved_canary_env() {
+  [[ -f "$env_file" ]] || return 0
+  local line assignment name
+  while IFS= read -r line; do
+    [[ "$line" == export\ SPREAD_* ]] || continue
+    assignment="${line#export }"
+    name="${assignment%%=*}"
+    if [[ "$name" =~ ^SPREAD_[A-Z0-9_]+$ && -z "${!name+x}" ]]; then
+      eval "$line"
+    fi
+  done < "$env_file"
+}
+
+persist_canary_env() {
+  mkdir -p "$(dirname "$env_file")"
+  local tmp_file="${env_file}.tmp"
+  : > "$tmp_file"
+  local env_name
+  while IFS= read -r env_name; do
+    if [[ -n "${!env_name+x}" ]]; then
+      printf 'export %s=%q\n' "$env_name" "${!env_name}" >> "$tmp_file"
+    fi
+  done < <(canary_env_names)
+  mv "$tmp_file" "$env_file"
+}
+
 start_worker() {
   mkdir -p "$(dirname "$pid_file")" "$(dirname "$health_output")" "$(dirname "$log_file")"
+  load_saved_canary_env
+  spreadfoundry_bin="${SPREAD_BINARY:-$spreadfoundry_bin}"
+  persist_canary_env
   local pid
   pid="$(read_pid || true)"
   if is_running "$pid"; then
@@ -81,25 +130,11 @@ set -euo pipefail
 cd "$repo_root"
 echo "\$\$" > "$pid_file"
 EOF
-  for env_name in \
-    SPREAD_CANARY_CANDIDATE \
-    SPREAD_CANARY_ORDER_LEDGER \
-    SPREAD_CANARY_MAX_ORDER_AGE_SECONDS \
-    SPREAD_CANARY_POLL_SECONDS \
-    SPREAD_CANARY_MODE \
-    SPREAD_CANARY_ACCOUNT_CASH \
-    SPREAD_CANARY_DEBIT_MAX_LOSS \
-    SPREAD_CANARY_WHEEL_RESERVE_CAP \
-    SPREAD_CANARY_FREE_CASH_BUFFER \
-    SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL \
-    SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS \
-    SPREAD_CANARY_BROKER_CASH_SECURED_PUTS \
-    SPREAD_CANARY_BROKER_COVERED_CALLS \
-    SPREAD_ROBINHOOD_MCP_COMMAND; do
+  while IFS= read -r env_name; do
     if [[ -n "${!env_name+x}" ]]; then
       printf 'export %s=%q\n' "$env_name" "${!env_name}" >> "$launch_script"
     fi
-  done
+  done < <(canary_env_names)
   cat >> "$launch_script" <<EOF
 export SPREAD_BINARY="$spreadfoundry_bin"
 export SPREAD_CANARY_ONCE=0

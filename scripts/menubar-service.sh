@@ -6,7 +6,7 @@ cd "$repo_root"
 
 pid_file="${SPREAD_MENUBAR_PID_FILE:-var/spreadfoundry_menubar.pid}"
 log_file="${SPREAD_MENUBAR_LOG_FILE:-var/spreadfoundry_menubar.log}"
-menubar_bin="${SPREAD_MENUBAR_BINARY:-apps/SpreadFoundryMenubar/.build/debug/SpreadFoundryMenubar}"
+menubar_bin="${SPREAD_MENUBAR_BINARY:-apps/SpreadFoundryMenubar/.build/release/SpreadFoundryMenubar}"
 launch_label="com.spreadfoundry.menubar"
 launch_domain="gui/$(id -u)"
 launch_script="var/spreadfoundry_menubar_launch.sh"

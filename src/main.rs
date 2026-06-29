@@ -87,7 +87,7 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
-    ShadowLive {
+    MonitorLive {
         #[arg(long)]
         symbol: String,
         #[arg(long, value_enum)]
@@ -660,7 +660,7 @@ async fn main() -> Result<()> {
             StrategyArg::PutSpread => optimize_put_spread(&config, method),
         },
         Commands::TrainRanker { config } => train_ranker(&config),
-        Commands::ShadowLive { symbol, strategy } => shadow_live(&symbol, strategy),
+        Commands::MonitorLive { symbol, strategy } => monitor_live(&symbol, strategy),
         Commands::Report { run } => {
             println!("{}", read_report_markdown(run)?);
             Ok(())
@@ -1365,6 +1365,7 @@ fn portfolio_canary_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_portfolio_canary(
     candidate: &Path,
     as_of: Option<NaiveDate>,
@@ -1520,7 +1521,7 @@ fn portfolio_canary_run_decision(
 ) -> PortfolioCanaryRunDecision {
     if let Err(err) = canary_artifact_ready_for_broker(artifact) {
         return canary_run_decision(
-            "shadow_artifact_blocked",
+            "monitor_artifact_blocked",
             &err.to_string(),
             as_of,
             mode,
@@ -1543,7 +1544,7 @@ fn portfolio_canary_run_decision(
         .collect::<Vec<_>>();
     if fresh_actions.is_empty() {
         return canary_run_decision(
-            "shadow_no_action",
+            "monitor_no_action",
             "no fresh entry_candidate or open_candidate; no broker action",
             as_of,
             mode,
@@ -1563,7 +1564,7 @@ fn portfolio_canary_run_decision(
     });
     let Some(selected) = selected else {
         return canary_run_decision(
-            "shadow_risk_blocked",
+            "monitor_risk_blocked",
             &format!(
                 "fresh action exists, but no action passed per-strategy risk controls: {}",
                 fresh_actions
@@ -1591,7 +1592,7 @@ fn portfolio_canary_run_decision(
 
     if let Err(err) = assert_canary_action_broker_supported(&selected, broker) {
         return canary_run_decision(
-            "shadow_broker_unsupported",
+            "monitor_broker_unsupported",
             &err.to_string(),
             as_of,
             mode,
@@ -1605,7 +1606,7 @@ fn portfolio_canary_run_decision(
     }
     if selected.status == "open_candidate" {
         return canary_run_decision(
-            "shadow_open_candidate_monitor_only",
+            "monitor_open_candidate_only",
             "open_candidate is a backtest position that would already be open; live worker will monitor only and will not submit a catch-up order",
             as_of,
             mode,
@@ -1621,7 +1622,7 @@ fn portfolio_canary_run_decision(
         let today = Utc::now().date_naive();
         if as_of != today {
             return canary_run_decision(
-                "live_order_blocked",
+                "live_blocked",
                 &format!(
                     "live placement requires --as-of to match today's UTC date {today}; got {as_of}"
                 ),
@@ -1639,7 +1640,7 @@ fn portfolio_canary_run_decision(
             canary_artifact_fresh_enough_for_live_order(artifact, max_order_age_seconds)
         {
             return canary_run_decision(
-                "live_order_blocked",
+                "live_blocked",
                 &err.to_string(),
                 as_of,
                 mode,
@@ -1654,7 +1655,7 @@ fn portfolio_canary_run_decision(
     }
     if mode == CanaryMode::Monitor {
         return canary_run_decision(
-            "ready_for_review",
+            "monitor_ready",
             "fresh action passed local artifact, risk, and broker capability gates; mode=monitor so Robinhood review was not requested",
             as_of,
             mode,
@@ -1666,22 +1667,21 @@ fn portfolio_canary_run_decision(
             Some(selected),
         );
     }
-    {
-        return canary_run_decision(
-            "review_required",
-            "broker review/preview has not succeeded; no order can be placed",
-            as_of,
-            mode,
-            risk,
-            broker,
-            false,
-            artifact_exported_at(artifact),
-            max_order_age_seconds,
-            Some(selected),
-        );
-    }
+    canary_run_decision(
+        "review_required",
+        "broker review/preview has not succeeded; no order can be placed",
+        as_of,
+        mode,
+        risk,
+        broker,
+        false,
+        artifact_exported_at(artifact),
+        max_order_age_seconds,
+        Some(selected),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canary_run_decision(
     status: &str,
     reason: &str,
@@ -1781,10 +1781,23 @@ fn canary_action_allowed_by_risk(
                 .get("max_loss")
                 .and_then(|value| value.as_f64())
                 .ok_or_else(|| format!("{strategy} missing max_loss"))?;
+            let order_max_loss = canary_debit_spread_order_max_loss(action, strategy)?;
+            if (order_max_loss - max_loss).abs() > 1.0 {
+                return Err(format!(
+                    "{strategy} max_loss {:.2} does not match order debit risk {:.2}",
+                    max_loss, order_max_loss
+                ));
+            }
             if max_loss <= 0.0 || max_loss > risk.debit_max_loss {
                 return Err(format!(
                     "{strategy} max_loss {:.2} exceeds debit cap {:.2}",
                     max_loss, risk.debit_max_loss
+                ));
+            }
+            if order_max_loss > risk.debit_max_loss {
+                return Err(format!(
+                    "{strategy} order debit risk {:.2} exceeds debit cap {:.2}",
+                    order_max_loss, risk.debit_max_loss
                 ));
             }
         }
@@ -1865,10 +1878,33 @@ fn canary_action_risk(action: &serde_json::Value) -> std::result::Result<CanaryA
         .get("max_loss")
         .and_then(|value| value.as_f64())
         .ok_or_else(|| format!("{strategy} missing max_loss for reserve"))?;
+    if matches!(strategy, "put_debit_spread" | "call_debit_spread") {
+        let order_max_loss = canary_debit_spread_order_max_loss(action, strategy)?;
+        return Ok(CanaryActionRisk {
+            reserve: max_loss.max(order_max_loss),
+            reserve_basis: "max_loss_and_order_debit".to_owned(),
+        });
+    }
     Ok(CanaryActionRisk {
         reserve: max_loss,
         reserve_basis: "max_loss".to_owned(),
     })
+}
+
+fn canary_debit_spread_order_max_loss(
+    action: &serde_json::Value,
+    strategy: &str,
+) -> std::result::Result<f64, String> {
+    let entry_credit = action
+        .get("entry_credit")
+        .and_then(|value| value.as_f64())
+        .ok_or_else(|| format!("{strategy} missing entry_credit for order risk"))?;
+    if !entry_credit.is_finite() || entry_credit >= 0.0 {
+        return Err(format!(
+            "{strategy} entry_credit must be a negative debit for order risk"
+        ));
+    }
+    Ok(entry_credit.abs() * 100.0)
 }
 
 fn canary_action_short_put(action: &serde_json::Value) -> Option<f64> {
@@ -1968,21 +2004,20 @@ fn apply_robinhood_mcp_bridge(
     if !robinhood_mcp_review_matches_order_key(decision.mcp_review.as_ref(), &order_key) {
         decision.status = "review_failed".to_owned();
         decision.reason =
-            "Robinhood MCP review did not echo the expected order_key for the order intent"
-                .to_owned();
+            "Robinhood MCP review did not echo the expected order_key with broker_preview_verified=true for the order intent".to_owned();
         return Ok(());
     }
 
     decision.broker_review_ok = true;
     if decision.mode != CanaryMode::Live {
-        decision.status = "ready_for_manual_approval".to_owned();
+        decision.status = "review_ready".to_owned();
         decision.reason =
             "Robinhood MCP review_option_order succeeded; live placement was not requested"
                 .to_owned();
         return Ok(());
     }
     if action.strategy == "wheel" {
-        decision.status = "ready_for_manual_approval".to_owned();
+        decision.status = "review_ready".to_owned();
         decision.reason = "Robinhood MCP review succeeded, but autonomous wheel placement is blocked until broker buying-power, assignment, and position reconciliation are implemented".to_owned();
         return Ok(());
     }
@@ -1990,7 +2025,7 @@ fn apply_robinhood_mcp_bridge(
     let place_request = robinhood_mcp_option_order_request("place_option_order", &action)?;
     let place_order_key = robinhood_mcp_order_key(&place_request);
     if place_order_key != order_key {
-        decision.status = "live_order_blocked".to_owned();
+        decision.status = "live_blocked".to_owned();
         decision.reason =
             "review and place order keys diverged; refusing live placement".to_owned();
         return Ok(());
@@ -1998,7 +2033,7 @@ fn apply_robinhood_mcp_bridge(
     if let Some(ledger_path) = order_ledger
         && canary_order_ledger_contains(ledger_path, &order_key)?
     {
-        decision.status = "live_order_already_submitted".to_owned();
+        decision.status = "live_already_submitted".to_owned();
         decision.reason =
             "matching Robinhood MCP order intent is already recorded in the local canary ledger"
                 .to_owned();
@@ -2011,10 +2046,10 @@ fn apply_robinhood_mcp_bridge(
     let place_ok = place.ok;
     decision.mcp_place = Some(place);
     if place_ok {
-        decision.status = "live_order_submitted".to_owned();
+        decision.status = "live_submitted".to_owned();
         decision.reason = "Robinhood MCP place_option_order returned success".to_owned();
     } else {
-        decision.status = "live_order_rejected".to_owned();
+        decision.status = "live_rejected".to_owned();
         decision.reason = "Robinhood MCP place_option_order returned a rejection".to_owned();
     }
     Ok(())
@@ -2063,6 +2098,13 @@ fn canary_action_order_intent(action: &CanaryActionSummary) -> Result<OptionOrde
         "put_debit_spread" => {
             let short_strike = require_option_f64(action.short_strike, "short_strike")?;
             let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+            validate_debit_spread_order_bounds(
+                action,
+                "put_debit_spread",
+                short_strike,
+                long_strike,
+                entry_credit.abs(),
+            )?;
             Ok(debit_spread_open_intent(
                 OptionKey::new(
                     symbol,
@@ -2084,6 +2126,13 @@ fn canary_action_order_intent(action: &CanaryActionSummary) -> Result<OptionOrde
         "call_debit_spread" => {
             let short_strike = require_option_f64(action.short_strike, "short_strike")?;
             let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+            validate_debit_spread_order_bounds(
+                action,
+                "call_debit_spread",
+                short_strike,
+                long_strike,
+                entry_credit.abs(),
+            )?;
             Ok(debit_spread_open_intent(
                 OptionKey::new(
                     symbol,
@@ -2104,6 +2153,56 @@ fn canary_action_order_intent(action: &CanaryActionSummary) -> Result<OptionOrde
         }
         other => anyhow::bail!("strategy {other} is not orderable through Robinhood MCP"),
     }
+}
+
+fn validate_debit_spread_order_bounds(
+    action: &CanaryActionSummary,
+    strategy: &str,
+    short_strike: f64,
+    long_strike: f64,
+    entry_debit: f64,
+) -> Result<()> {
+    match strategy {
+        "put_debit_spread" if long_strike <= short_strike => {
+            anyhow::bail!("{strategy} requires long put strike above short put strike");
+        }
+        "call_debit_spread" if long_strike >= short_strike => {
+            anyhow::bail!("{strategy} requires long call strike below short call strike");
+        }
+        _ => {}
+    }
+    let width = (long_strike - short_strike).abs();
+    if entry_debit > width + 0.01 {
+        anyhow::bail!(
+            "{} limit debit {:.2} exceeds strike width {:.2}",
+            strategy,
+            entry_debit,
+            width
+        );
+    }
+    if let Some(exported_width) = action.width
+        && exported_width.is_finite()
+        && exported_width > 0.0
+        && (exported_width - width).abs() > 0.01
+    {
+        anyhow::bail!(
+            "{} width {:.2} does not match strike width {:.2}",
+            strategy,
+            exported_width,
+            width
+        );
+    }
+    if let Some(max_loss) = action.max_loss
+        && (entry_debit * 100.0 - max_loss).abs() > 1.0
+    {
+        anyhow::bail!(
+            "{} max_loss {:.2} does not match order debit risk {:.2}",
+            strategy,
+            max_loss,
+            entry_debit * 100.0
+        );
+    }
+    Ok(())
 }
 
 fn robinhood_mcp_option_order_arguments(
@@ -2209,10 +2308,14 @@ fn robinhood_mcp_review_matches_order_key(
     review: Option<&RobinhoodMcpToolResponse>,
     order_key: &str,
 ) -> bool {
-    review
-        .and_then(|review| review.raw.get("order_key"))
-        .and_then(|value| value.as_str())
-        == Some(order_key)
+    let Some(raw) = review.map(|review| &review.raw) else {
+        return false;
+    };
+    raw.get("order_key").and_then(|value| value.as_str()) == Some(order_key)
+        && raw
+            .get("broker_preview_verified")
+            .and_then(|value| value.as_bool())
+            == Some(true)
 }
 
 fn canary_order_ledger_contains(path: &Path, order_key: &str) -> Result<bool> {
@@ -2379,9 +2482,10 @@ fn build_canary_worker_snapshot(
         .unwrap_or(true);
     let status = snapshot_status(health.as_ref(), worker_running, health_stale);
     let tray_title = match status.as_str() {
-        "ready" => "SF ready",
+        "monitor" => "SF monitor",
+        "review" => "SF review",
         "live" => "SF live",
-        "shadow" => "SF shadow",
+        "blocked" => "SF blocked",
         _ => "SF down",
     }
     .to_owned();
@@ -2535,7 +2639,7 @@ fn broker_capability_summary(health: &CanaryWorkerHealth) -> String {
         capabilities.push("covered calls");
     }
     if capabilities.is_empty() {
-        "shadow-only".to_owned()
+        "monitor-only".to_owned()
     } else {
         capabilities.join(", ")
     }
@@ -2560,8 +2664,8 @@ fn health_age_label(age_seconds: Option<i64>) -> String {
 
 fn snapshot_tone(status: &str) -> &'static str {
     match status {
-        "ready" | "live" => "ok",
-        "shadow" => "warn",
+        "monitor" | "live" => "ok",
+        "review" => "warn",
         _ => "bad",
     }
 }
@@ -2662,18 +2766,7 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
             false
         }
     };
-    let status = if error.is_some() {
-        "unhealthy"
-    } else {
-        match decision.as_ref().map(|decision| decision.status.as_str()) {
-            Some("ready_for_review" | "ready_for_manual_approval" | "review_required") => "ready",
-            Some("live_order_submitted" | "live_order_already_submitted") => "live",
-            Some("review_failed" | "live_order_rejected") => "unhealthy",
-            Some(_) => "shadow",
-            None => "unhealthy",
-        }
-    }
-    .to_owned();
+    let status = canary_worker_aggregate_status(decision.as_ref(), error.as_deref()).to_owned();
     CanaryWorkerHealth {
         checked_at: Utc::now(),
         service: "portfolio_canary_worker".to_owned(),
@@ -2698,13 +2791,32 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
     }
 }
 
+fn canary_worker_aggregate_status(
+    decision: Option<&PortfolioCanaryRunDecision>,
+    error: Option<&str>,
+) -> &'static str {
+    if error.is_some() {
+        return "unhealthy";
+    }
+    match decision.map(|decision| decision.status.as_str()) {
+        Some("monitor_ready" | "monitor_no_action" | "monitor_open_candidate_only") => "monitor",
+        Some("review_required" | "review_ready") => "review",
+        Some("live_submitted" | "live_already_submitted") => "live",
+        Some("review_failed" | "live_rejected") | None => "unhealthy",
+        Some(_) => "blocked",
+    }
+}
+
 fn write_canary_worker_health(path: &Path, health: &CanaryWorkerHealth) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create health output directory {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_string_pretty(health)?)
-        .with_context(|| format!("write canary worker health {}", path.display()))
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, serde_json::to_string_pretty(health)?)
+        .with_context(|| format!("write canary worker health temp {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("replace canary worker health {}", path.display()))
 }
 
 fn canary_broker(
@@ -3166,18 +3278,18 @@ fn train_ranker(config: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shadow_live(symbol: &str, strategy: StrategyArg) -> Result<()> {
+fn monitor_live(symbol: &str, strategy: StrategyArg) -> Result<()> {
     let broker = RobinhoodBrokerAdapter::default();
     match strategy {
         StrategyArg::PutSpread => {
             if let Err(err) = broker.assert_credit_spread_live_supported() {
-                println!("{symbol} put-spread shadow-live is data-only for now: {err}");
+                println!("{symbol} put-spread monitor-live is data-only for now: {err}");
                 println!("No orders placed.");
                 return Ok(());
             }
         }
     }
-    println!("{symbol} shadow-live adapter is not connected yet. No orders placed.");
+    println!("{symbol} monitor-live adapter is not connected yet. No orders placed.");
     Ok(())
 }
 
@@ -4745,7 +4857,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_runner_returns_shadow_when_stale() {
+    fn portfolio_canary_runner_returns_monitor_when_stale() {
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"entry_candidate",
             "symbol":"CRWV",
@@ -4765,7 +4877,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "shadow_no_action");
+        assert_eq!(decision.status, "monitor_no_action");
         assert!(decision.selected_action.is_none());
     }
 
@@ -4805,7 +4917,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "shadow_risk_blocked");
+        assert_eq!(decision.status, "monitor_risk_blocked");
         assert_eq!(
             decision
                 .selected_action
@@ -4823,6 +4935,10 @@ mod tests {
             "strategy":"put_debit_spread",
             "entry_date":"2026-06-28",
             "exit_date":"2026-06-28",
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-3.35,
             "max_loss":335.0
         }]));
         let broker = RobinhoodBrokerAdapter::default();
@@ -4836,7 +4952,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "shadow_broker_unsupported");
+        assert_eq!(decision.status, "monitor_broker_unsupported");
         assert_eq!(
             decision
                 .selected_action
@@ -4844,6 +4960,44 @@ mod tests {
                 .map(|action| action.strategy.as_str()),
             Some("put_debit_spread")
         );
+    }
+
+    #[test]
+    fn portfolio_canary_runner_blocks_debit_when_order_debit_exceeds_exported_max_loss() {
+        let artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"TSLA",
+            "strategy":"put_debit_spread",
+            "entry_date":"2026-06-28",
+            "exit_date":"2026-06-28",
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-3.35,
+            "max_loss":100.0
+        }]));
+        let broker = RobinhoodBrokerAdapter {
+            capabilities: BrokerCapabilities {
+                single_leg_options: true,
+                multi_leg_options: true,
+                stock_option_combos: false,
+                cash_secured_puts: false,
+                covered_calls: false,
+            },
+            live_orders_enabled: false,
+        };
+
+        let decision = portfolio_canary_run_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            CanaryMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "monitor_risk_blocked");
+        assert!(decision.reason.contains("does not match order debit risk"));
     }
 
     #[test]
@@ -4856,6 +5010,10 @@ mod tests {
             "strategy":"put_debit_spread",
             "entry_date":today_s,
             "exit_date":today_s,
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-1.00,
             "max_loss":100.0
         }]));
         let broker = RobinhoodBrokerAdapter {
@@ -4895,6 +5053,10 @@ mod tests {
             "strategy":"put_debit_spread",
             "entry_date":historical_s,
             "exit_date":historical_s,
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-1.00,
             "max_loss":100.0
         }]));
         let broker = RobinhoodBrokerAdapter {
@@ -4917,7 +5079,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "live_order_blocked");
+        assert_eq!(decision.status, "live_blocked");
         assert!(decision.reason.contains("today's UTC date"));
     }
 
@@ -4946,7 +5108,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "shadow_artifact_blocked");
+        assert_eq!(decision.status, "monitor_artifact_blocked");
         assert!(decision.selected_action.is_none());
     }
 
@@ -4987,7 +5149,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "live_order_blocked");
+        assert_eq!(decision.status, "live_blocked");
         assert!(decision.reason.contains("artifact age"));
     }
 
@@ -5011,6 +5173,10 @@ mod tests {
             "strategy":"call_debit_spread",
             "entry_date":"2026-06-26",
             "exit_date":"2026-06-30",
+            "expiration":"2026-07-02",
+            "short_strike":225.0,
+            "long_strike":220.0,
+            "entry_credit":-4.50,
             "max_loss":450.0
         }]));
         let broker = RobinhoodBrokerAdapter {
@@ -5033,7 +5199,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "shadow_open_candidate_monitor_only");
+        assert_eq!(decision.status, "monitor_open_candidate_only");
         assert_eq!(
             decision
                 .selected_action
@@ -5044,7 +5210,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_runner_reaches_ready_for_review_in_monitor_mode() {
+    fn portfolio_canary_runner_reaches_monitor_ready_in_monitor_mode() {
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"entry_candidate",
             "symbol":"ORCL",
@@ -5077,7 +5243,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "ready_for_review");
+        assert_eq!(decision.status, "monitor_ready");
     }
 
     #[test]
@@ -5145,6 +5311,31 @@ mod tests {
     }
 
     #[test]
+    fn robinhood_mcp_order_arguments_rejects_debit_above_spread_width() {
+        let action = CanaryActionSummary {
+            status: "entry_candidate".to_owned(),
+            symbol: "ORCL".to_owned(),
+            strategy: "call_debit_spread".to_owned(),
+            entry_date: Some("2026-06-28".to_owned()),
+            exit_date: Some("2026-06-28".to_owned()),
+            expiration: Some("2026-07-02".to_owned()),
+            short_put: None,
+            short_strike: Some(225.0),
+            long_strike: Some(220.0),
+            width: Some(5.0),
+            entry_credit: Some(-6.00),
+            max_loss: Some(600.0),
+            reserve: Some(600.0),
+            reserve_basis: Some("max_loss_and_order_debit".to_owned()),
+            pnl: None,
+        };
+
+        let err = robinhood_mcp_option_order_request("review_option_order", &action).unwrap_err();
+
+        assert!(format!("{err:#}").contains("exceeds strike width"));
+    }
+
+    #[test]
     fn robinhood_mcp_order_arguments_rejects_open_candidate() {
         let action = CanaryActionSummary {
             status: "open_candidate".to_owned(),
@@ -5167,6 +5358,60 @@ mod tests {
         let err = robinhood_mcp_option_order_request("review_option_order", &action).unwrap_err();
 
         assert!(format!("{err:#}").contains("entry_candidate"));
+    }
+
+    #[test]
+    fn robinhood_mcp_bridge_rejects_review_without_verified_preview_flag() {
+        let artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"ORCL",
+            "strategy":"call_debit_spread",
+            "entry_date":"2026-06-28",
+            "exit_date":"2026-06-28",
+            "expiration":"2026-07-02",
+            "short_strike":225.0,
+            "long_strike":220.0,
+            "entry_credit":-4.50,
+            "max_loss":450.0
+        }]));
+        let broker = RobinhoodBrokerAdapter {
+            capabilities: BrokerCapabilities {
+                single_leg_options: true,
+                multi_leg_options: true,
+                stock_option_combos: false,
+                cash_secured_puts: false,
+                covered_calls: false,
+            },
+            live_orders_enabled: false,
+        };
+        let mut decision = portfolio_canary_run_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            CanaryMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let action = decision.selected_action.clone().unwrap();
+        let expected_key = robinhood_mcp_order_key(
+            &robinhood_mcp_option_order_request("review_option_order", &action).unwrap(),
+        );
+        let response = serde_json::json!({
+            "ok": true,
+            "tool": "review_option_order",
+            "raw": {"order_key": expected_key}
+        })
+        .to_string();
+
+        apply_robinhood_mcp_bridge(
+            &mut decision,
+            Some(&format!("cat >/dev/null; printf '%s\\n' '{}'", response)),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(decision.status, "review_failed");
+        assert!(!decision.broker_review_ok);
     }
 
     #[test]
@@ -5208,7 +5453,7 @@ mod tests {
         let response = serde_json::json!({
             "ok": true,
             "tool": "review_option_order",
-            "raw": {"preview": "ok", "order_key": expected_key}
+            "raw": {"preview": "ok", "order_key": expected_key, "broker_preview_verified": true}
         })
         .to_string();
         apply_robinhood_mcp_bridge(
@@ -5218,7 +5463,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision.status, "ready_for_manual_approval");
+        assert_eq!(decision.status, "review_ready");
         assert!(decision.broker_review_ok);
         assert_eq!(
             decision
@@ -5269,7 +5514,7 @@ mod tests {
         let response = serde_json::json!({
             "ok": true,
             "tool": "review_option_order",
-            "raw": {"order_key": expected_key}
+            "raw": {"order_key": expected_key, "broker_preview_verified": true}
         })
         .to_string();
 
@@ -5280,7 +5525,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision.status, "ready_for_manual_approval");
+        assert_eq!(decision.status, "review_ready");
         assert!(decision.mcp_place.is_none());
         assert!(decision.reason.contains("wheel placement is blocked"));
     }
@@ -5328,7 +5573,7 @@ mod tests {
         let review_response = serde_json::json!({
             "ok": true,
             "tool": "review_option_order",
-            "raw": {"order_key": expected_key}
+            "raw": {"order_key": expected_key, "broker_preview_verified": true}
         })
         .to_string();
         let place_response = serde_json::json!({
@@ -5353,8 +5598,8 @@ mod tests {
         );
         apply_robinhood_mcp_bridge(&mut second, Some(command.as_str()), Some(&ledger)).unwrap();
 
-        assert_eq!(first.status, "live_order_submitted");
-        assert_eq!(second.status, "live_order_already_submitted");
+        assert_eq!(first.status, "live_submitted");
+        assert_eq!(second.status, "live_already_submitted");
         fs::remove_file(ledger).unwrap();
     }
 
@@ -5389,7 +5634,7 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "ready_for_review");
+        assert_eq!(decision.status, "monitor_ready");
         assert_eq!(
             decision
                 .selected_action
@@ -5400,7 +5645,7 @@ mod tests {
     }
 
     #[test]
-    fn canary_worker_health_reports_shadow_without_action() {
+    fn canary_worker_health_reports_monitor_without_action() {
         let path = unique_main_test_path("canary-worker-no-action.json");
         fs::write(
             &path,
@@ -5428,13 +5673,74 @@ mod tests {
 
         let health = canary_worker_health(&args);
 
-        assert_eq!(health.status, "shadow");
+        assert_eq!(health.status, "monitor");
         assert_eq!(
             health
                 .decision
                 .as_ref()
                 .map(|decision| decision.status.as_str()),
-            Some("shadow_no_action")
+            Some("monitor_no_action")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canary_worker_health_reports_review_before_broker_review_succeeds() {
+        let path = unique_main_test_path("canary-worker-review-required.json");
+        fs::write(
+            &path,
+            r#"{
+                "status":"canary_only",
+                "exported_at":"2026-06-28T12:00:00Z",
+                "decision":{"canary_ready":true,"research_gate":"research_pass"},
+                "latest_actions":[{
+                    "status":"entry_candidate",
+                    "symbol":"ORCL",
+                    "strategy":"call_debit_spread",
+                    "entry_date":"2026-06-28",
+                    "exit_date":"2026-06-28",
+                    "expiration":"2026-07-02",
+                    "short_strike":225.0,
+                    "long_strike":220.0,
+                    "entry_credit":-4.50,
+                    "max_loss":450.0
+                }]
+            }"#,
+        )
+        .unwrap();
+        let args = CanaryWorkerArgs {
+            candidate: path.clone(),
+            as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            risk: test_canary_risk(),
+            broker: RobinhoodBrokerAdapter {
+                capabilities: BrokerCapabilities {
+                    single_leg_options: true,
+                    multi_leg_options: true,
+                    stock_option_combos: false,
+                    cash_secured_puts: false,
+                    covered_calls: false,
+                },
+                live_orders_enabled: false,
+            },
+            mode: CanaryMode::Review,
+            robinhood_mcp_command: None,
+            order_ledger: unique_main_test_path("canary-order-ledger-review-required.json"),
+            max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
+            poll_seconds: 60,
+            once: true,
+            health_output: None,
+            json: true,
+        };
+
+        let health = canary_worker_health(&args);
+
+        assert_eq!(health.status, "review");
+        assert_eq!(
+            health
+                .decision
+                .as_ref()
+                .map(|decision| decision.status.as_str()),
+            Some("review_required")
         );
         fs::remove_file(path).unwrap();
     }

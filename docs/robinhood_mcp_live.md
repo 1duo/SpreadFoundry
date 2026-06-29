@@ -38,8 +38,9 @@ Set `SPREAD_ROBINHOOD_MCP_COMMAND` to a command that:
 1. Reads one JSON object from stdin.
 2. Calls the requested Robinhood MCP tool.
 3. Writes one JSON object to stdout.
-4. For `review_option_order`, validates the Robinhood preview and echoes the
-   supplied order intent as `raw.order_key`.
+4. For `review_option_order`, validates the Robinhood preview, echoes the
+   supplied order intent as `raw.order_key`, and returns
+   `raw.broker_preview_verified=true`.
 
 Input shape:
 
@@ -67,19 +68,21 @@ Output shape:
   "ok": true,
   "tool": "review_option_order",
   "raw": {
-    "order_key": "{\"server\":\"robinhood-trading\",\"arguments\":{...}}"
+    "order_key": "{\"server\":\"robinhood-trading\",\"arguments\":{...}}",
+    "broker_preview_verified": true
   }
 }
 ```
 
 If `ok` is false, the runner records `review_failed` or
-`live_order_rejected` and stops.
+`live_rejected` and stops.
 
 The runner refuses autonomous placement unless the review response echoes the
-same deterministic `order_key` that would be used for placement. This binds
-review and place to the same local order intent. The bridge should only echo the
-key after checking Robinhood's previewed legs, side, strike, expiration,
-quantity, limit price, and buying-power/max-loss terms against the request.
+same deterministic `order_key` that would be used for placement and marks the
+broker preview as verified. This binds review and place to the same local order
+intent. The bridge should only set that flag after checking Robinhood's
+previewed legs, side, strike, expiration, quantity, limit price, and
+buying-power/max-loss terms against the request.
 
 The local ledger defaults to `var/canary_order_ledger.json`. The runner writes
 the ledger before calling `place_option_order`, so a restart after a broker call
@@ -129,8 +132,8 @@ include `exported_at`; placement is blocked when that timestamp is older than
 `SPREAD_CANARY_MAX_ORDER_AGE_SECONDS`, default `1800`.
 
 Autonomous placement also requires the runner `--as-of` date to match today's
-UTC date. Historical reruns can still review and shadow-monitor, but they cannot
-submit live orders.
+UTC date. Historical reruns can still review and monitor, but they cannot submit
+live orders.
 
 Only same-day `entry_candidate` actions are orderable. `open_candidate` is
 monitor-only because it represents a position that would already be open in the

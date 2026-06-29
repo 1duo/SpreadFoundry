@@ -74,10 +74,8 @@ enum MenubarIcon {
 
     private static func statusColor(_ status: String) -> NSColor {
         switch status {
-        case "ready", "live":
+        case "monitor", "review", "live":
             return NSColor(red: 0.03, green: 0.78, blue: 0.36, alpha: 1.0)
-        case "shadow":
-            return NSColor(red: 0.15, green: 0.72, blue: 0.38, alpha: 1.0)
         default:
             return NSColor(red: 0.95, green: 0.23, blue: 0.27, alpha: 1.0)
         }

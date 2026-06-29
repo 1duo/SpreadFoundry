@@ -49,9 +49,10 @@ pub const DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AMD,META,AMZN,AAPL,
 pub const DEFAULT_WEEKLY_RESEARCH_SYMBOLS: [&str; 5] = ["IREN", "PLTR", "ORCL", "TSLA", "CRWV"];
 pub const DEFAULT_WEEKLY_RESEARCH_SYMBOLS_CSV: &str = "IREN,PLTR,ORCL,TSLA,CRWV";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResearchProfileFamily {
+    #[default]
     Swing,
     Weekly,
     WeeklyFarOtm,
@@ -59,12 +60,6 @@ pub enum ResearchProfileFamily {
     WeeklyCallCredit,
     WeeklyCallDebit,
     WeeklyWheel,
-}
-
-impl Default for ResearchProfileFamily {
-    fn default() -> Self {
-        Self::Swing
-    }
 }
 
 impl ResearchProfileFamily {
@@ -81,20 +76,15 @@ impl ResearchProfileFamily {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpreadStructure {
+    #[default]
     PutCreditSpread,
     CallCreditSpread,
     PutDebitSpread,
     CallDebitSpread,
     Wheel,
-}
-
-impl Default for SpreadStructure {
-    fn default() -> Self {
-        Self::PutCreditSpread
-    }
 }
 
 impl SpreadStructure {
@@ -4916,7 +4906,7 @@ fn plateau_status_from_counts(
             "live_gate_passed",
             false,
             "detector and execution strategy both passed deployment gates",
-            "review shadow-live readiness before any broker integration",
+            "review monitor-live readiness before any broker integration",
         )
     } else if deployment_gate.best_profile_gate
         && !deployment_gate.walk_forward_oos_gate
@@ -5408,6 +5398,7 @@ fn weekly_call_credit_research_profiles() -> Vec<ResearchProfile> {
     profiles
 }
 
+#[allow(clippy::single_element_loop)]
 fn weekly_put_debit_research_profiles() -> Vec<ResearchProfile> {
     let baseline = ResearchProfile::weekly_put_debit_baseline();
     let mut profiles = Vec::new();
@@ -5585,6 +5576,7 @@ fn weekly_put_debit_research_profiles() -> Vec<ResearchProfile> {
     profiles
 }
 
+#[allow(clippy::single_element_loop)]
 fn weekly_call_debit_research_profiles() -> Vec<ResearchProfile> {
     let baseline = ResearchProfile::weekly_call_debit_baseline();
     let mut profiles = Vec::new();
@@ -8092,6 +8084,7 @@ async fn load_expiration_rows_for_mode(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_expiration_rows_for_mode_with_cache_mode(
     symbol: &str,
     expiration: NaiveDate,
@@ -8167,6 +8160,7 @@ async fn load_expiration_rows_for_mode_with_cache_mode(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_expiration_rows(
     symbol: &str,
     expiration: NaiveDate,
@@ -8210,6 +8204,7 @@ async fn load_expiration_rows(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_greeks_rows(
     symbol: &str,
     expiration: NaiveDate,
@@ -8269,6 +8264,7 @@ async fn load_greeks_rows(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_open_interest_map(
     symbol: &str,
     expiration: NaiveDate,
@@ -8378,6 +8374,8 @@ fn extend_oi_map_for_window(
     Ok(())
 }
 
+type CachedOptionSources = Vec<(PathBuf, Arc<Value>)>;
+
 fn read_option_cache_sequence(
     raw_dir: &Path,
     exp: &str,
@@ -8385,7 +8383,7 @@ fn read_option_cache_sequence(
     end: NaiveDate,
     option_right: OptionRight,
     dataset: CachedOptionDataset,
-) -> Result<Option<Vec<(PathBuf, Arc<Value>)>>> {
+) -> Result<Option<CachedOptionSources>> {
     let windows =
         cached_option_cache_covering_sequence(raw_dir, exp, start, end, option_right, dataset)?;
     if windows.is_empty() {
@@ -8605,7 +8603,7 @@ fn option_cache_covering_sequence_from_windows(
     let mut cursor = start;
     let mut selected = Vec::new();
     while cursor <= end {
-        let Some(best) = windows
+        let best = windows
             .iter()
             .filter(|window| window.start <= cursor && window.end >= cursor)
             .max_by(|a, b| {
@@ -8618,10 +8616,7 @@ fn option_cache_covering_sequence_from_windows(
                     })
                     .then_with(|| b.start.cmp(&a.start))
                     .then_with(|| b.path.cmp(&a.path))
-            })
-        else {
-            return None;
-        };
+            })?;
         selected.push(best.clone());
         cursor = best.end + Duration::days(1);
     }
@@ -9990,7 +9985,7 @@ fn simulate_wheel_candidate(
 
     let mark_date = forced_stock_exit_date;
     let mark_price = underlying_on_or_before(underlying_by_date, mark_date)
-        .or_else(|| Some(expiration_put.underlying_price))?;
+        .or(Some(expiration_put.underlying_price))?;
     let pnl_per_share = candidate.credit + total_call_credit + mark_price - assigned_strike;
     Some(
         build_wheel_trade(
@@ -10096,6 +10091,7 @@ impl WheelTradeDetails for ResearchTrade {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_wheel_trade(
     candidate: &Candidate,
     exit_date: NaiveDate,
@@ -11744,7 +11740,7 @@ fn professional_options_review(report: &ResearchReport) -> Vec<String> {
         format_exit_reasons(&best_metrics.exit_reasons)
     ));
     if report.deployment_gate.pass {
-        lines.push("Decision: profile passes research gates; next review should be broker, liquidity, sizing, and shadow-live readiness.".to_owned());
+        lines.push("Decision: profile passes research gates; next review should be broker, liquidity, sizing, and monitor-live readiness.".to_owned());
     } else if report.deployment_gate.best_profile_gate
         && !report.deployment_gate.walk_forward_oos_gate
         && !report.deployment_gate.holdout_oos_gate

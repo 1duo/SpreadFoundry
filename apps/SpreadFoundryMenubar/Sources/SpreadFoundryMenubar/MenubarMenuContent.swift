@@ -87,9 +87,9 @@ struct MenubarMenuContent: View {
 
     private var statusTone: String {
         switch viewModel.snapshot.status {
-        case "ready", "live":
+        case "monitor", "live":
             return "ok"
-        case "shadow":
+        case "review":
             return "warn"
         default:
             return "bad"

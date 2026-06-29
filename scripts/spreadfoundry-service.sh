@@ -19,7 +19,6 @@ case "${1:-status}" in
     ;;
   status)
     "$repo_root/scripts/canary-service.sh" status
-    "$repo_root/scripts/menubar-service.sh" status
     ;;
   *)
     echo "usage: $0 {start|stop|restart|status}" >&2

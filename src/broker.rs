@@ -95,9 +95,7 @@ impl RobinhoodBrokerAdapter {
 
     pub fn assert_live_orders_enabled(&self) -> anyhow::Result<()> {
         if !self.live_orders_enabled {
-            anyhow::bail!(
-                "live order placement is disabled; use shadow-live until explicit rollout gates pass"
-            );
+            anyhow::bail!("live order placement is disabled until explicit rollout gates pass");
         }
         Ok(())
     }

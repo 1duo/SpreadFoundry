@@ -125,9 +125,9 @@ Commands:
 
 ```bash
 cd apps/SpreadFoundryMenubar
-swift build
+swift build -c release
 cargo build --release
-SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run SpreadFoundryMenubar
+SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run -c release SpreadFoundryMenubar
 ```
 
 The app renders the Rust snapshot and exposes only `Refresh`, `Start`, `Stop`,

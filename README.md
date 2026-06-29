@@ -17,7 +17,7 @@ cargo test
 cargo run -- simulate --strategy put-spread --config configs/nvda_put_spread.toml
 cargo run -- optimize --strategy put-spread --config configs/nvda_opt.toml --method grid
 cargo run -- train-ranker --config configs/nvda_ranker.toml
-cargo run -- shadow-live --symbol NVDA --strategy put-spread
+cargo run -- monitor-live --symbol NVDA --strategy put-spread
 cargo run -- research-nvda --from 2010-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 cargo run -- research-symbol --symbol AAPL --from 2010-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4
 cargo run -- research-universe --plateau-run runs/<nvda-run>/research.json --from 2010-01-01 --to 2026-06-18 --max-expirations 48 --fetch-concurrency 4 --symbol-concurrency 4
