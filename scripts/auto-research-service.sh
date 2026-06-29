@@ -18,6 +18,16 @@ is_running() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+terminate_process_tree() {
+  local root_pid="$1"
+  local signal="${2:-TERM}"
+  local child_pid
+  while IFS= read -r child_pid; do
+    [[ -n "$child_pid" ]] && terminate_process_tree "$child_pid" "$signal"
+  done < <(pgrep -P "$root_pid" 2>/dev/null || true)
+  kill "-$signal" "$root_pid" 2>/dev/null || true
+}
+
 read_pid() {
   if [[ -f "$pid_file" ]]; then
     tr -d '[:space:]' < "$pid_file"
@@ -33,6 +43,7 @@ auto_research_env_names() {
     SPREAD_AUTO_RESEARCH_LOG_FILE \
     SPREAD_CANARY_REFRESH_STATE_FILE \
     SPREAD_CANARY_REFRESH_MARKET_WINDOW_ONLY \
+    SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS \
     SPREAD_CANARY_REFRESH_START_MINUTE_ET \
     SPREAD_CANARY_REFRESH_END_MINUTE_ET \
     SPREAD_CANARY_CANDIDATE \
@@ -86,6 +97,7 @@ configure_canary_refresh() {
   export SPREAD_AUTO_RESEARCH_COMMAND="${SPREAD_AUTO_RESEARCH_COMMAND:-$repo_root/scripts/refresh-canary-artifact.sh}"
   export SPREAD_AUTO_RESEARCH_INTERVAL_SECONDS="${SPREAD_AUTO_RESEARCH_INTERVAL_SECONDS:-300}"
   export SPREAD_CANARY_REFRESH_MARKET_WINDOW_ONLY="${SPREAD_CANARY_REFRESH_MARKET_WINDOW_ONLY:-1}"
+  export SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS="${SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS:-900}"
   export SPREAD_SELECTOR_FROM="${SPREAD_SELECTOR_FROM:-2016-01-01}"
   export SPREAD_SELECTOR_SYMBOLS="${SPREAD_SELECTOR_SYMBOLS:-IREN,PLTR,ORCL,TSLA,CRWV,AMD}"
   export SPREAD_SELECTOR_FETCH_CONCURRENCY="${SPREAD_SELECTOR_FETCH_CONCURRENCY:-4}"
@@ -128,17 +140,21 @@ start_research() {
 }
 
 stop_research() {
+  local pid
+  pid="$(read_pid || true)"
+  if is_running "$pid"; then
+    terminate_process_tree "$pid" TERM
+  fi
   if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout "$launch_domain/$launch_label" >/dev/null 2>&1 || true
   fi
-  local pid
   pid="$(read_pid || true)"
   if ! is_running "$pid"; then
     rm -f "$pid_file"
     echo "auto research stopped"
     return 0
   fi
-  kill "$pid" 2>/dev/null || true
+  terminate_process_tree "$pid" TERM
   for _ in {1..20}; do
     if ! is_running "$pid"; then
       rm -f "$pid_file"
@@ -147,7 +163,7 @@ stop_research() {
     fi
     sleep 0.5
   done
-  kill -9 "$pid" 2>/dev/null || true
+  terminate_process_tree "$pid" KILL
   rm -f "$pid_file"
   echo "force-stopped auto research pid=$pid"
 }
@@ -213,6 +229,13 @@ status_research() {
   if [[ -n "${SPREAD_AUTO_RESEARCH_COMMAND:-}" ]]; then
     echo "command=$SPREAD_AUTO_RESEARCH_COMMAND"
     echo "interval_seconds=${SPREAD_AUTO_RESEARCH_INTERVAL_SECONDS:-21600}"
+  fi
+  local refresh_state_file="${SPREAD_CANARY_REFRESH_STATE_FILE:-var/canary_refresh_last.json}"
+  if [[ -f "$refresh_state_file" ]]; then
+    echo "refresh_state=$refresh_state_file"
+    cat "$refresh_state_file"
+  else
+    echo "no refresh state file at $refresh_state_file"
   fi
 }
 

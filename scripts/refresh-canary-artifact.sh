@@ -8,6 +8,7 @@ spreadfoundry_bin="${SPREAD_BINARY:-target/release/spreadfoundry}"
 state_file="${SPREAD_CANARY_REFRESH_STATE_FILE:-var/canary_refresh_last.json}"
 candidate_output="${SPREAD_CANARY_CANDIDATE:-candidates/weekly_selector_canary.json}"
 market_window_only="${SPREAD_CANARY_REFRESH_MARKET_WINDOW_ONLY:-1}"
+refresh_timeout_seconds="${SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS:-900}"
 run_to="${SPREAD_CANARY_REFRESH_TO:-$(date -u '+%Y-%m-%d')}"
 selector_from="${SPREAD_SELECTOR_FROM:-2016-01-01}"
 selector_symbols="${SPREAD_SELECTOR_SYMBOLS:-IREN,PLTR,ORCL,TSLA,CRWV,AMD}"
@@ -63,7 +64,59 @@ run_spreadfoundry() {
   fi
 }
 
+terminate_process_tree() {
+  local root_pid="$1"
+  local signal="${2:-TERM}"
+  local child_pid
+  while IFS= read -r child_pid; do
+    [[ -n "$child_pid" ]] && terminate_process_tree "$child_pid" "$signal"
+  done < <(pgrep -P "$root_pid" 2>/dev/null || true)
+  kill "-$signal" "$root_pid" 2>/dev/null || true
+}
+
+run_research_with_timeout() {
+  local output_file="$1"
+  shift
+  local timed_out_file="${output_file}.timed_out"
+  local child_pid watchdog_pid exit_code
+  rm -f "$timed_out_file"
+
+  run_spreadfoundry "$@" > "$output_file" 2>&1 &
+  child_pid="$!"
+  (
+    sleep "$refresh_timeout_seconds"
+    if kill -0 "$child_pid" 2>/dev/null; then
+      : > "$timed_out_file"
+      terminate_process_tree "$child_pid" TERM
+      sleep 5
+      if kill -0 "$child_pid" 2>/dev/null; then
+        terminate_process_tree "$child_pid" KILL
+      fi
+    fi
+  ) &
+  watchdog_pid="$!"
+
+  wait "$child_pid"
+  exit_code="$?"
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  cat "$output_file"
+
+  if [[ -f "$timed_out_file" ]]; then
+    rm -f "$timed_out_file"
+    return 124
+  fi
+  return "$exit_code"
+}
+
 started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+if ! [[ "$refresh_timeout_seconds" =~ ^[0-9]+$ ]] || [[ "$refresh_timeout_seconds" -le 0 ]]; then
+  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  write_state "configuration_error" 2 "$started_at" "$finished_at" "" "SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS must be a positive integer"
+  echo "SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
 
 if [[ "$market_window_only" == "1" ]] && ! within_market_window; then
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -71,6 +124,8 @@ if [[ "$market_window_only" == "1" ]] && ! within_market_window; then
   echo "canary refresh skipped: outside configured regular-market refresh window"
   exit 0
 fi
+
+write_state "running" 0 "$started_at" "" "" "portfolio selector research in progress"
 
 research_args=(
   research-portfolio-selector
@@ -112,11 +167,21 @@ fi
 
 tmp_output="$(mktemp "${TMPDIR:-/tmp}/spreadfoundry-refresh.XXXXXX")"
 set +e
-run_spreadfoundry "${research_args[@]}" | tee "$tmp_output"
-research_code="${PIPESTATUS[0]}"
+run_research_with_timeout "$tmp_output" "${research_args[@]}"
+research_code="$?"
 set -e
-run_dir="$(tail -n 1 "$tmp_output" | tr -d '[:space:]')"
+run_dir=""
+if [[ "$research_code" -eq 0 ]]; then
+  run_dir="$(tail -n 1 "$tmp_output" | tr -d '[:space:]')"
+fi
 rm -f "$tmp_output"
+
+if [[ "$research_code" -eq 124 ]]; then
+  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  write_state "research_timeout" 124 "$started_at" "$finished_at" "$run_dir" "portfolio selector research exceeded ${refresh_timeout_seconds}s timeout"
+  echo "canary refresh timed out after ${refresh_timeout_seconds}s"
+  exit 0
+fi
 
 if [[ "$research_code" -ne 0 ]]; then
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

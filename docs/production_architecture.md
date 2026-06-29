@@ -173,6 +173,10 @@ Status: implemented as an opt-in canary refresh service.
   artifact untouched.
 - The default refresh loop is regular-market-window gated and reruns every
   `300` seconds after `scripts/auto-research-service.sh configure-canary`.
+- Each selector refresh has a process-level watchdog, default
+  `SPREAD_CANARY_REFRESH_TIMEOUT_SECONDS=900`. A timeout records
+  `research_timeout`, kills the refresh process tree, leaves the prior artifact
+  untouched, and lets the loop retry on the next interval.
 
 Success criteria:
 
