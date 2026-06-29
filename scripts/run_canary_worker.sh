@@ -14,7 +14,7 @@ debit_max_loss="${SPREAD_CANARY_DEBIT_MAX_LOSS:-1000}"
 wheel_reserve_cap="${SPREAD_CANARY_WHEEL_RESERVE_CAP:-35000}"
 free_cash_buffer="${SPREAD_CANARY_FREE_CASH_BUFFER:-11250}"
 max_wheel_positions_per_symbol="${SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL:-1}"
-spreadfoundry_bin="${SPREAD_BINARY:-target/debug/spreadfoundry}"
+spreadfoundry_bin="${SPREAD_BINARY:-target/release/spreadfoundry}"
 
 cli_args=(
   canary-worker
@@ -60,4 +60,4 @@ if [[ -x "$spreadfoundry_bin" ]]; then
   exec "$spreadfoundry_bin" "${cli_args[@]}"
 fi
 
-exec cargo run --quiet -- "${cli_args[@]}"
+exec cargo run --quiet --release -- "${cli_args[@]}"

@@ -7,7 +7,7 @@ cd "$repo_root"
 pid_file="${SPREAD_CANARY_PID_FILE:-var/canary_worker.pid}"
 health_output="${SPREAD_CANARY_HEALTH_OUTPUT:-var/canary_worker_health.json}"
 log_file="${SPREAD_CANARY_LOG_FILE:-var/canary_worker.log}"
-spreadfoundry_bin="${SPREAD_BINARY:-target/debug/spreadfoundry}"
+spreadfoundry_bin="${SPREAD_BINARY:-target/release/spreadfoundry}"
 
 is_running() {
   local pid="$1"
@@ -68,7 +68,7 @@ snapshot_worker() {
       --pid-file "$pid_file" \
       --json
   else
-    cargo run --quiet -- canary-worker-snapshot \
+    cargo run --quiet --release -- canary-worker-snapshot \
       --health-output "$health_output" \
       --pid-file "$pid_file" \
       --json

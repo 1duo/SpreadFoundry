@@ -92,6 +92,7 @@ Success criteria:
 Commands:
 
 ```bash
+cargo build --release
 scripts/canary-service.sh start
 scripts/canary-service.sh status
 scripts/canary-service.sh restart
@@ -123,6 +124,7 @@ Commands:
 ```bash
 cd apps/SpreadFoundryMenubar
 swift build
+cargo build --release
 SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run SpreadFoundryMenubar
 ```
 
