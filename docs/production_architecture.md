@@ -163,11 +163,16 @@ wing/arc with two spread bars to signal gated directional option exposure.
 
 ### Phase 5: Continuous Auto-Research
 
-Status: implemented as an opt-in service wrapper.
+Status: implemented as an opt-in canary refresh service.
 
 - Schedule research refreshes through service scripts.
 - Store candidate artifacts with provenance and simulator version.
 - Require promotion gates before a candidate can reach broker review.
+- Refresh only exports a canary artifact when the rerun has a canary-ready
+  profile; otherwise it records `no_canary_ready_profile` and leaves the prior
+  artifact untouched.
+- The default refresh loop is regular-market-window gated and reruns every
+  `300` seconds after `scripts/auto-research-service.sh configure-canary`.
 
 Success criteria:
 
@@ -177,14 +182,17 @@ Success criteria:
 Commands:
 
 ```bash
-export SPREAD_AUTO_RESEARCH_COMMAND='cargo run -- run-portfolio-selector-research ...'
+scripts/auto-research-service.sh configure-canary
 scripts/auto-research-service.sh start
 scripts/auto-research-service.sh status
 scripts/auto-research-service.sh stop
 ```
 
-The service is inert unless `SPREAD_AUTO_RESEARCH_COMMAND` is set. Each run
-writes `var/auto_research_last.json` with start time, finish time, exit code,
-and command, plus append-only logs in `var/auto_research.log`. Candidate export
-still must pass the existing canary artifact gates before the worker can review
-an order.
+`configure-canary` persists a real refresh command in `var/auto_research.env`.
+The command runs `scripts/refresh-canary-artifact.sh`, which reruns the
+portfolio selector through the current UTC date during the configured market
+window and attempts `export-portfolio-canary`. Each refresh writes
+`var/canary_refresh_last.json`; the loop writes `var/auto_research_last.json`
+with start time, finish time, exit code, and command, plus append-only logs in
+`var/auto_research.log`. Candidate export still must pass the existing canary
+artifact gates before the worker can review an order.
