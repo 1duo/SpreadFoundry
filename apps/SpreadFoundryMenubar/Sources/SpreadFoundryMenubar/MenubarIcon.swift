@@ -3,7 +3,7 @@ import SwiftUI
 
 enum MenubarIcon {
     static func statusImage(status: String) -> NSImage {
-        let image = draw(size: CGSize(width: 18, height: 18), status: status, template: true)
+        let image = draw(size: CGSize(width: 22, height: 22), status: status, template: true)
         image.isTemplate = true
         return image
     }

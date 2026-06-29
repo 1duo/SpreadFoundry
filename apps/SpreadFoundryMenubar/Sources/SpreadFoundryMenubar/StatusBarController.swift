@@ -10,7 +10,7 @@ final class StatusBarController {
 
     init(viewModel: MenubarViewModel) {
         self.viewModel = viewModel
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         configureButton(for: viewModel.snapshot)
         rebuildMenu()
 
@@ -22,8 +22,8 @@ final class StatusBarController {
 
     private func configureButton(for snapshot: CanarySnapshot) {
         statusItem.button?.image = MenubarIcon.statusImage(status: snapshot.status)
-        statusItem.button?.imagePosition = .imageLeading
-        statusItem.button?.title = snapshot.trayTitle.replacingOccurrences(of: "SF ", with: "")
+        statusItem.button?.imagePosition = .imageOnly
+        statusItem.button?.title = ""
         statusItem.button?.toolTip = snapshot.trayTooltip
     }
 
