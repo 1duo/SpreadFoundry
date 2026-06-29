@@ -13172,7 +13172,7 @@ mod tests {
             trade: opportunity.trade,
         };
         let metrics = metrics_with_min_trades_per_year(
-            &[trade.trade.clone()],
+            std::slice::from_ref(&trade.trade),
             entry,
             entry + Duration::days(30),
             0.1,
@@ -13214,7 +13214,7 @@ mod tests {
             trade: opportunity.trade,
         };
         let metrics = metrics_with_min_trades_per_year(
-            &[trade.trade.clone()],
+            std::slice::from_ref(&trade.trade),
             entry,
             entry + Duration::days(30),
             0.1,

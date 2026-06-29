@@ -6,7 +6,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use spreadfoundry::broker::{
     BrokerCapabilities, RobinhoodBrokerAdapter, RobinhoodMcpCommandExecutor,
-    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse,
+    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierClient, TradierConfig,
+    TradierOrderResponse,
 };
 use spreadfoundry::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
@@ -108,6 +109,8 @@ enum Commands {
         candidate_id: String,
         #[arg(long)]
         frozen_on: Option<NaiveDate>,
+        #[arg(long, default_value_t = false)]
+        allow_risk_controlled_live: bool,
     },
     PortfolioCanaryStatus {
         #[arg(long, default_value = "candidates/weekly_selector_canary.json")]
@@ -132,6 +135,8 @@ enum Commands {
         free_cash_buffer: f64,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
+        #[arg(long, value_enum, default_value = "tradier")]
+        broker: CanaryBrokerKind,
         #[arg(long, default_value_t = false)]
         broker_multi_leg_options: bool,
         #[arg(long, default_value_t = false)]
@@ -166,6 +171,8 @@ enum Commands {
         max_wheel_positions_per_symbol: usize,
         #[arg(long, value_enum, default_value = "monitor")]
         mode: CanaryMode,
+        #[arg(long, value_enum, default_value = "tradier")]
+        broker: CanaryBrokerKind,
         #[arg(long, default_value_t = false)]
         broker_multi_leg_options: bool,
         #[arg(long, default_value_t = false)]
@@ -198,6 +205,8 @@ enum Commands {
         max_wheel_positions_per_symbol: usize,
         #[arg(long, value_enum, default_value = "monitor")]
         mode: CanaryMode,
+        #[arg(long, value_enum, default_value = "tradier")]
+        broker: CanaryBrokerKind,
         #[arg(long, default_value_t = false)]
         broker_multi_leg_options: bool,
         #[arg(long, default_value_t = false)]
@@ -492,6 +501,85 @@ enum CanaryMode {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum CanaryBrokerKind {
+    Robinhood,
+    Tradier,
+}
+
+#[derive(Clone, Debug)]
+struct CanaryBrokerAdapter {
+    kind: CanaryBrokerKind,
+    capabilities: BrokerCapabilities,
+    live_orders_enabled: bool,
+}
+
+trait CanaryBrokerView {
+    fn kind(&self) -> CanaryBrokerKind;
+    fn capabilities(&self) -> &BrokerCapabilities;
+    fn live_orders_enabled(&self) -> bool;
+
+    fn assert_debit_spread_live_supported(&self) -> Result<()> {
+        if !self.capabilities().multi_leg_options {
+            let broker = canary_broker_label(self.kind());
+            anyhow::bail!(
+                "debit spread live execution is disabled: {broker} adapter has no proven atomic multi-leg support"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_wheel_live_supported(&self) -> Result<()> {
+        if self.kind() == CanaryBrokerKind::Tradier {
+            anyhow::bail!(
+                "wheel live execution is disabled: Tradier V1 only supports defined-risk debit spreads"
+            );
+        }
+        if !self.capabilities().cash_secured_puts {
+            let broker = canary_broker_label(self.kind());
+            anyhow::bail!(
+                "wheel live execution is disabled: {broker} adapter has no proven cash-secured put sell-to-open support"
+            );
+        }
+        if !self.capabilities().covered_calls {
+            let broker = canary_broker_label(self.kind());
+            anyhow::bail!(
+                "wheel live execution is disabled: {broker} adapter has no proven covered-call lifecycle support"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl CanaryBrokerView for CanaryBrokerAdapter {
+    fn kind(&self) -> CanaryBrokerKind {
+        self.kind
+    }
+
+    fn capabilities(&self) -> &BrokerCapabilities {
+        &self.capabilities
+    }
+
+    fn live_orders_enabled(&self) -> bool {
+        self.live_orders_enabled
+    }
+}
+
+impl CanaryBrokerView for RobinhoodBrokerAdapter {
+    fn kind(&self) -> CanaryBrokerKind {
+        CanaryBrokerKind::Robinhood
+    }
+
+    fn capabilities(&self) -> &BrokerCapabilities {
+        &self.capabilities
+    }
+
+    fn live_orders_enabled(&self) -> bool {
+        self.live_orders_enabled
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProfileFamilyArg {
     Swing,
@@ -706,7 +794,14 @@ async fn main() -> Result<()> {
             output,
             candidate_id,
             frozen_on,
-        } => export_portfolio_canary(&run, &output, &candidate_id, frozen_on),
+            allow_risk_controlled_live,
+        } => export_portfolio_canary(
+            &run,
+            &output,
+            &candidate_id,
+            frozen_on,
+            allow_risk_controlled_live,
+        ),
         Commands::PortfolioCanaryStatus {
             candidate,
             as_of,
@@ -720,6 +815,7 @@ async fn main() -> Result<()> {
             wheel_reserve_cap,
             free_cash_buffer,
             max_wheel_positions_per_symbol,
+            broker,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
@@ -735,6 +831,7 @@ async fn main() -> Result<()> {
             wheel_reserve_cap,
             free_cash_buffer,
             max_wheel_positions_per_symbol,
+            broker,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
@@ -753,6 +850,7 @@ async fn main() -> Result<()> {
             free_cash_buffer,
             max_wheel_positions_per_symbol,
             mode,
+            broker,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
@@ -770,6 +868,7 @@ async fn main() -> Result<()> {
             free_cash_buffer,
             max_wheel_positions_per_symbol,
             mode,
+            broker,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
@@ -787,6 +886,7 @@ async fn main() -> Result<()> {
             free_cash_buffer,
             max_wheel_positions_per_symbol,
             mode,
+            broker,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
@@ -811,6 +911,7 @@ async fn main() -> Result<()> {
                     max_wheel_positions_per_symbol,
                 },
                 broker: canary_broker(
+                    broker,
                     broker_multi_leg_options,
                     broker_cash_secured_puts,
                     broker_covered_calls,
@@ -1166,6 +1267,7 @@ fn export_portfolio_canary(
     output: &Path,
     candidate_id: &str,
     frozen_on: Option<NaiveDate>,
+    allow_risk_controlled_live: bool,
 ) -> Result<()> {
     let report_path = portfolio_report_json_path(run);
     let report: PortfolioWheelReport = serde_json::from_str(
@@ -1173,16 +1275,54 @@ fn export_portfolio_canary(
             .with_context(|| format!("read portfolio report {}", report_path.display()))?,
     )
     .with_context(|| format!("parse portfolio report {}", report_path.display()))?;
-    let best = report
+    let canary_ready_profile = report
         .profiles
         .iter()
-        .find(|profile| profile.canary_readiness.canary_ready)
-        .with_context(|| {
-            format!(
-                "portfolio report {} has no canary-ready profiles; refusing to export candidate",
-                report_path.display()
-            )
-        })?;
+        .find(|profile| profile.canary_readiness.canary_ready);
+    let risk_controlled_profile = allow_risk_controlled_live
+        .then(|| {
+            report
+                .profiles
+                .iter()
+                .find(|profile| risk_controlled_live_export_allowed(profile))
+        })
+        .flatten();
+    let (best, export_policy) = if let Some(profile) = canary_ready_profile {
+        (profile, "canary_ready")
+    } else if let Some(profile) = risk_controlled_profile {
+        (profile, "risk_controlled_live")
+    } else {
+        anyhow::bail!(
+            "portfolio report {} has no exportable profiles; refusing to export candidate{}",
+            report_path.display(),
+            if allow_risk_controlled_live {
+                " even with --allow-risk-controlled-live"
+            } else {
+                ""
+            }
+        );
+    };
+    if export_policy != "canary_ready" && !allow_risk_controlled_live {
+        anyhow::bail!(format!(
+            "portfolio report {} has no canary-ready profiles; refusing to export candidate",
+            report_path.display()
+        ));
+    }
+    let exported_canary_ready =
+        best.canary_readiness.canary_ready || export_policy == "risk_controlled_live";
+    let exported_status = if exported_canary_ready {
+        "canary_only"
+    } else {
+        best.canary_readiness.status.as_str()
+    };
+    let export_reason = if export_policy == "risk_controlled_live" {
+        format!(
+            "risk-controlled live override: source canary status was {}; runtime remains limited to same-day debit spreads with per-trade caps",
+            best.canary_readiness.status
+        )
+    } else {
+        best.canary_readiness.reason.clone()
+    };
     let frozen_on = frozen_on.unwrap_or_else(|| Utc::now().date_naive());
     let latest_action_summary = latest_action_status_counts(best);
     let has_action = best
@@ -1206,7 +1346,7 @@ fn export_portfolio_canary(
         .unwrap_or_else(|| PathBuf::from("report.md"));
     let artifact = serde_json::json!({
         "candidate_id": candidate_id,
-        "status": best.canary_readiness.status,
+        "status": exported_status,
         "source_run_id": report.run_id,
         "source_report": report_path,
         "source_markdown_report": source_markdown,
@@ -1216,13 +1356,16 @@ fn export_portfolio_canary(
         "profile": best.profile.name,
         "decision": {
             "research_gate": best.gate_status,
+            "export_policy": export_policy,
+            "source_canary_status": best.canary_readiness.status,
+            "source_canary_ready": best.canary_readiness.canary_ready,
             "canary_status": best.canary_readiness.status,
-            "canary_ready": best.canary_readiness.canary_ready,
+            "canary_ready": exported_canary_ready,
             "full_promotion_ready": best.canary_readiness.full_promotion_ready,
             "recommended_capital_fraction": best.canary_readiness.recommended_capital_fraction,
             "action_policy": "wait_for_fresh_entry_or_open_candidate",
             "current_action_state": current_action_state,
-            "reason": best.canary_readiness.reason,
+            "reason": export_reason,
         },
         "research_window": {
             "from": report.from,
@@ -1292,6 +1435,25 @@ fn export_portfolio_canary(
         .with_context(|| format!("write canary artifact {}", output.display()))?;
     println!("{}", output.display());
     Ok(())
+}
+
+fn risk_controlled_live_export_allowed(
+    profile: &spreadfoundry::research::PortfolioWheelProfileResult,
+) -> bool {
+    profile.gate_pass
+        && profile.canary_readiness.cost_25_pnl > 0.0
+        && profile.risk_summary.wheel_trades == 0
+        && profile.risk_summary.assigned_cycles == 0
+        && profile.risk_summary.marked_stock_cycles == 0
+        && profile.canary_readiness.symbol_ablation_passes >= 3
+        && profile.canary_readiness.strategy_ablation_passes > 0
+        && profile.decision_metrics.cost_25_max_capital_drawdown_pct <= 0.30
+        && profile.strategy_summaries.iter().all(|summary| {
+            matches!(
+                summary.strategy.as_str(),
+                "put_debit_spread" | "call_debit_spread"
+            ) && summary.pnl > 0.0
+        })
 }
 
 fn portfolio_report_json_path(run: &Path) -> PathBuf {
@@ -1447,6 +1609,7 @@ fn run_portfolio_canary(
     free_cash_buffer: f64,
     max_wheel_positions_per_symbol: usize,
     mode: CanaryMode,
+    broker_kind: CanaryBrokerKind,
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
@@ -1475,6 +1638,7 @@ fn run_portfolio_canary(
     };
     validate_canary_risk_config(&risk)?;
     let broker = canary_broker(
+        broker_kind,
         broker_multi_leg_options,
         broker_cash_secured_puts,
         broker_covered_calls,
@@ -1488,8 +1652,9 @@ fn run_portfolio_canary(
         mode,
         max_order_age_seconds,
     );
-    apply_robinhood_mcp_bridge(
+    apply_broker_bridge(
         &mut decision,
+        &broker,
         robinhood_mcp_command.as_deref(),
         Some(&order_ledger),
     )?;
@@ -1524,6 +1689,7 @@ fn run_portfolio_canary(
                 .mcp_place
                 .as_ref()
                 .map(|response| response.ok)
+                .or_else(|| decision.tradier_place.as_ref().map(|response| response.ok))
                 .unwrap_or(false)
         );
     }
@@ -1537,9 +1703,11 @@ struct CanaryLiveReadinessReport {
     candidate_readable: bool,
     artifact_parse_ok: bool,
     as_of: NaiveDate,
+    broker: CanaryBrokerKind,
     candidate_ready_for_broker_review: bool,
     live_worker_ready_to_attempt_order: bool,
     robinhood_mcp_command_configured: bool,
+    tradier_credentials_configured: bool,
     blockers: Vec<String>,
     warnings: Vec<String>,
     next_action: String,
@@ -1556,6 +1724,7 @@ fn canary_live_readiness(
     wheel_reserve_cap: f64,
     free_cash_buffer: f64,
     max_wheel_positions_per_symbol: usize,
+    broker_kind: CanaryBrokerKind,
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
@@ -1574,6 +1743,7 @@ fn canary_live_readiness(
     };
     validate_canary_risk_config(&risk)?;
     let broker = canary_broker(
+        broker_kind,
         broker_multi_leg_options,
         broker_cash_secured_puts,
         broker_covered_calls,
@@ -1606,6 +1776,7 @@ fn canary_live_readiness(
         &risk,
         &broker,
         robinhood_mcp_command.is_some(),
+        tradier_config_from_env().is_ok(),
         max_order_age_seconds,
     );
 
@@ -1629,20 +1800,25 @@ fn build_canary_live_readiness_report(
     artifact_error: Option<String>,
     as_of: NaiveDate,
     risk: &CanaryRiskConfig,
-    broker: &RobinhoodBrokerAdapter,
+    broker: &impl CanaryBrokerView,
     robinhood_mcp_command_configured: bool,
+    tradier_credentials_configured: bool,
     max_order_age_seconds: u64,
 ) -> CanaryLiveReadinessReport {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
     let mut decision = None;
     let mcp_blocker = "SPREAD_ROBINHOOD_MCP_COMMAND not configured; worker cannot call Robinhood MCP review/place";
+    let tradier_blocker = "SPREAD_TRADIER_ACCOUNT_ID/SPREAD_TRADIER_TOKEN not configured; worker cannot call Tradier preview/place";
 
     if let Some(err) = artifact_error.as_deref() {
         push_unique(&mut blockers, err);
     }
-    if !robinhood_mcp_command_configured {
+    if broker.kind() == CanaryBrokerKind::Robinhood && !robinhood_mcp_command_configured {
         push_unique(&mut blockers, mcp_blocker);
+    }
+    if broker.kind() == CanaryBrokerKind::Tradier && !tradier_credentials_configured {
+        push_unique(&mut blockers, tradier_blocker);
     }
 
     if let Some(artifact) = artifact {
@@ -1689,7 +1865,7 @@ fn build_canary_live_readiness_report(
             if matches!(
                 action.strategy.as_str(),
                 "put_debit_spread" | "call_debit_spread"
-            ) && !broker.capabilities.multi_leg_options
+            ) && !broker.capabilities().multi_leg_options
             {
                 push_unique(
                     &mut blockers,
@@ -1697,13 +1873,13 @@ fn build_canary_live_readiness_report(
                 );
             }
             if action.strategy == "wheel" {
-                if !broker.capabilities.cash_secured_puts {
+                if !broker.capabilities().cash_secured_puts {
                     push_unique(
                         &mut blockers,
                         "broker cash-secured put capability not enabled/proven for selected wheel entry",
                     );
                 }
-                if !broker.capabilities.covered_calls {
+                if !broker.capabilities().covered_calls {
                     push_unique(
                         &mut blockers,
                         "broker covered-call capability not enabled/proven for selected wheel lifecycle",
@@ -1744,13 +1920,24 @@ fn build_canary_live_readiness_report(
     let candidate_ready_for_broker_review = decision_ready_for_review
         && blockers
             .iter()
-            .all(|blocker| blocker.as_str() == mcp_blocker);
+            .all(|blocker| blocker.as_str() == mcp_blocker || blocker.as_str() == tradier_blocker);
+    let broker_configured_for_live = match broker.kind() {
+        CanaryBrokerKind::Robinhood => robinhood_mcp_command_configured,
+        CanaryBrokerKind::Tradier => tradier_credentials_configured,
+    };
     let live_worker_ready_to_attempt_order =
-        decision_ready_for_review && blockers.is_empty() && robinhood_mcp_command_configured;
+        decision_ready_for_review && blockers.is_empty() && broker_configured_for_live;
     let next_action = if live_worker_ready_to_attempt_order {
         "run the worker in live mode; it will request broker review before any placement"
     } else if candidate_ready_for_broker_review {
-        "configure SPREAD_ROBINHOOD_MCP_COMMAND, then rerun readiness"
+        match broker.kind() {
+            CanaryBrokerKind::Robinhood => {
+                "configure SPREAD_ROBINHOOD_MCP_COMMAND, then rerun readiness"
+            }
+            CanaryBrokerKind::Tradier => {
+                "configure SPREAD_TRADIER_ACCOUNT_ID/SPREAD_TRADIER_TOKEN, then rerun readiness"
+            }
+        }
     } else if blockers
         .iter()
         .any(|blocker| blocker.starts_with("no fresh entry_candidate"))
@@ -1767,9 +1954,11 @@ fn build_canary_live_readiness_report(
         candidate_readable,
         artifact_parse_ok,
         as_of,
+        broker: broker.kind(),
         candidate_ready_for_broker_review,
         live_worker_ready_to_attempt_order,
         robinhood_mcp_command_configured,
+        tradier_credentials_configured,
         blockers,
         warnings,
         next_action,
@@ -1780,9 +1969,10 @@ fn build_canary_live_readiness_report(
 
 fn print_canary_live_readiness_report(report: &CanaryLiveReadinessReport) {
     println!(
-        "live_worker_ready_to_attempt_order={} candidate_ready_for_broker_review={} as_of={}",
+        "live_worker_ready_to_attempt_order={} candidate_ready_for_broker_review={} broker={} as_of={}",
         report.live_worker_ready_to_attempt_order,
         report.candidate_ready_for_broker_review,
+        canary_broker_label(report.broker),
         report.as_of
     );
     println!("candidate={}", report.candidate);
@@ -1842,10 +2032,13 @@ struct PortfolioCanaryRunDecision {
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
     broker_review_ok: bool,
+    broker: CanaryBrokerKind,
     artifact_exported_at: Option<chrono::DateTime<Utc>>,
     max_order_age_seconds: u64,
     mcp_review: Option<RobinhoodMcpToolResponse>,
     mcp_place: Option<RobinhoodMcpToolResponse>,
+    tradier_preview: Option<TradierOrderResponse>,
+    tradier_place: Option<TradierOrderResponse>,
     selected_action: Option<CanaryActionSummary>,
 }
 
@@ -1872,7 +2065,7 @@ fn portfolio_canary_run_decision(
     artifact: &serde_json::Value,
     as_of: NaiveDate,
     risk: &CanaryRiskConfig,
-    broker: &RobinhoodBrokerAdapter,
+    broker: &impl CanaryBrokerView,
     mode: CanaryMode,
     max_order_age_seconds: u64,
 ) -> PortfolioCanaryRunDecision {
@@ -2013,7 +2206,10 @@ fn portfolio_canary_run_decision(
     if mode == CanaryMode::Monitor {
         return canary_run_decision(
             "monitor_ready",
-            "fresh action passed local artifact, risk, and broker capability gates; mode=monitor so Robinhood review was not requested",
+            &format!(
+                "fresh action passed local artifact, risk, and broker capability gates; mode=monitor so {} review was not requested",
+                canary_broker_label(broker.kind())
+            ),
             as_of,
             mode,
             risk,
@@ -2045,7 +2241,7 @@ fn canary_run_decision(
     as_of: NaiveDate,
     mode: CanaryMode,
     risk: &CanaryRiskConfig,
-    broker: &RobinhoodBrokerAdapter,
+    broker: &impl CanaryBrokerView,
     broker_review_ok: bool,
     artifact_exported_at: Option<chrono::DateTime<Utc>>,
     max_order_age_seconds: u64,
@@ -2057,14 +2253,17 @@ fn canary_run_decision(
         as_of,
         mode,
         risk: risk.clone(),
-        broker_multi_leg_options: broker.capabilities.multi_leg_options,
-        broker_cash_secured_puts: broker.capabilities.cash_secured_puts,
-        broker_covered_calls: broker.capabilities.covered_calls,
+        broker_multi_leg_options: broker.capabilities().multi_leg_options,
+        broker_cash_secured_puts: broker.capabilities().cash_secured_puts,
+        broker_covered_calls: broker.capabilities().covered_calls,
+        broker: broker.kind(),
         broker_review_ok,
         artifact_exported_at,
         max_order_age_seconds,
         mcp_review: None,
         mcp_place: None,
+        tradier_preview: None,
+        tradier_place: None,
         selected_action,
     }
 }
@@ -2287,7 +2486,7 @@ fn canary_action_short_put(action: &serde_json::Value) -> Option<f64> {
 
 fn assert_canary_action_broker_supported(
     action: &CanaryActionSummary,
-    broker: &RobinhoodBrokerAdapter,
+    broker: &impl CanaryBrokerView,
 ) -> anyhow::Result<()> {
     match action.strategy.as_str() {
         "put_debit_spread" | "call_debit_spread" => broker.assert_debit_spread_live_supported(),
@@ -2338,6 +2537,29 @@ fn canary_action_optional_string(action: &serde_json::Value, key: &str) -> Optio
 
 fn canary_action_optional_f64(action: &serde_json::Value, key: &str) -> Option<f64> {
     action.get(key).and_then(|value| value.as_f64())
+}
+
+fn apply_broker_bridge(
+    decision: &mut PortfolioCanaryRunDecision,
+    broker: &CanaryBrokerAdapter,
+    robinhood_mcp_command: Option<&str>,
+    order_ledger: Option<&Path>,
+) -> Result<()> {
+    if decision.status != "review_required" {
+        return Ok(());
+    }
+    if decision.mode == CanaryMode::Live && !broker.live_orders_enabled() {
+        decision.status = "live_blocked".to_owned();
+        decision.reason =
+            "live order placement is disabled until explicit rollout gates pass".to_owned();
+        return Ok(());
+    }
+    match broker.kind() {
+        CanaryBrokerKind::Robinhood => {
+            apply_robinhood_mcp_bridge(decision, robinhood_mcp_command, order_ledger)
+        }
+        CanaryBrokerKind::Tradier => apply_tradier_rest_bridge(decision, order_ledger),
+    }
 }
 
 fn apply_robinhood_mcp_bridge(
@@ -2516,7 +2738,7 @@ fn canary_action_order_intent(action: &CanaryActionSummary) -> Result<OptionOrde
                 action.strategy.clone(),
             )?)
         }
-        other => anyhow::bail!("strategy {other} is not orderable through Robinhood MCP"),
+        other => anyhow::bail!("strategy {other} is not orderable through the canary broker"),
     }
 }
 
@@ -2663,6 +2885,7 @@ fn option_right_value(right: &OptionRight) -> &'static str {
 
 fn robinhood_mcp_order_key(request: &RobinhoodMcpToolRequest) -> String {
     serde_json::to_string(&serde_json::json!({
+        "broker": "robinhood",
         "server": request.server,
         "arguments": request.arguments,
     }))
@@ -2683,34 +2906,478 @@ fn robinhood_mcp_review_matches_order_key(
             == Some(true)
 }
 
-fn canary_order_ledger_contains(path: &Path, order_key: &str) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
+fn apply_tradier_rest_bridge(
+    decision: &mut PortfolioCanaryRunDecision,
+    order_ledger: Option<&Path>,
+) -> Result<()> {
+    if decision.status != "review_required" {
+        return Ok(());
     }
-    let body = fs::read_to_string(path)
-        .with_context(|| format!("read canary order ledger {}", path.display()))?;
-    let ledger: BTreeSet<String> = serde_json::from_str(&body)
-        .with_context(|| format!("parse canary order ledger {}", path.display()))?;
-    Ok(ledger.contains(order_key))
+    apply_tradier_rest_bridge_with_config_result(decision, order_ledger, tradier_config_from_env())
+}
+
+fn apply_tradier_rest_bridge_with_config_result(
+    decision: &mut PortfolioCanaryRunDecision,
+    order_ledger: Option<&Path>,
+    config: Result<TradierConfig>,
+) -> Result<()> {
+    let config = match config {
+        Ok(config) => config,
+        Err(err) => {
+            decision.status = "review_failed".to_owned();
+            decision.reason = format!("Tradier credentials are not configured: {err}");
+            return Ok(());
+        }
+    };
+    apply_tradier_rest_bridge_with_config(decision, order_ledger, config)
+}
+
+fn apply_tradier_rest_bridge_with_config(
+    decision: &mut PortfolioCanaryRunDecision,
+    order_ledger: Option<&Path>,
+    config: TradierConfig,
+) -> Result<()> {
+    let Some(action) = decision.selected_action.clone() else {
+        return Ok(());
+    };
+    let payload = match tradier_multileg_debit_payload(&action) {
+        Ok(payload) => payload,
+        Err(err) => {
+            decision.status = "review_failed".to_owned();
+            decision.reason = format!("Tradier order shape rejected before preview: {err}");
+            return Ok(());
+        }
+    };
+    let client = match TradierClient::new(config.clone()) {
+        Ok(client) => client,
+        Err(err) => {
+            decision.status = "review_failed".to_owned();
+            decision.reason = format!("Tradier client initialization failed: {err}");
+            return Ok(());
+        }
+    };
+    let order_key = tradier_order_key(&config, &payload, &action);
+    if decision.mode == CanaryMode::Live
+        && let Some(ledger_path) = order_ledger
+        && canary_order_ledger_contains(ledger_path, &order_key)?
+    {
+        decision.status = "live_already_submitted".to_owned();
+        decision.reason =
+            "matching Tradier order intent is already recorded in the local canary ledger"
+                .to_owned();
+        return Ok(());
+    }
+
+    let preview = match client.preview_order(&payload) {
+        Ok(response) => response,
+        Err(err) => {
+            decision.status = "review_failed".to_owned();
+            decision.reason = format!("Tradier preview request failed: {err}");
+            return Ok(());
+        }
+    };
+    let preview_result = tradier_preview_accepted(&preview);
+    decision.tradier_preview = Some(preview);
+    if let Err(reason) = preview_result {
+        decision.status = "review_failed".to_owned();
+        decision.reason = format!("Tradier preview rejected the canary order: {reason}");
+        return Ok(());
+    }
+
+    decision.broker_review_ok = true;
+    if decision.mode != CanaryMode::Live {
+        decision.status = "review_ready".to_owned();
+        decision.reason = "Tradier preview succeeded; live placement was not requested".to_owned();
+        return Ok(());
+    }
+
+    if let Some(ledger_path) = order_ledger {
+        canary_order_ledger_record_status(
+            ledger_path,
+            &order_key,
+            "pending_unknown",
+            None,
+            Some("Tradier place request is about to be sent"),
+        )?;
+    }
+    let place = match client.place_order(&payload) {
+        Ok(response) => response,
+        Err(err) => {
+            decision.status = "live_submit_unknown".to_owned();
+            decision.reason = format!(
+                "Tradier place request transport failed after local ledger reservation; check Tradier before retrying: {err}"
+            );
+            return Ok(());
+        }
+    };
+    let place_result = tradier_place_accepted(&place);
+    decision.tradier_place = Some(place);
+    match place_result {
+        Ok(order_id) => {
+            if let Some(ledger_path) = order_ledger {
+                canary_order_ledger_record_status(
+                    ledger_path,
+                    &order_key,
+                    "submitted",
+                    Some(order_id.as_str()),
+                    Some("Tradier place order returned an accepted order id"),
+                )?;
+            }
+            decision.status = "live_submitted".to_owned();
+            decision.reason = format!(
+                "Tradier place order returned accepted order id {order_id}; broker lifecycle still requires monitoring"
+            );
+        }
+        Err(reason) => {
+            if let Some(ledger_path) = order_ledger {
+                canary_order_ledger_record_status(
+                    ledger_path,
+                    &order_key,
+                    "rejected",
+                    None,
+                    Some(reason.as_str()),
+                )?;
+            }
+            decision.status = "live_rejected".to_owned();
+            decision.reason = format!("Tradier place order returned a rejection: {reason}");
+        }
+    }
+    Ok(())
+}
+
+fn tradier_config_from_env() -> Result<TradierConfig> {
+    let account_id = std::env::var("SPREAD_TRADIER_ACCOUNT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .context("SPREAD_TRADIER_ACCOUNT_ID is missing")?;
+    let token = std::env::var("SPREAD_TRADIER_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .context("SPREAD_TRADIER_TOKEN is missing")?;
+    let base_url = std::env::var("SPREAD_TRADIER_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://sandbox.tradier.com/v1".to_owned());
+    Ok(TradierConfig {
+        account_id,
+        token,
+        base_url,
+    })
+}
+
+fn tradier_preview_accepted(response: &TradierOrderResponse) -> std::result::Result<(), String> {
+    tradier_response_base_ok(response)?;
+    let order = tradier_response_order(&response.raw)
+        .ok_or_else(|| "missing Tradier order preview envelope".to_owned())?;
+    let result = order
+        .get("result")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| "missing Tradier preview result=true confirmation".to_owned())?;
+    if !result {
+        return Err(tradier_response_reason(&response.raw)
+            .unwrap_or_else(|| "Tradier preview result=false".to_owned()));
+    }
+    let status = tradier_order_status(order).unwrap_or_default();
+    if status.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(format!("unexpected Tradier preview status {status}"))
+    }
+}
+
+fn tradier_place_accepted(response: &TradierOrderResponse) -> std::result::Result<String, String> {
+    tradier_response_base_ok(response)?;
+    let order = tradier_response_order(&response.raw)
+        .ok_or_else(|| "missing Tradier place order envelope".to_owned())?;
+    let order_id = order
+        .get("id")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_i64().map(|id| id.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "missing Tradier broker order id".to_owned())?;
+    let status = tradier_order_status(order).unwrap_or_default();
+    if matches!(
+        status.as_str(),
+        "ok" | "pending" | "open" | "partially_filled" | "filled"
+    ) {
+        Ok(order_id)
+    } else {
+        Err(tradier_response_reason(&response.raw)
+            .unwrap_or_else(|| format!("unexpected Tradier place status {status}")))
+    }
+}
+
+fn tradier_response_base_ok(response: &TradierOrderResponse) -> std::result::Result<(), String> {
+    if !response.ok {
+        return Err(response
+            .error
+            .clone()
+            .unwrap_or_else(|| "Tradier HTTP request was not successful".to_owned()));
+    }
+    if let Some(reason) = tradier_response_reason(&response.raw) {
+        return Err(reason);
+    }
+    if tradier_response_has_terminal_bad_status(&response.raw) {
+        return Err("Tradier response contains terminal bad order status".to_owned());
+    }
+    Ok(())
+}
+
+fn tradier_response_order(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value
+        .get("order")
+        .and_then(|value| value.as_object())
+        .or_else(|| {
+            value
+                .get("orders")
+                .and_then(|orders| orders.get("order"))
+                .and_then(|order| {
+                    order
+                        .as_object()
+                        .or_else(|| order.as_array()?.first()?.as_object())
+                })
+        })
+}
+
+fn tradier_order_status(order: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    order
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(|status| status.to_ascii_lowercase())
+}
+
+fn tradier_response_reason(value: &serde_json::Value) -> Option<String> {
+    for key in ["reason_description", "reason", "message", "errors", "fault"] {
+        if let Some(reason) = value.get(key) {
+            if let Some(reason) = reason.as_str() {
+                return Some(reason.to_owned());
+            }
+            if reason.is_object() || reason.is_array() {
+                return Some(reason.to_string());
+            }
+        }
+    }
+    match value {
+        serde_json::Value::Object(map) => map.values().find_map(tradier_response_reason),
+        serde_json::Value::Array(values) => values.iter().find_map(tradier_response_reason),
+        _ => None,
+    }
+}
+
+fn tradier_response_has_terminal_bad_status(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            key == "status" && value.as_str().is_some_and(tradier_terminal_bad_status)
+                || tradier_response_has_terminal_bad_status(value)
+        }),
+        serde_json::Value::Array(values) => {
+            values.iter().any(tradier_response_has_terminal_bad_status)
+        }
+        _ => false,
+    }
+}
+
+fn tradier_terminal_bad_status(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "rejected" | "error" | "canceled" | "cancelled" | "expired"
+    )
+}
+
+fn tradier_multileg_debit_payload(
+    action: &CanaryActionSummary,
+) -> Result<BTreeMap<String, String>> {
+    if !matches!(
+        action.strategy.as_str(),
+        "call_debit_spread" | "put_debit_spread"
+    ) {
+        anyhow::bail!("Tradier V1 only supports call_debit_spread and put_debit_spread");
+    }
+    let intent = canary_action_order_intent(action)?;
+    if intent.order_effect != OptionOrderEffect::Debit {
+        anyhow::bail!("Tradier V1 canary spread must be a debit order");
+    }
+    if intent.quantity() != 1 {
+        anyhow::bail!("Tradier V1 canary order quantity must be one spread");
+    }
+    let [long_leg, short_leg] = intent.legs.as_slice() else {
+        anyhow::bail!("Tradier V1 canary debit spread must have exactly two legs");
+    };
+    if long_leg.side != OptionOrderSide::Buy
+        || long_leg.position_effect != PositionEffect::Open
+        || short_leg.side != OptionOrderSide::Sell
+        || short_leg.position_effect != PositionEffect::Open
+    {
+        anyhow::bail!("Tradier debit spread legs must be buy_to_open then sell_to_open");
+    }
+    if long_leg.key.right != short_leg.key.right
+        || long_leg.key.expiration != short_leg.key.expiration
+        || long_leg.key.underlying != short_leg.key.underlying
+    {
+        anyhow::bail!("Tradier debit spread legs must share underlying, expiration, and right");
+    }
+
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "multileg".to_owned());
+    payload.insert("symbol".to_owned(), intent.symbol.to_ascii_uppercase());
+    payload.insert("type".to_owned(), "debit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&intent.time_in_force).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(intent.limit_price, "limit_price")?,
+    );
+    payload.insert(
+        "option_symbol[0]".to_owned(),
+        tradier_occ_option_symbol(&long_leg.key)?,
+    );
+    payload.insert("side[0]".to_owned(), "buy_to_open".to_owned());
+    payload.insert("quantity[0]".to_owned(), long_leg.quantity.to_string());
+    payload.insert(
+        "option_symbol[1]".to_owned(),
+        tradier_occ_option_symbol(&short_leg.key)?,
+    );
+    payload.insert("side[1]".to_owned(), "sell_to_open".to_owned());
+    payload.insert("quantity[1]".to_owned(), short_leg.quantity.to_string());
+    Ok(payload)
+}
+
+fn tradier_occ_option_symbol(key: &OptionKey) -> Result<String> {
+    let right = match key.right {
+        OptionRight::Call => "C",
+        OptionRight::Put => "P",
+    };
+    let strike = decimal_to_f64(key.strike, "strike")?;
+    if strike <= 0.0 || !strike.is_finite() {
+        anyhow::bail!("strike must be positive and finite");
+    }
+    let scaled_strike = (strike * 1000.0).round();
+    if (scaled_strike - strike * 1000.0).abs() > 0.001 {
+        anyhow::bail!("strike has unsupported precision for OCC symbol: {strike}");
+    }
+    Ok(format!(
+        "{}{}{}{:08}",
+        key.underlying.to_ascii_uppercase(),
+        key.expiration.format("%y%m%d"),
+        right,
+        scaled_strike as u64
+    ))
+}
+
+fn format_tradier_price(value: Decimal, field: &str) -> Result<String> {
+    let price = decimal_to_f64(value, field)?;
+    if price <= 0.0 || !price.is_finite() {
+        anyhow::bail!("{field} must be positive and finite");
+    }
+    Ok(format!("{price:.2}"))
+}
+
+fn tradier_order_key(
+    config: &TradierConfig,
+    payload: &BTreeMap<String, String>,
+    action: &CanaryActionSummary,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "broker": "tradier",
+        "account_id": config.account_id,
+        "base_url": config.base_url,
+        "entry_date": action.entry_date,
+        "status": action.status,
+        "payload": payload,
+    }))
+    .expect("Tradier order key serialization should be infallible")
+}
+
+fn canary_order_ledger_contains(path: &Path, order_key: &str) -> Result<bool> {
+    Ok(read_canary_order_ledger(path)?
+        .get(order_key)
+        .is_some_and(|entry| entry.blocks_duplicate()))
 }
 
 fn canary_order_ledger_record(path: &Path, order_key: &str) -> Result<()> {
-    let mut ledger = if path.exists() {
-        let body = fs::read_to_string(path)
-            .with_context(|| format!("read canary order ledger {}", path.display()))?;
-        serde_json::from_str::<BTreeSet<String>>(&body)
-            .with_context(|| format!("parse canary order ledger {}", path.display()))?
-    } else {
-        BTreeSet::new()
-    };
-    ledger.insert(order_key.to_owned());
+    canary_order_ledger_record_status(path, order_key, "submitted", None, None)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CanaryOrderLedgerEntry {
+    status: String,
+    recorded_at: chrono::DateTime<Utc>,
+    broker_order_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl CanaryOrderLedgerEntry {
+    fn blocks_duplicate(&self) -> bool {
+        matches!(self.status.as_str(), "pending_unknown" | "submitted")
+    }
+}
+
+fn read_canary_order_ledger(path: &Path) -> Result<BTreeMap<String, CanaryOrderLedgerEntry>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("read canary order ledger {}", path.display()))?;
+    if let Ok(entries) = serde_json::from_str::<BTreeMap<String, CanaryOrderLedgerEntry>>(&body) {
+        return Ok(entries);
+    }
+    let legacy: BTreeSet<String> = serde_json::from_str(&body)
+        .with_context(|| format!("parse canary order ledger {}", path.display()))?;
+    Ok(legacy
+        .into_iter()
+        .map(|order_key| {
+            (
+                order_key,
+                CanaryOrderLedgerEntry {
+                    status: "submitted".to_owned(),
+                    recorded_at: Utc::now(),
+                    broker_order_id: None,
+                    reason: Some("legacy ledger entry".to_owned()),
+                },
+            )
+        })
+        .collect())
+}
+
+fn canary_order_ledger_record_status(
+    path: &Path,
+    order_key: &str,
+    status: &str,
+    broker_order_id: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let mut ledger = read_canary_order_ledger(path)?;
+    ledger.insert(
+        order_key.to_owned(),
+        CanaryOrderLedgerEntry {
+            status: status.to_owned(),
+            recorded_at: Utc::now(),
+            broker_order_id: broker_order_id.map(ToOwned::to_owned),
+            reason: reason.map(ToOwned::to_owned),
+        },
+    );
+    write_canary_order_ledger(path, &ledger)
+}
+
+fn write_canary_order_ledger(
+    path: &Path,
+    ledger: &BTreeMap<String, CanaryOrderLedgerEntry>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("create canary order ledger directory {}", parent.display())
         })?;
     }
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(&ledger)?)
+    fs::write(&tmp_path, serde_json::to_string_pretty(ledger)?)
         .with_context(|| format!("write canary order ledger temp {}", tmp_path.display()))?;
     fs::rename(&tmp_path, path)
         .with_context(|| format!("replace canary order ledger {}", path.display()))
@@ -2746,7 +3413,7 @@ struct CanaryWorkerArgs {
     candidate: PathBuf,
     as_of: Option<NaiveDate>,
     risk: CanaryRiskConfig,
-    broker: RobinhoodBrokerAdapter,
+    broker: CanaryBrokerAdapter,
     mode: CanaryMode,
     robinhood_mcp_command: Option<String>,
     order_ledger: PathBuf,
@@ -2772,9 +3439,11 @@ struct CanaryWorkerHealth {
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
+    broker: CanaryBrokerKind,
     mode: CanaryMode,
     broker_review_ok: bool,
     robinhood_mcp_command_configured: bool,
+    tradier_credentials_configured: bool,
     order_ledger: String,
     decision: Option<PortfolioCanaryRunDecision>,
     error: Option<String>,
@@ -2793,6 +3462,7 @@ struct CanaryWorkerSnapshot {
     tray_title: String,
     tray_tooltip: String,
     rows: Vec<SnapshotRow>,
+    broker_rows: Vec<SnapshotRow>,
     action_rows: Vec<SnapshotRow>,
 }
 
@@ -2801,6 +3471,21 @@ struct SnapshotRow {
     label: String,
     value: String,
     tone: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrokerAccountSnapshot {
+    broker: CanaryBrokerKind,
+    status: String,
+    account: String,
+    equity: Option<f64>,
+    buying_power: Option<f64>,
+    cash: Option<f64>,
+    day_pnl: Option<f64>,
+    open_pnl: Option<f64>,
+    close_pnl: Option<f64>,
+    requirement: Option<f64>,
+    error: Option<String>,
 }
 
 fn canary_worker_snapshot(
@@ -2823,7 +3508,12 @@ fn canary_worker_snapshot(
                 .map(|age| format!("{age}s"))
                 .unwrap_or_else(|| "missing".to_owned())
         );
-        for row in snapshot.rows.iter().chain(snapshot.action_rows.iter()) {
+        for row in snapshot
+            .rows
+            .iter()
+            .chain(snapshot.broker_rows.iter())
+            .chain(snapshot.action_rows.iter())
+        {
             println!("{}: {}", row.label, row.value);
         }
     }
@@ -2849,7 +3539,7 @@ fn build_canary_worker_snapshot(
         .unwrap_or(true);
     let status = snapshot_status(health.as_ref(), worker_running, health_stale);
     let tray_title = match status.as_str() {
-        "monitor" => "SF monitor",
+        "monitor" => "SF monitoring",
         "review" => "SF review",
         "live" => "SF live",
         "blocked" => "SF blocked",
@@ -2885,13 +3575,13 @@ fn build_canary_worker_snapshot(
         rows.extend([
             snapshot_row(
                 "Decision",
-                health.status.as_str(),
+                snapshot_decision_label(health).as_str(),
                 snapshot_tone(&health.status),
             ),
             snapshot_row(
                 "Broker",
                 broker_capability_summary(health).as_str(),
-                if health.robinhood_mcp_command_configured {
+                if broker_execution_configured(health) {
                     "ok"
                 } else {
                     "warn"
@@ -2914,6 +3604,8 @@ fn build_canary_worker_snapshot(
         ]);
     }
 
+    let broker_account = snapshot_broker_account(health.as_ref());
+    let broker_rows = snapshot_broker_rows(broker_account.as_ref());
     let action_rows = snapshot_action_rows(health.as_ref());
     CanaryWorkerSnapshot {
         updated_at: now,
@@ -2927,6 +3619,7 @@ fn build_canary_worker_snapshot(
         tray_title,
         tray_tooltip,
         rows,
+        broker_rows,
         action_rows,
     }
 }
@@ -2964,10 +3657,10 @@ fn snapshot_tooltip(
 
 fn snapshot_action_rows(health: Option<&CanaryWorkerHealth>) -> Vec<SnapshotRow> {
     let Some(decision) = health.and_then(|health| health.decision.as_ref()) else {
-        return vec![snapshot_row("Action", "none", "warn")];
+        return Vec::new();
     };
     let Some(action) = decision.selected_action.as_ref() else {
-        return vec![snapshot_row("Action", decision.reason.as_str(), "warn")];
+        return Vec::new();
     };
     let mut rows = vec![
         snapshot_row(
@@ -2994,6 +3687,248 @@ fn snapshot_action_rows(health: Option<&CanaryWorkerHealth>) -> Vec<SnapshotRow>
     rows
 }
 
+fn snapshot_decision_label(health: &CanaryWorkerHealth) -> String {
+    match health
+        .decision
+        .as_ref()
+        .map(|decision| decision.status.as_str())
+    {
+        Some("monitor_no_action") => "Monitoring".to_owned(),
+        Some("monitor_ready") => "Ready".to_owned(),
+        Some("monitor_open_candidate_only") => "Monitoring".to_owned(),
+        Some("monitor_risk_blocked") => "Risk blocked".to_owned(),
+        Some("monitor_broker_unsupported") => "Broker blocked".to_owned(),
+        Some("review_required") => "Review needed".to_owned(),
+        Some("review_ready") => "Review ready".to_owned(),
+        Some("review_failed") => "Review failed".to_owned(),
+        Some("live_submitted") => "Live submitted".to_owned(),
+        Some("live_already_submitted") => "Live active".to_owned(),
+        Some("live_rejected") => "Live rejected".to_owned(),
+        Some("live_submit_unknown") => "Live unknown".to_owned(),
+        Some("live_blocked") => "Live blocked".to_owned(),
+        Some(other) => other.replace('_', " "),
+        None => health.status.replace('_', " "),
+    }
+}
+
+fn snapshot_broker_account(health: Option<&CanaryWorkerHealth>) -> Option<BrokerAccountSnapshot> {
+    let health = health?;
+    match health.broker {
+        CanaryBrokerKind::Robinhood => Some(BrokerAccountSnapshot {
+            broker: CanaryBrokerKind::Robinhood,
+            status: "unsupported".to_owned(),
+            account: "Robinhood MCP".to_owned(),
+            equity: None,
+            buying_power: None,
+            cash: None,
+            day_pnl: None,
+            open_pnl: None,
+            close_pnl: None,
+            requirement: None,
+            error: Some("account/P&L snapshot not implemented for Robinhood MCP".to_owned()),
+        }),
+        CanaryBrokerKind::Tradier => snapshot_tradier_account(),
+    }
+}
+
+fn snapshot_tradier_account() -> Option<BrokerAccountSnapshot> {
+    let config = match tradier_config_from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            return Some(BrokerAccountSnapshot {
+                broker: CanaryBrokerKind::Tradier,
+                status: "unconfigured".to_owned(),
+                account: "Tradier".to_owned(),
+                equity: None,
+                buying_power: None,
+                cash: None,
+                day_pnl: None,
+                open_pnl: None,
+                close_pnl: None,
+                requirement: None,
+                error: Some(err.to_string()),
+            });
+        }
+    };
+    let account = masked_account_label("Tradier", &config.account_id);
+    let client = match TradierClient::new_with_timeout(config, StdDuration::from_secs(5)) {
+        Ok(client) => client,
+        Err(err) => {
+            return Some(BrokerAccountSnapshot {
+                broker: CanaryBrokerKind::Tradier,
+                status: "error".to_owned(),
+                account,
+                equity: None,
+                buying_power: None,
+                cash: None,
+                day_pnl: None,
+                open_pnl: None,
+                close_pnl: None,
+                requirement: None,
+                error: Some(err.to_string()),
+            });
+        }
+    };
+    let response = match client.get_balances() {
+        Ok(response) => response,
+        Err(err) => {
+            return Some(BrokerAccountSnapshot {
+                broker: CanaryBrokerKind::Tradier,
+                status: "error".to_owned(),
+                account,
+                equity: None,
+                buying_power: None,
+                cash: None,
+                day_pnl: None,
+                open_pnl: None,
+                close_pnl: None,
+                requirement: None,
+                error: Some(err.to_string()),
+            });
+        }
+    };
+    if !response.ok {
+        return Some(BrokerAccountSnapshot {
+            broker: CanaryBrokerKind::Tradier,
+            status: "error".to_owned(),
+            account,
+            equity: None,
+            buying_power: None,
+            cash: None,
+            day_pnl: None,
+            open_pnl: None,
+            close_pnl: None,
+            requirement: None,
+            error: response.error,
+        });
+    }
+    let Some(balances) = response.balances else {
+        return Some(BrokerAccountSnapshot {
+            broker: CanaryBrokerKind::Tradier,
+            status: "error".to_owned(),
+            account,
+            equity: None,
+            buying_power: None,
+            cash: None,
+            day_pnl: None,
+            open_pnl: None,
+            close_pnl: None,
+            requirement: None,
+            error: Some("Tradier balances response missing balances object".to_owned()),
+        });
+    };
+    let account = balances
+        .account_number
+        .as_deref()
+        .map(|account| masked_account_label("Tradier", account))
+        .unwrap_or(account);
+    let day_pnl = match (balances.close_pl, balances.open_pl) {
+        (Some(close_pl), Some(open_pl)) => Some(close_pl + open_pl),
+        (Some(close_pl), None) => Some(close_pl),
+        (None, Some(open_pl)) => Some(open_pl),
+        (None, None) => None,
+    };
+    Some(BrokerAccountSnapshot {
+        broker: CanaryBrokerKind::Tradier,
+        status: "ok".to_owned(),
+        account,
+        equity: balances.equity,
+        buying_power: balances.option_buying_power.or(balances.total_cash),
+        cash: balances.cash,
+        day_pnl,
+        open_pnl: balances.open_pl,
+        close_pnl: balances.close_pl,
+        requirement: balances.current_requirement.or(balances.option_requirement),
+        error: None,
+    })
+}
+
+fn snapshot_broker_rows(account: Option<&BrokerAccountSnapshot>) -> Vec<SnapshotRow> {
+    let Some(account) = account else {
+        return Vec::new();
+    };
+    let mut rows = vec![snapshot_row(
+        "Account",
+        account.account.as_str(),
+        if account.status == "ok" { "ok" } else { "warn" },
+    )];
+    if let Some(equity) = account.equity {
+        rows.push(snapshot_row("Equity", format_money(equity).as_str(), "ok"));
+    }
+    if let Some(buying_power) = account.buying_power {
+        rows.push(snapshot_row(
+            "Buy Power",
+            format_money(buying_power).as_str(),
+            "ok",
+        ));
+    }
+    if let Some(cash) = account.cash {
+        rows.push(snapshot_row("Cash", format_money(cash).as_str(), "ok"));
+    }
+    if let Some(day_pnl) = account.day_pnl {
+        rows.push(snapshot_row(
+            "Day P&L",
+            format_signed_money(day_pnl).as_str(),
+            pnl_tone(day_pnl),
+        ));
+    }
+    if let Some(open_pnl) = account.open_pnl {
+        rows.push(snapshot_row(
+            "Open P&L",
+            format_signed_money(open_pnl).as_str(),
+            pnl_tone(open_pnl),
+        ));
+    }
+    if let Some(requirement) = account.requirement {
+        rows.push(snapshot_row(
+            "Requirement",
+            format_money(requirement).as_str(),
+            "warn",
+        ));
+    }
+    if account.status != "ok" {
+        rows.push(snapshot_row(
+            "Account Status",
+            account.error.as_deref().unwrap_or(account.status.as_str()),
+            "warn",
+        ));
+    }
+    rows
+}
+
+fn masked_account_label(broker: &str, account_id: &str) -> String {
+    let trimmed = account_id.trim();
+    if trimmed.len() <= 4 {
+        return format!("{broker} {trimmed}");
+    }
+    let suffix = &trimmed[trimmed.len() - 4..];
+    format!("{broker} ****{suffix}")
+}
+
+fn format_money(value: f64) -> String {
+    format!("${value:.2}")
+}
+
+fn format_signed_money(value: f64) -> String {
+    if value > 0.0 {
+        format!("+${value:.2}")
+    } else if value < 0.0 {
+        format!("-${:.2}", value.abs())
+    } else {
+        "$0.00".to_owned()
+    }
+}
+
+fn pnl_tone(value: f64) -> &'static str {
+    if value > 0.0 {
+        "ok"
+    } else if value < 0.0 {
+        "bad"
+    } else {
+        "neutral"
+    }
+}
+
 fn broker_capability_summary(health: &CanaryWorkerHealth) -> String {
     let mut capabilities = Vec::new();
     if health.broker_multi_leg_options {
@@ -3006,9 +3941,20 @@ fn broker_capability_summary(health: &CanaryWorkerHealth) -> String {
         capabilities.push("covered calls");
     }
     if capabilities.is_empty() {
-        "monitor-only".to_owned()
+        format!("{} monitor-only", canary_broker_label(health.broker))
     } else {
-        capabilities.join(", ")
+        format!(
+            "{} {}",
+            canary_broker_label(health.broker),
+            capabilities.join(", ")
+        )
+    }
+}
+
+fn broker_execution_configured(health: &CanaryWorkerHealth) -> bool {
+    match health.broker {
+        CanaryBrokerKind::Robinhood => health.robinhood_mcp_command_configured,
+        CanaryBrokerKind::Tradier => health.tradier_credentials_configured,
     }
 }
 
@@ -3128,6 +4074,7 @@ fn canary_notification_key(health: &CanaryWorkerHealth) -> Option<String> {
         [
             decision.status.as_str(),
             canary_mode_label(decision.mode),
+            canary_broker_label(decision.broker),
             action.symbol.as_str(),
             action.strategy.as_str(),
             action.entry_date.as_deref().unwrap_or(""),
@@ -3149,6 +4096,7 @@ fn canary_status_should_notify(status: &str) -> bool {
             | "review_ready"
             | "review_failed"
             | "live_submitted"
+            | "live_submit_unknown"
             | "live_rejected"
     )
 }
@@ -3171,6 +4119,7 @@ fn canary_notification_payload(health: &CanaryWorkerHealth, key: &str) -> Result
         "checked_at": health.checked_at,
         "status": decision.status,
         "mode": canary_mode_label(decision.mode),
+        "broker": canary_broker_label(decision.broker),
         "reason": decision.reason,
         "broker_review_ok": decision.broker_review_ok,
         "action": action,
@@ -3249,12 +4198,16 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
                     args.mode,
                     args.max_order_age_seconds,
                 );
-                if let Err(err) = apply_robinhood_mcp_bridge(
+                if let Err(err) = apply_broker_bridge(
                     &mut canary_decision,
+                    &args.broker,
                     args.robinhood_mcp_command.as_deref(),
                     Some(&args.order_ledger),
                 ) {
-                    error = Some(format!("Robinhood MCP bridge: {err}"));
+                    error = Some(format!(
+                        "{} broker bridge: {err}",
+                        canary_broker_label(args.broker.kind)
+                    ));
                 }
                 decision = Some(canary_decision);
                 true
@@ -3282,12 +4235,14 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
         broker_multi_leg_options: args.broker.capabilities.multi_leg_options,
         broker_cash_secured_puts: args.broker.capabilities.cash_secured_puts,
         broker_covered_calls: args.broker.capabilities.covered_calls,
+        broker: args.broker.kind,
         mode: args.mode,
         broker_review_ok: decision
             .as_ref()
             .map(|decision| decision.broker_review_ok)
             .unwrap_or(false),
         robinhood_mcp_command_configured: args.robinhood_mcp_command.is_some(),
+        tradier_credentials_configured: tradier_config_from_env().is_ok(),
         order_ledger: args.order_ledger.display().to_string(),
         decision,
         error,
@@ -3305,7 +4260,7 @@ fn canary_worker_aggregate_status(
         Some("monitor_ready" | "monitor_no_action" | "monitor_open_candidate_only") => "monitor",
         Some("review_required" | "review_ready") => "review",
         Some("live_submitted" | "live_already_submitted") => "live",
-        Some("review_failed" | "live_rejected") | None => "unhealthy",
+        Some("review_failed" | "live_rejected" | "live_submit_unknown") | None => "unhealthy",
         Some(_) => "blocked",
     }
 }
@@ -3323,20 +4278,39 @@ fn write_canary_worker_health(path: &Path, health: &CanaryWorkerHealth) -> Resul
 }
 
 fn canary_broker(
+    kind: CanaryBrokerKind,
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
     live_orders_enabled: bool,
-) -> RobinhoodBrokerAdapter {
-    RobinhoodBrokerAdapter {
-        capabilities: BrokerCapabilities {
+) -> CanaryBrokerAdapter {
+    let capabilities = match kind {
+        CanaryBrokerKind::Robinhood => BrokerCapabilities {
             single_leg_options: true,
             multi_leg_options: broker_multi_leg_options,
             stock_option_combos: false,
             cash_secured_puts: broker_cash_secured_puts,
             covered_calls: broker_covered_calls,
         },
+        CanaryBrokerKind::Tradier => BrokerCapabilities {
+            single_leg_options: true,
+            multi_leg_options: true,
+            stock_option_combos: false,
+            cash_secured_puts: false,
+            covered_calls: false,
+        },
+    };
+    CanaryBrokerAdapter {
+        kind,
+        capabilities,
         live_orders_enabled,
+    }
+}
+
+fn canary_broker_label(kind: CanaryBrokerKind) -> &'static str {
+    match kind {
+        CanaryBrokerKind::Robinhood => "robinhood",
+        CanaryBrokerKind::Tradier => "tradier",
     }
 }
 
@@ -5141,6 +6115,7 @@ mod tests {
                 output,
                 candidate_id,
                 frozen_on,
+                allow_risk_controlled_live,
             } => {
                 assert_eq!(run, PathBuf::from("runs/example"));
                 assert_eq!(output, PathBuf::from("candidates/example.json"));
@@ -5149,6 +6124,7 @@ mod tests {
                     frozen_on,
                     Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap())
                 );
+                assert!(!allow_risk_controlled_live);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -5220,6 +6196,7 @@ mod tests {
                 free_cash_buffer,
                 max_wheel_positions_per_symbol,
                 mode,
+                broker,
                 broker_multi_leg_options,
                 broker_cash_secured_puts,
                 broker_covered_calls,
@@ -5237,6 +6214,7 @@ mod tests {
                 assert_eq!(free_cash_buffer, 11_250.0);
                 assert_eq!(max_wheel_positions_per_symbol, 1);
                 assert_eq!(mode, CanaryMode::Live);
+                assert_eq!(broker, CanaryBrokerKind::Tradier);
                 assert!(broker_multi_leg_options);
                 assert!(broker_cash_secured_puts);
                 assert!(broker_covered_calls);
@@ -5287,6 +6265,7 @@ mod tests {
                 wheel_reserve_cap,
                 free_cash_buffer,
                 max_wheel_positions_per_symbol,
+                broker,
                 broker_multi_leg_options,
                 broker_cash_secured_puts,
                 broker_covered_calls,
@@ -5302,6 +6281,7 @@ mod tests {
                 assert_eq!(wheel_reserve_cap, 35_000.0);
                 assert_eq!(free_cash_buffer, 11_250.0);
                 assert_eq!(max_wheel_positions_per_symbol, 1);
+                assert_eq!(broker, CanaryBrokerKind::Tradier);
                 assert!(broker_multi_leg_options);
                 assert!(broker_cash_secured_puts);
                 assert!(broker_covered_calls);
@@ -6175,6 +7155,462 @@ mod tests {
     }
 
     #[test]
+    fn tradier_call_debit_payload_matches_multileg_shape() {
+        let action = canary_action_summary(
+            &serde_json::json!({
+                "status":"entry_candidate",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }),
+            None,
+        );
+
+        let payload = tradier_multileg_debit_payload(&action).unwrap();
+
+        assert_eq!(payload.get("class").map(String::as_str), Some("multileg"));
+        assert_eq!(payload.get("symbol").map(String::as_str), Some("ORCL"));
+        assert_eq!(payload.get("type").map(String::as_str), Some("debit"));
+        assert_eq!(payload.get("duration").map(String::as_str), Some("day"));
+        assert_eq!(payload.get("price").map(String::as_str), Some("4.50"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("ORCL260702C00220000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("buy_to_open")
+        );
+        assert_eq!(payload.get("quantity[0]").map(String::as_str), Some("1"));
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("ORCL260702C00225000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("sell_to_open")
+        );
+        assert_eq!(payload.get("quantity[1]").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn tradier_put_debit_payload_matches_multileg_shape() {
+        let action = canary_action_summary(
+            &serde_json::json!({
+                "status":"entry_candidate",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+            }),
+            None,
+        );
+
+        let payload = tradier_multileg_debit_payload(&action).unwrap();
+
+        assert_eq!(payload.get("price").map(String::as_str), Some("1.00"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("TSLA260702P00355000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("buy_to_open")
+        );
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("TSLA260702P00350000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("sell_to_open")
+        );
+    }
+
+    #[test]
+    fn tradier_occ_option_symbol_handles_integer_and_decimal_strikes() {
+        let expiration = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let integer = OptionKey::new(
+            "AAPL",
+            expiration,
+            decimal_from_f64(225.0, "strike").unwrap(),
+            OptionRight::Call,
+        );
+        let decimal = OptionKey::new(
+            "AAPL",
+            expiration,
+            decimal_from_f64(12.5, "strike").unwrap(),
+            OptionRight::Put,
+        );
+
+        assert_eq!(
+            tradier_occ_option_symbol(&integer).unwrap(),
+            "AAPL260702C00225000"
+        );
+        assert_eq!(
+            tradier_occ_option_symbol(&decimal).unwrap(),
+            "AAPL260702P00012500"
+        );
+    }
+
+    #[test]
+    fn tradier_invalid_spread_geometry_is_rejected_before_http() {
+        let action = canary_action_summary(
+            &serde_json::json!({
+                "status":"entry_candidate",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":220.0,
+                "long_strike":225.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+            }),
+            None,
+        );
+
+        let err = tradier_multileg_debit_payload(&action).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("long call strike below short call strike")
+        );
+    }
+
+    #[test]
+    fn tradier_monitor_mode_does_not_require_credentials() {
+        let artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"ORCL",
+            "strategy":"call_debit_spread",
+            "entry_date":"2026-06-29",
+            "exit_date":"2026-06-29",
+            "expiration":"2026-07-02",
+            "short_strike":225.0,
+            "long_strike":220.0,
+            "entry_credit":-4.50,
+            "max_loss":450.0
+        }]));
+        let broker = canary_broker(CanaryBrokerKind::Tradier, false, false, false, false);
+
+        let decision = portfolio_canary_run_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            CanaryMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "monitor_ready");
+        assert_eq!(decision.broker, CanaryBrokerKind::Tradier);
+    }
+
+    #[test]
+    fn canary_worker_default_broker_is_tradier_monitor_safe() {
+        let path = unique_main_test_path("canary-worker-default-tradier.json");
+        fs::write(
+            &path,
+            r#"{
+                "status":"canary_only",
+                "decision":{"canary_ready":true,"research_gate":"research_pass"},
+                "latest_actions":[{"status":"recent_closed","symbol":"TSLA","strategy":"put_debit_spread","entry_date":"2026-06-25","exit_date":"2026-06-26","max_loss":100.0}]
+            }"#,
+        )
+        .unwrap();
+        let args = CanaryWorkerArgs {
+            candidate: path.clone(),
+            as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            risk: test_canary_risk(),
+            broker: canary_broker(CanaryBrokerKind::Tradier, false, false, false, false),
+            mode: CanaryMode::Monitor,
+            robinhood_mcp_command: None,
+            order_ledger: unique_main_test_path("canary-order-ledger-default-tradier.json"),
+            notify_command: None,
+            notify_ledger: unique_main_test_path("canary-notify-ledger-default-tradier.json"),
+            max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
+            poll_seconds: 60,
+            once: true,
+            health_output: None,
+            json: true,
+        };
+
+        let health = canary_worker_health(&args);
+
+        assert_eq!(health.status, "monitor");
+        assert_eq!(health.broker, CanaryBrokerKind::Tradier);
+        assert!(!health.tradier_credentials_configured);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tradier_review_mode_fails_closed_without_credentials() {
+        let artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"ORCL",
+            "strategy":"call_debit_spread",
+            "entry_date":"2026-06-29",
+            "exit_date":"2026-06-29",
+            "expiration":"2026-07-02",
+            "short_strike":225.0,
+            "long_strike":220.0,
+            "entry_credit":-4.50,
+            "max_loss":450.0
+        }]));
+        let broker = canary_broker(CanaryBrokerKind::Tradier, false, false, false, false);
+        let mut decision = portfolio_canary_run_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            CanaryMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        apply_tradier_rest_bridge_with_config_result(
+            &mut decision,
+            None,
+            Err(anyhow::anyhow!("missing test credentials")),
+        )
+        .unwrap();
+
+        assert_eq!(decision.status, "review_failed");
+        assert!(
+            decision
+                .reason
+                .contains("Tradier credentials are not configured")
+        );
+    }
+
+    #[test]
+    fn tradier_review_sends_preview_without_place() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+        )]);
+        let mut decision = tradier_test_decision(CanaryMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "review_ready");
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("preview=true"));
+        assert!(bodies[0].contains("class=multileg"));
+        assert!(bodies[0].contains("type=debit"));
+    }
+
+    #[test]
+    fn tradier_live_previews_then_places_same_payload() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+            ),
+            (200, r#"{"order":{"id":"placed","status":"ok"}}"#),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-live.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "live_submitted");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("preview=true"));
+        assert!(bodies[1].contains("preview=false"));
+        assert_eq!(
+            bodies[0].replace("preview=true", "preview=false"),
+            bodies[1]
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_preview_result_false_blocks_live_placement() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"ok","result":false,"reason_description":"bp fail"}}"#,
+        )]);
+        let ledger = unique_main_test_path("tradier-order-ledger-preview-result-false.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "review_failed");
+        assert!(decision.reason.contains("bp fail"));
+        assert_eq!(bodies.len(), 1);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    fn tradier_preview_failure_blocks_live_placement() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(400, r#"{"errors":"bad"}"#)]);
+        let ledger = unique_main_test_path("tradier-order-ledger-preview-fail.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "review_failed");
+        assert_eq!(bodies.len(), 1);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    fn tradier_rejected_preview_body_blocks_live_placement() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"rejected","result":false,"reason":"test rejection"}}"#,
+        )]);
+        let ledger = unique_main_test_path("tradier-order-ledger-body-rejected.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "review_failed");
+        assert_eq!(bodies.len(), 1);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    fn tradier_duplicate_ledger_blocks_second_placement() {
+        let ledger = unique_main_test_path("tradier-order-ledger-duplicate.json");
+        let config = test_tradier_config("http://127.0.0.1:1/v1".to_owned());
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_action.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_action.as_ref().unwrap(),
+        );
+        canary_order_ledger_record(&ledger, &order_key).unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        assert_eq!(decision.status, "live_already_submitted");
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_rejected_ledger_entry_does_not_block_retry() {
+        let ledger = unique_main_test_path("tradier-order-ledger-rejected-retry.json");
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+        )]);
+        let config = test_tradier_config(base_url);
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_action.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_action.as_ref().unwrap(),
+        );
+        canary_order_ledger_record_status(
+            &ledger,
+            &order_key,
+            "rejected",
+            None,
+            Some("prior clean rejection"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+        let bodies = collect_mock_requests(requests, handle);
+
+        assert_eq!(decision.status, "live_submit_unknown");
+        assert_eq!(bodies.len(), 1);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_place_transport_failure_is_unknown_not_rejected() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+        )]);
+        let ledger = unique_main_test_path("tradier-order-ledger-place-unknown.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "live_submit_unknown");
+        assert!(decision.reason.contains("check Tradier before retrying"));
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            read_canary_order_ledger(&ledger)
+                .unwrap()
+                .values()
+                .any(|entry| entry.status == "pending_unknown")
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_place_error_status_is_rejected_not_submitted() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+            ),
+            (
+                200,
+                r#"{"order":{"id":"placed","status":"error","reason_description":"broker rejected"}}"#,
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-place-error.json");
+        let mut decision = tradier_test_decision(CanaryMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "live_rejected");
+        assert!(decision.reason.contains("broker rejected"));
+        assert_eq!(bodies.len(), 2);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_network_error_does_not_crash_worker_decision() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        drop(listener);
+        let mut decision = tradier_test_decision(CanaryMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        assert_eq!(decision.status, "review_failed");
+        assert!(decision.reason.contains("Tradier preview request failed"));
+    }
+
+    #[test]
     fn portfolio_canary_runner_allows_wheel_after_risk_and_broker_gates() {
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"entry_candidate",
@@ -6231,7 +7667,7 @@ mod tests {
             candidate: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             risk: test_canary_risk(),
-            broker: RobinhoodBrokerAdapter::default(),
+            broker: canary_broker(CanaryBrokerKind::Robinhood, false, false, false, false),
             mode: CanaryMode::Monitor,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger.json"),
@@ -6254,6 +7690,8 @@ mod tests {
                 .map(|decision| decision.status.as_str()),
             Some("monitor_no_action")
         );
+        assert_eq!(snapshot_decision_label(&health), "Monitoring");
+        assert!(snapshot_action_rows(Some(&health)).is_empty());
         fs::remove_file(path).unwrap();
     }
 
@@ -6285,16 +7723,7 @@ mod tests {
             candidate: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             risk: test_canary_risk(),
-            broker: RobinhoodBrokerAdapter {
-                capabilities: BrokerCapabilities {
-                    single_leg_options: true,
-                    multi_leg_options: true,
-                    stock_option_combos: false,
-                    cash_secured_puts: false,
-                    covered_calls: false,
-                },
-                live_orders_enabled: false,
-            },
+            broker: canary_broker(CanaryBrokerKind::Robinhood, true, false, false, false),
             mode: CanaryMode::Review,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger-review-required.json"),
@@ -6316,6 +7745,12 @@ mod tests {
                 .as_ref()
                 .map(|decision| decision.status.as_str()),
             Some("review_required")
+        );
+        assert_eq!(snapshot_decision_label(&health), "Review needed");
+        assert!(
+            snapshot_action_rows(Some(&health))
+                .iter()
+                .any(|row| row.label == "Action" && row.value == "ORCL call_debit_spread")
         );
         fs::remove_file(path).unwrap();
     }
@@ -6349,16 +7784,7 @@ mod tests {
             candidate: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             risk: test_canary_risk(),
-            broker: RobinhoodBrokerAdapter {
-                capabilities: BrokerCapabilities {
-                    single_leg_options: true,
-                    multi_leg_options: true,
-                    stock_option_combos: false,
-                    cash_secured_puts: false,
-                    covered_calls: false,
-                },
-                live_orders_enabled: false,
-            },
+            broker: canary_broker(CanaryBrokerKind::Robinhood, true, false, false, false),
             mode: CanaryMode::Monitor,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger-notify.json"),
@@ -6407,6 +7833,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &RobinhoodBrokerAdapter::default(),
+            false,
             false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
@@ -6470,6 +7897,7 @@ mod tests {
             35_000.0,
             11_250.0,
             1,
+            CanaryBrokerKind::Robinhood,
             true,
             false,
             false,
@@ -6489,6 +7917,7 @@ mod tests {
             35_000.0,
             11_250.0,
             1,
+            CanaryBrokerKind::Robinhood,
             true,
             false,
             false,
@@ -6550,6 +7979,7 @@ mod tests {
             &test_canary_risk(),
             &broker,
             true,
+            false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -6604,6 +8034,7 @@ mod tests {
             &test_canary_risk(),
             &broker,
             true,
+            false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
         let live_err =
@@ -6640,6 +8071,126 @@ mod tests {
             },
             "latest_actions": latest_actions
         })
+    }
+
+    fn tradier_test_decision(mode: CanaryMode) -> PortfolioCanaryRunDecision {
+        let as_of = if mode == CanaryMode::Live {
+            Utc::now().date_naive()
+        } else {
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
+        };
+        let as_of_s = as_of.to_string();
+        let artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"ORCL",
+            "strategy":"call_debit_spread",
+            "entry_date":as_of_s,
+            "exit_date":as_of_s,
+            "expiration":"2026-07-02",
+            "short_strike":225.0,
+            "long_strike":220.0,
+            "entry_credit":-4.50,
+            "max_loss":450.0
+        }]));
+        let broker = canary_broker(
+            CanaryBrokerKind::Tradier,
+            false,
+            false,
+            false,
+            mode == CanaryMode::Live,
+        );
+        portfolio_canary_run_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            mode,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        )
+    }
+
+    fn test_tradier_config(base_url: String) -> TradierConfig {
+        TradierConfig {
+            account_id: "TEST123".to_owned(),
+            token: "test-token".to_owned(),
+            base_url,
+        }
+    }
+
+    fn spawn_tradier_mock(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                tx.send(request).unwrap();
+                let status_text = if status == 200 { "OK" } else { "Bad Request" };
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, rx, handle)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = find_header_end(&buffer) {
+                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                if buffer.len() >= body_start + content_length {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8(buffer).unwrap();
+        request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or(request)
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn collect_mock_requests(
+        requests: std::sync::mpsc::Receiver<String>,
+        handle: std::thread::JoinHandle<()>,
+    ) -> Vec<String> {
+        handle.join().unwrap();
+        requests.try_iter().collect()
     }
 
     #[test]

@@ -12,6 +12,7 @@ struct CanarySnapshot: Decodable {
     let trayTitle: String
     let trayTooltip: String
     let rows: [SnapshotRow]
+    let brokerRows: [SnapshotRow]
     let actionRows: [SnapshotRow]
 
     static let unavailable = CanarySnapshot(
@@ -26,6 +27,7 @@ struct CanarySnapshot: Decodable {
         trayTitle: "SF down",
         trayTooltip: "Snapshot unavailable",
         rows: [],
+        brokerRows: [],
         actionRows: []
     )
 
@@ -33,6 +35,23 @@ struct CanarySnapshot: Decodable {
         rows
             .first { $0.label == "Mode" }
             .flatMap { CanaryModeChoice(rawValue: $0.value) }
+    }
+
+    var statusTitle: String {
+        switch status {
+        case "monitor":
+            return "Monitoring"
+        case "review":
+            return "Review"
+        case "live":
+            return "Live"
+        case "blocked":
+            return "Blocked"
+        case "unhealthy":
+            return "Down"
+        default:
+            return status.replacingOccurrences(of: "_", with: " ").capitalized
+        }
     }
 }
 

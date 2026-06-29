@@ -14,11 +14,22 @@ struct MenubarMenuContent: View {
             }
             modePicker
 
-            panelDivider()
+            if !viewModel.snapshot.brokerRows.isEmpty {
+                panelDivider()
 
-            SectionHeaderRow(title: "Action", systemImage: "scope")
-            ForEach(viewModel.snapshot.actionRows) { row in
-                ValueRow(label: row.label, value: row.value, tone: RowTone(row.tone))
+                SectionHeaderRow(title: "Broker", systemImage: "building.columns")
+                ForEach(viewModel.snapshot.brokerRows) { row in
+                    BrokerValueRow(row: row)
+                }
+            }
+
+            if !viewModel.snapshot.actionRows.isEmpty {
+                panelDivider()
+
+                SectionHeaderRow(title: "Action", systemImage: "scope")
+                ForEach(viewModel.snapshot.actionRows) { row in
+                    ValueRow(label: row.label, value: row.value, tone: RowTone(row.tone))
+                }
             }
 
             if let errorMessage = viewModel.errorMessage {
@@ -76,7 +87,7 @@ struct MenubarMenuContent: View {
 
             Spacer(minLength: MenuLayoutMetrics.columnSpacing)
 
-            Text(viewModel.snapshot.status)
+            Text(viewModel.snapshot.statusTitle)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(RowTone(statusTone).color)
                 .monospacedDigit()
@@ -143,6 +154,48 @@ struct MenubarMenuContent: View {
                 .menuPanelRow()
         }
         .buttonStyle(MenuPanelButtonStyle())
+    }
+}
+
+private struct BrokerValueRow: View {
+    let row: SnapshotRow
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: MenuLayoutMetrics.columnSpacing) {
+            MenuRowIcon(systemName: systemImage)
+            Text(row.label)
+                .lineLimit(1)
+            Spacer(minLength: MenuLayoutMetrics.columnSpacing)
+            Text(row.value)
+                .foregroundStyle(RowTone(row.tone).valueColor)
+                .monospacedDigit()
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .multilineTextAlignment(.trailing)
+        }
+        .menuPanelRow()
+        .allowsHitTesting(false)
+    }
+
+    private var systemImage: String {
+        switch row.label {
+        case "Account":
+            return "person.text.rectangle"
+        case "Equity":
+            return "chart.line.uptrend.xyaxis"
+        case "Buy Power":
+            return "bolt.circle"
+        case "Cash":
+            return "dollarsign.circle"
+        case "Day P&L":
+            return "calendar"
+        case "Open P&L":
+            return "waveform.path.ecg"
+        case "Requirement":
+            return "lock"
+        default:
+            return "info.circle"
+        }
     }
 }
 

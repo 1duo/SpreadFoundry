@@ -35,6 +35,7 @@ canary_env_names() {
     SPREAD_CANARY_MAX_ORDER_AGE_SECONDS \
     SPREAD_CANARY_POLL_SECONDS \
     SPREAD_CANARY_MODE \
+    SPREAD_CANARY_BROKER \
     SPREAD_CANARY_ACCOUNT_CASH \
     SPREAD_CANARY_DEBIT_MAX_LOSS \
     SPREAD_CANARY_WHEEL_RESERVE_CAP \
@@ -48,7 +49,10 @@ canary_env_names() {
     SPREAD_NTFY_TOKEN \
     SPREAD_NTFY_PRIORITY \
     SPREAD_NTFY_TIMEOUT_SECONDS \
-    SPREAD_ROBINHOOD_MCP_COMMAND
+    SPREAD_ROBINHOOD_MCP_COMMAND \
+    SPREAD_TRADIER_ACCOUNT_ID \
+    SPREAD_TRADIER_TOKEN \
+    SPREAD_TRADIER_BASE_URL
 }
 
 load_saved_canary_env() {
@@ -67,14 +71,16 @@ load_saved_canary_env() {
 persist_canary_env() {
   mkdir -p "$(dirname "$env_file")"
   local tmp_file="${env_file}.tmp"
-  : > "$tmp_file"
+  (umask 077 && : > "$tmp_file")
   local env_name
   while IFS= read -r env_name; do
     if [[ -n "${!env_name+x}" ]]; then
       printf 'export %s=%q\n' "$env_name" "${!env_name}" >> "$tmp_file"
     fi
   done < <(canary_env_names)
+  chmod 600 "$tmp_file"
   mv "$tmp_file" "$env_file"
+  chmod 600 "$env_file"
 }
 
 set_worker_mode() {
@@ -110,6 +116,32 @@ configure_ntfy() {
   export SPREAD_NTFY_TIMEOUT_SECONDS="${SPREAD_NTFY_TIMEOUT_SECONDS:-10}"
   persist_canary_env
   echo "configured ntfy topic=$SPREAD_NTFY_TOPIC command=$SPREAD_CANARY_NOTIFY_COMMAND"
+}
+
+configure_tradier() {
+  local environment="${1:-}"
+  local base_url
+  case "$environment" in
+    sandbox)
+      base_url="https://sandbox.tradier.com/v1"
+      ;;
+    production)
+      base_url="https://api.tradier.com/v1"
+      ;;
+    *)
+      echo "usage: $0 configure-tradier {sandbox|production}" >&2
+      exit 2
+      ;;
+  esac
+  load_saved_canary_env
+  if [[ -z "${SPREAD_TRADIER_ACCOUNT_ID:-}" || -z "${SPREAD_TRADIER_TOKEN:-}" ]]; then
+    echo "SPREAD_TRADIER_ACCOUNT_ID and SPREAD_TRADIER_TOKEN must be exported before configure-tradier" >&2
+    exit 2
+  fi
+  export SPREAD_CANARY_BROKER=tradier
+  export SPREAD_TRADIER_BASE_URL="$base_url"
+  persist_canary_env
+  echo "configured tradier environment=$environment broker=$SPREAD_CANARY_BROKER base_url=$SPREAD_TRADIER_BASE_URL account_id=$SPREAD_TRADIER_ACCOUNT_ID"
 }
 
 start_worker() {
@@ -166,24 +198,24 @@ stop_worker() {
 }
 
 write_launch_files() {
-  cat > "$launch_script" <<EOF
+  (umask 077 && cat > "$launch_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$repo_root"
 echo "\$\$" > "$pid_file"
+if [[ -f "$env_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$env_file"
+fi
 EOF
-  while IFS= read -r env_name; do
-    if [[ -n "${!env_name+x}" ]]; then
-      printf 'export %s=%q\n' "$env_name" "${!env_name}" >> "$launch_script"
-    fi
-  done < <(canary_env_names)
   cat >> "$launch_script" <<EOF
 export SPREAD_BINARY="$spreadfoundry_bin"
 export SPREAD_CANARY_ONCE=0
 export SPREAD_CANARY_HEALTH_OUTPUT="$health_output"
 exec "$repo_root/scripts/run_canary_worker.sh"
 EOF
-  chmod +x "$launch_script"
+  )
+  chmod 700 "$launch_script"
   cat > "$launch_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -212,6 +244,8 @@ EOF
 }
 
 snapshot_worker() {
+  load_saved_canary_env
+  spreadfoundry_bin="${SPREAD_BINARY:-$spreadfoundry_bin}"
   if [[ -x "$spreadfoundry_bin" ]]; then
     "$spreadfoundry_bin" canary-worker-snapshot \
       --health-output "$health_output" \
@@ -235,6 +269,7 @@ readiness_report() {
   local free_cash_buffer="${SPREAD_CANARY_FREE_CASH_BUFFER:-11250}"
   local max_wheel_positions_per_symbol="${SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL:-1}"
   local max_order_age_seconds="${SPREAD_CANARY_MAX_ORDER_AGE_SECONDS:-1800}"
+  local broker="${SPREAD_CANARY_BROKER:-tradier}"
   local cli_args=(
     canary-live-readiness
     --candidate "$candidate"
@@ -243,6 +278,7 @@ readiness_report() {
     --wheel-reserve-cap "$wheel_reserve_cap"
     --free-cash-buffer "$free_cash_buffer"
     --max-wheel-positions-per-symbol "$max_wheel_positions_per_symbol"
+    --broker "$broker"
     --max-order-age-seconds "$max_order_age_seconds"
     --json
   )
@@ -284,6 +320,9 @@ case "${1:-status}" in
   configure-ntfy)
     configure_ntfy "${2:-}"
     ;;
+  configure-tradier)
+    configure_tradier "${2:-}"
+    ;;
   status|snapshot)
     snapshot_worker
     ;;
@@ -296,7 +335,7 @@ case "${1:-status}" in
     tail -n "${SPREAD_CANARY_LOG_LINES:-80}" "$log_file"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|set-mode|configure-ntfy|status|snapshot|readiness|log}" >&2
+    echo "usage: $0 {start|stop|restart|set-mode|configure-ntfy|configure-tradier|status|snapshot|readiness|log}" >&2
     exit 2
     ;;
 esac

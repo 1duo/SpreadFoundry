@@ -68,7 +68,7 @@ Output shape:
   "ok": true,
   "tool": "review_option_order",
   "raw": {
-    "order_key": "{\"server\":\"robinhood-trading\",\"arguments\":{...}}",
+    "order_key": "{\"broker\":\"robinhood\",\"server\":\"robinhood-trading\",\"arguments\":{...}}",
     "broker_preview_verified": true
   }
 }
@@ -96,6 +96,7 @@ Monitor-only production, no Robinhood calls:
 
 ```sh
 SPREAD_CANARY_MODE=monitor \
+SPREAD_CANARY_BROKER=robinhood \
 scripts/run_canary_worker.sh
 ```
 
@@ -103,6 +104,7 @@ Review-only production through MCP bridge, no placement:
 
 ```sh
 SPREAD_CANARY_MODE=review \
+SPREAD_CANARY_BROKER=robinhood \
 SPREAD_ROBINHOOD_MCP_COMMAND=/path/to/bridge \
 SPREAD_CANARY_BROKER_CASH_SECURED_PUTS=1 \
 SPREAD_CANARY_BROKER_COVERED_CALLS=1 \
@@ -119,6 +121,7 @@ Live placement requires every prior gate plus:
 
 ```sh
 SPREAD_CANARY_MODE=live
+SPREAD_CANARY_BROKER=robinhood
 ```
 
 `SPREAD_CANARY_MODE` is the only side-effect switch:

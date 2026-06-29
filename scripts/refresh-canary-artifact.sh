@@ -190,11 +190,17 @@ if [[ "$research_code" -ne 0 ]]; then
 fi
 
 set +e
-run_spreadfoundry export-portfolio-canary \
+export_args=(
+  export-portfolio-canary
   --run "$run_dir" \
   --output "$candidate_output" \
   --candidate-id "$candidate_id" \
   --frozen-on "$run_to"
+)
+if [[ "${SPREAD_CANARY_EXPORT_RISK_CONTROLLED_LIVE:-0}" == "1" ]]; then
+  export_args+=(--allow-risk-controlled-live)
+fi
+run_spreadfoundry "${export_args[@]}"
 export_code="$?"
 set -e
 finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

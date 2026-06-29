@@ -19,6 +19,7 @@ flowchart LR
   I --> B["Broker Adapter"]
   S --> R["Research Reports"]
   B --> RH["Robinhood MCP Bridge"]
+  B --> TR["Tradier REST Bridge"]
   W["Worker"] --> D
   W --> B
   W --> H["Health Snapshot"]
@@ -34,7 +35,8 @@ flowchart LR
 - `src/sim.rs`: scenario simulator that calls `execution` for fills and PnL.
 - `src/research.rs`: strategy generation, backtests, ranking, and promotion
   gates. It should move toward calling `execution` for every fill assumption.
-- `src/broker.rs`: broker capability checks and Robinhood MCP command execution.
+- `src/broker.rs`: broker capability checks, Robinhood MCP command execution,
+  and minimal Tradier REST order preview/place calls.
 - `src/main.rs`: CLI orchestration and temporary adapter glue. Long-term
   strategy and execution logic should move out of this file.
 - `scripts/`: service launch, teardown, and health-check entry points.
@@ -121,6 +123,14 @@ decision. `scripts/canary-service.sh configure-ntfy <topic>` persists
 `var/canary_worker.env`. The worker sends compact JSON to the command on stdin,
 dedupes notifications in `var/canary_notify_ledger.json`, and never lets
 notification delivery failure block monitoring, review, or placement gates.
+
+Broker selection is explicit. Tradier is the default path for atomic
+debit-spread preview/place. Run
+`scripts/canary-service.sh configure-tradier sandbox|production` to persist
+Tradier account settings, or set `SPREAD_CANARY_BROKER=robinhood` to use the
+Robinhood MCP bridge. Tradier V1 only executes `call_debit_spread` and
+`put_debit_spread`; wheel lifecycle remains monitor-only. See
+`docs/tradier_live.md`.
 
 ### Phase 4: Menubar
 
