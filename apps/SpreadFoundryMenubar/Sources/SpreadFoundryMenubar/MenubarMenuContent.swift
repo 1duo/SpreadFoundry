@@ -5,13 +5,20 @@ struct MenubarMenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(viewModel.snapshot.trayTitle)
-                    .font(.headline)
-                Spacer()
-                Button("Refresh") {
-                    viewModel.refresh()
+            HStack(alignment: .center, spacing: 10) {
+                Image(nsImage: MenubarIcon.brandImage(status: viewModel.snapshot.status))
+                    .resizable()
+                    .frame(width: 36, height: 36)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SpreadFoundry")
+                        .font(.headline)
+                    Text(viewModel.snapshot.trayTitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                Spacer()
+                Button("Refresh") { viewModel.refresh() }
             }
 
             Text(viewModel.snapshot.trayTooltip)
@@ -40,22 +47,19 @@ struct MenubarMenuContent: View {
 
             Divider()
 
-            HStack {
-                Button("Start") {
-                    viewModel.startWorker()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Button("Start") { viewModel.startWorker() }
+                    Button("Restart") { viewModel.restartWorker() }
+                    Button("Stop") { viewModel.stopWorker() }
+                    Spacer()
                 }
-                Button("Stop") {
-                    viewModel.stopWorker()
-                }
-                Button("Log") {
-                    viewModel.openLog()
-                }
-                Button("Docs") {
-                    viewModel.openDocs()
-                }
-                Spacer()
-                Button("Quit") {
-                    NSApplication.shared.terminate(nil)
+
+                HStack {
+                    Button("Log") { viewModel.openLog() }
+                    Button("Docs") { viewModel.openDocs() }
+                    Spacer()
+                    Button("Quit") { NSApplication.shared.terminate(nil) }
                 }
             }
         }

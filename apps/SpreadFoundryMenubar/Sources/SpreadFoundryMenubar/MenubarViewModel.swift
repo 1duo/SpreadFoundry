@@ -42,6 +42,10 @@ final class MenubarViewModel: ObservableObject {
         runThenRefresh("stop")
     }
 
+    func restartWorker() {
+        runThenRefresh("restart")
+    }
+
     func openLog() {
         scriptRunner.openLog()
     }

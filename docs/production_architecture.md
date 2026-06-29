@@ -131,7 +131,23 @@ SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run SpreadFoundryMenubar
 ```
 
 The app renders the Rust snapshot and exposes only `Refresh`, `Start`, `Stop`,
-`Log`, `Docs`, and `Quit`.
+`Restart`, `Log`, `Docs`, and `Quit`.
+
+Essential menubar functions:
+
+- `Status`: show worker liveness, health freshness, current decision, broker
+  capability mode, live-order flag, and selected action.
+- `Refresh`: force a new read of the Rust canary snapshot.
+- `Start`: start the canary worker service without changing trading gates.
+- `Restart`: restart the worker after a binary/config update.
+- `Stop`: stop the worker fail-closed; no order routing continues.
+- `Log`: open `var/canary_worker.log` for operational triage.
+- `Docs`: open this architecture/runbook.
+- `Quit`: close the menubar only; it does not stop the worker.
+
+Icon design: the menubar uses an original green mark inspired by finance/trading
+visual language, not by copying any broker logo. The mark combines an upward
+wing/arc with two spread bars to signal gated directional option exposure.
 
 ### Phase 5: Continuous Auto-Research
 
