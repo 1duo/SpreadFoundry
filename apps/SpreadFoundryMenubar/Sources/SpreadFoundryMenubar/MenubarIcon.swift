@@ -75,7 +75,7 @@ enum MenubarIcon {
             let dotRadius = min(size.width, size.height) * (22.0 / 128.0)
             let dotCenter = CGPoint(
                 x: size.width - size.width * (27.0 / 128.0),
-                y: size.height - size.height * (20.0 / 128.0)
+                y: size.height * (20.0 / 128.0)
             )
             let dotRect = CGRect(
                 x: dotCenter.x - dotRadius,
