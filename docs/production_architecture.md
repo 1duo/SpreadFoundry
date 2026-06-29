@@ -93,12 +93,14 @@ Commands:
 
 ```bash
 cargo build --release
-scripts/canary-service.sh start
-scripts/canary-service.sh status
-scripts/canary-service.sh restart
-scripts/canary-service.sh stop
+scripts/spreadfoundry-service.sh start
+scripts/spreadfoundry-service.sh status
+scripts/spreadfoundry-service.sh restart
+scripts/spreadfoundry-service.sh stop
 ```
 
+`spreadfoundry-service.sh` starts the canary worker and menubar. The canary
+worker is managed as a macOS LaunchAgent so it survives the launching shell.
 `status` calls `spreadfoundry canary-worker-snapshot`, which reads
 `var/canary_worker_health.json`, checks `var/canary_worker.pid`, and emits one
 JSON object for both CLI operations and the menubar. The script never computes a

@@ -33,7 +33,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration as StdDuration;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
@@ -2613,6 +2613,7 @@ fn pid_file_running(pid_file: &Path) -> bool {
     ProcessCommand::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
