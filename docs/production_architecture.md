@@ -38,7 +38,8 @@ flowchart LR
 - `src/main.rs`: CLI orchestration and temporary adapter glue. Long-term
   strategy and execution logic should move out of this file.
 - `scripts/`: service launch, teardown, and health-check entry points.
-- `apps/`: later native menubar app that consumes a JSON health snapshot.
+- `apps/SpreadFoundryMenubar`: native menubar app that consumes the worker JSON
+  snapshot and delegates lifecycle actions to scripts.
 
 ## Phase Plan
 
@@ -77,6 +78,8 @@ Success criteria:
 
 ### Phase 3: Service Runtime
 
+Status: implemented.
+
 - Add start, stop, restart, status, and health scripts for the canary worker.
 - Write a stable JSON health snapshot under `var/`.
 - Keep teardown explicit and idempotent.
@@ -86,7 +89,23 @@ Success criteria:
 - `start` creates one worker, `stop` removes it, `status` reports stale/missing
   health clearly, and `restart` is safe to repeat.
 
+Commands:
+
+```bash
+scripts/canary-service.sh start
+scripts/canary-service.sh status
+scripts/canary-service.sh restart
+scripts/canary-service.sh stop
+```
+
+`status` calls `spreadfoundry canary-worker-snapshot`, which reads
+`var/canary_worker_health.json`, checks `var/canary_worker.pid`, and emits one
+JSON object for both CLI operations and the menubar. The script never computes a
+trade decision.
+
 ### Phase 4: Menubar
+
+Status: implemented.
 
 - Add a small macOS menubar app modeled after AxiomTrade's snapshot-consumer
   pattern.
@@ -99,7 +118,20 @@ Success criteria:
 - Menubar reads the same health JSON as CLI status.
 - No trading decisions or broker calls are implemented in Swift.
 
+Commands:
+
+```bash
+cd apps/SpreadFoundryMenubar
+swift build
+SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run SpreadFoundryMenubar
+```
+
+The app renders the Rust snapshot and exposes only `Refresh`, `Start`, `Stop`,
+`Log`, `Docs`, and `Quit`.
+
 ### Phase 5: Continuous Auto-Research
+
+Status: implemented as an opt-in service wrapper.
 
 - Schedule research refreshes through service scripts.
 - Store candidate artifacts with provenance and simulator version.
@@ -109,3 +141,18 @@ Success criteria:
 
 - A new research result can be traced from data window to simulator version to
   canary artifact to broker review decision.
+
+Commands:
+
+```bash
+export SPREAD_AUTO_RESEARCH_COMMAND='cargo run -- run-portfolio-selector-research ...'
+scripts/auto-research-service.sh start
+scripts/auto-research-service.sh status
+scripts/auto-research-service.sh stop
+```
+
+The service is inert unless `SPREAD_AUTO_RESEARCH_COMMAND` is set. Each run
+writes `var/auto_research_last.json` with start time, finish time, exit code,
+and command, plus append-only logs in `var/auto_research.log`. Candidate export
+still must pass the existing canary artifact gates before the worker can review
+an order.

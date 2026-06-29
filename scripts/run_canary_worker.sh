@@ -14,9 +14,10 @@ debit_max_loss="${SPREAD_CANARY_DEBIT_MAX_LOSS:-1000}"
 wheel_reserve_cap="${SPREAD_CANARY_WHEEL_RESERVE_CAP:-35000}"
 free_cash_buffer="${SPREAD_CANARY_FREE_CASH_BUFFER:-11250}"
 max_wheel_positions_per_symbol="${SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL:-1}"
+spreadfoundry_bin="${SPREAD_BINARY:-target/debug/spreadfoundry}"
 
-args=(
-  run --quiet -- canary-worker
+cli_args=(
+  canary-worker
   --candidate "$candidate"
   --account-cash "$account_cash"
   --debit-max-loss "$debit_max_loss"
@@ -31,28 +32,32 @@ args=(
 )
 
 if [[ "${SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS:-0}" == "1" ]]; then
-  args+=(--broker-multi-leg-options)
+  cli_args+=(--broker-multi-leg-options)
 fi
 if [[ "${SPREAD_CANARY_BROKER_CASH_SECURED_PUTS:-0}" == "1" ]]; then
-  args+=(--broker-cash-secured-puts)
+  cli_args+=(--broker-cash-secured-puts)
 fi
 if [[ "${SPREAD_CANARY_BROKER_COVERED_CALLS:-0}" == "1" ]]; then
-  args+=(--broker-covered-calls)
+  cli_args+=(--broker-covered-calls)
 fi
 if [[ "${SPREAD_CANARY_BROKER_REVIEW_OK:-0}" == "1" ]]; then
-  args+=(--broker-review-ok)
+  cli_args+=(--broker-review-ok)
 fi
 if [[ "${SPREAD_CANARY_LIVE_ORDERS_ENABLED:-0}" == "1" ]]; then
-  args+=(--live-orders-enabled)
+  cli_args+=(--live-orders-enabled)
 fi
 if [[ -n "${SPREAD_ROBINHOOD_MCP_COMMAND:-}" ]]; then
-  args+=(--robinhood-mcp-command "$SPREAD_ROBINHOOD_MCP_COMMAND")
+  cli_args+=(--robinhood-mcp-command "$SPREAD_ROBINHOOD_MCP_COMMAND")
 fi
 if [[ "${SPREAD_CANARY_PLACE_LIVE_ORDER:-0}" == "1" ]]; then
-  args+=(--place-live-order)
+  cli_args+=(--place-live-order)
 fi
 if [[ "${SPREAD_CANARY_ONCE:-0}" == "1" ]]; then
-  args+=(--once)
+  cli_args+=(--once)
 fi
 
-exec cargo "${args[@]}"
+if [[ -x "$spreadfoundry_bin" ]]; then
+  exec "$spreadfoundry_bin" "${cli_args[@]}"
+fi
+
+exec cargo run --quiet -- "${cli_args[@]}"

@@ -33,6 +33,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::Duration as StdDuration;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
@@ -191,6 +192,16 @@ enum Commands {
         once: bool,
         #[arg(long)]
         health_output: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    CanaryWorkerSnapshot {
+        #[arg(long, default_value = "var/canary_worker_health.json")]
+        health_output: PathBuf,
+        #[arg(long, default_value = "var/canary_worker.pid")]
+        pid_file: PathBuf,
+        #[arg(long, default_value_t = 180)]
+        max_age_seconds: u64,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -754,6 +765,12 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Commands::CanaryWorkerSnapshot {
+            health_output,
+            pid_file,
+            max_age_seconds,
+            json,
+        } => canary_worker_snapshot(&health_output, &pid_file, max_age_seconds, json),
         Commands::AuditOptionCacheCoverage {
             symbols,
             from,
@@ -1450,7 +1467,7 @@ fn run_portfolio_canary(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct CanaryRiskConfig {
     account_cash: f64,
     debit_max_loss: f64,
@@ -1465,7 +1482,7 @@ struct CanaryActionRisk {
     reserve_basis: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct PortfolioCanaryRunDecision {
     status: String,
     reason: String,
@@ -1484,7 +1501,7 @@ struct PortfolioCanaryRunDecision {
     selected_action: Option<CanaryActionSummary>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct CanaryActionSummary {
     status: String,
     symbol: String,
@@ -2304,7 +2321,7 @@ struct CanaryWorkerArgs {
     json: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CanaryWorkerHealth {
     checked_at: chrono::DateTime<Utc>,
     service: String,
@@ -2324,6 +2341,281 @@ struct CanaryWorkerHealth {
     order_ledger: String,
     decision: Option<PortfolioCanaryRunDecision>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CanaryWorkerSnapshot {
+    updated_at: chrono::DateTime<Utc>,
+    health_path: String,
+    pid_file: String,
+    worker_running: bool,
+    health_readable: bool,
+    health_age_seconds: Option<i64>,
+    health_stale: bool,
+    status: String,
+    tray_title: String,
+    tray_tooltip: String,
+    rows: Vec<SnapshotRow>,
+    action_rows: Vec<SnapshotRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotRow {
+    label: String,
+    value: String,
+    tone: String,
+}
+
+fn canary_worker_snapshot(
+    health_output: &Path,
+    pid_file: &Path,
+    max_age_seconds: u64,
+    json: bool,
+) -> Result<()> {
+    let snapshot = build_canary_worker_snapshot(health_output, pid_file, max_age_seconds);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!(
+            "{} status={} running={} health_age={}",
+            snapshot.tray_title,
+            snapshot.status,
+            snapshot.worker_running,
+            snapshot
+                .health_age_seconds
+                .map(|age| format!("{age}s"))
+                .unwrap_or_else(|| "missing".to_owned())
+        );
+        for row in snapshot.rows.iter().chain(snapshot.action_rows.iter()) {
+            println!("{}: {}", row.label, row.value);
+        }
+    }
+    Ok(())
+}
+
+fn build_canary_worker_snapshot(
+    health_output: &Path,
+    pid_file: &Path,
+    max_age_seconds: u64,
+) -> CanaryWorkerSnapshot {
+    let now = Utc::now();
+    let worker_running = pid_file_running(pid_file);
+    let health = fs::read_to_string(health_output)
+        .ok()
+        .and_then(|body| serde_json::from_str::<CanaryWorkerHealth>(&body).ok());
+    let health_readable = health.is_some();
+    let health_age_seconds = health
+        .as_ref()
+        .map(|health| now.signed_duration_since(health.checked_at).num_seconds());
+    let health_stale = health_age_seconds
+        .map(|age| age < 0 || age as u64 > max_age_seconds)
+        .unwrap_or(true);
+    let status = snapshot_status(health.as_ref(), worker_running, health_stale);
+    let tray_title = match status.as_str() {
+        "ready" => "SF ready",
+        "live" => "SF live",
+        "shadow" => "SF shadow",
+        _ => "SF down",
+    }
+    .to_owned();
+    let tray_tooltip = snapshot_tooltip(health.as_ref(), worker_running, health_stale);
+    let mut rows = vec![
+        snapshot_row(
+            "Worker",
+            if worker_running {
+                "running"
+            } else {
+                "not running"
+            },
+            if worker_running { "ok" } else { "bad" },
+        ),
+        snapshot_row(
+            "Health",
+            if health_readable {
+                if health_stale { "stale" } else { "fresh" }
+            } else {
+                "missing"
+            },
+            if health_readable && !health_stale {
+                "ok"
+            } else {
+                "bad"
+            },
+        ),
+    ];
+    if let Some(health) = &health {
+        rows.extend([
+            snapshot_row(
+                "Decision",
+                health.status.as_str(),
+                snapshot_tone(&health.status),
+            ),
+            snapshot_row(
+                "Broker",
+                broker_capability_summary(health).as_str(),
+                if health.robinhood_mcp_command_configured {
+                    "ok"
+                } else {
+                    "warn"
+                },
+            ),
+            snapshot_row(
+                "Live",
+                if health.live_orders_enabled && health.place_live_order {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if health.live_orders_enabled && health.place_live_order {
+                    "warn"
+                } else {
+                    "ok"
+                },
+            ),
+            snapshot_row(
+                "Last Check",
+                health_age_label(health_age_seconds).as_str(),
+                if health_stale { "bad" } else { "ok" },
+            ),
+        ]);
+    }
+
+    let action_rows = snapshot_action_rows(health.as_ref());
+    CanaryWorkerSnapshot {
+        updated_at: now,
+        health_path: health_output.display().to_string(),
+        pid_file: pid_file.display().to_string(),
+        worker_running,
+        health_readable,
+        health_age_seconds,
+        health_stale,
+        status,
+        tray_title,
+        tray_tooltip,
+        rows,
+        action_rows,
+    }
+}
+
+fn snapshot_status(
+    health: Option<&CanaryWorkerHealth>,
+    worker_running: bool,
+    health_stale: bool,
+) -> String {
+    if !worker_running || health_stale {
+        return "unhealthy".to_owned();
+    }
+    match health {
+        Some(health) if health.error.is_none() => health.status.clone(),
+        _ => "unhealthy".to_owned(),
+    }
+}
+
+fn snapshot_tooltip(
+    health: Option<&CanaryWorkerHealth>,
+    worker_running: bool,
+    health_stale: bool,
+) -> String {
+    if !worker_running {
+        return "Canary worker is not running".to_owned();
+    }
+    if health_stale {
+        return "Canary worker health is stale or missing".to_owned();
+    }
+    match health.and_then(|health| health.decision.as_ref()) {
+        Some(decision) => decision.reason.clone(),
+        None => "Canary worker has no decision".to_owned(),
+    }
+}
+
+fn snapshot_action_rows(health: Option<&CanaryWorkerHealth>) -> Vec<SnapshotRow> {
+    let Some(decision) = health.and_then(|health| health.decision.as_ref()) else {
+        return vec![snapshot_row("Action", "none", "warn")];
+    };
+    let Some(action) = decision.selected_action.as_ref() else {
+        return vec![snapshot_row("Action", decision.reason.as_str(), "warn")];
+    };
+    let mut rows = vec![
+        snapshot_row(
+            "Action",
+            format!("{} {}", action.symbol, action.strategy).as_str(),
+            "ok",
+        ),
+        snapshot_row("Signal", action.status.as_str(), "ok"),
+    ];
+    if let Some(max_loss) = action.max_loss {
+        rows.push(snapshot_row(
+            "Max Loss",
+            format!("${max_loss:.0}").as_str(),
+            "warn",
+        ));
+    }
+    if let Some(reserve) = action.reserve {
+        rows.push(snapshot_row(
+            "Reserve",
+            format!("${reserve:.0}").as_str(),
+            "warn",
+        ));
+    }
+    rows
+}
+
+fn broker_capability_summary(health: &CanaryWorkerHealth) -> String {
+    let mut capabilities = Vec::new();
+    if health.broker_multi_leg_options {
+        capabilities.push("spreads");
+    }
+    if health.broker_cash_secured_puts {
+        capabilities.push("cash-secured puts");
+    }
+    if health.broker_covered_calls {
+        capabilities.push("covered calls");
+    }
+    if capabilities.is_empty() {
+        "shadow-only".to_owned()
+    } else {
+        capabilities.join(", ")
+    }
+}
+
+fn health_age_label(age_seconds: Option<i64>) -> String {
+    match age_seconds {
+        Some(age) if age < 0 => "clock skew".to_owned(),
+        Some(age) if age < 60 => format!("{age}s ago"),
+        Some(age) => format!("{}m ago", age / 60),
+        None => "missing".to_owned(),
+    }
+}
+
+fn snapshot_tone(status: &str) -> &'static str {
+    match status {
+        "ready" | "live" => "ok",
+        "shadow" => "warn",
+        _ => "bad",
+    }
+}
+
+fn snapshot_row(label: &str, value: &str, tone: &str) -> SnapshotRow {
+    SnapshotRow {
+        label: label.to_owned(),
+        value: value.to_owned(),
+        tone: tone.to_owned(),
+    }
+}
+
+fn pid_file_running(pid_file: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(pid_file) else {
+        return false;
+    };
+    let Ok(pid) = body.trim().parse::<u32>() else {
+        return false;
+    };
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 async fn run_canary_worker(args: CanaryWorkerArgs) -> Result<()> {

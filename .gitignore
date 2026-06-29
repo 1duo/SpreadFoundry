@@ -1,4 +1,6 @@
 /target
+/.build
+**/.build
 /runs
 /var
 /data/raw
