@@ -3,7 +3,7 @@ import SwiftUI
 
 enum MenubarIcon {
     static func statusImage(status: String) -> NSImage {
-        let image = draw(size: CGSize(width: 22, height: 22), status: status, template: true)
+        let image = draw(size: CGSize(width: 24, height: 24), status: status, template: true)
         image.isTemplate = true
         return image
     }
@@ -33,33 +33,30 @@ enum MenubarIcon {
 
         ink.setStroke()
         let arc = NSBezierPath()
-        arc.lineWidth = max(1.8 * scale, 1.0)
+        arc.lineWidth = max(4.0 * scale, 2.0)
         arc.lineCapStyle = .round
-        arc.move(to: CGPoint(x: 12 * scale, y: 14 * scale))
+        arc.move(to: CGPoint(x: 11 * scale, y: 13 * scale))
         arc.curve(
-            to: CGPoint(x: 31 * scale, y: 31 * scale),
-            controlPoint1: CGPoint(x: 14 * scale, y: 25 * scale),
-            controlPoint2: CGPoint(x: 22 * scale, y: 31 * scale)
+            to: CGPoint(x: 33 * scale, y: 32 * scale),
+            controlPoint1: CGPoint(x: 14 * scale, y: 27 * scale),
+            controlPoint2: CGPoint(x: 23 * scale, y: 33 * scale)
         )
         arc.stroke()
 
         let wing = NSBezierPath()
-        wing.lineWidth = max(2.6 * scale, 1.2)
+        wing.lineWidth = max(5.4 * scale, 2.6)
         wing.lineCapStyle = .round
         wing.lineJoinStyle = .round
-        wing.move(to: CGPoint(x: 14 * scale, y: 28 * scale))
+        wing.move(to: CGPoint(x: 13 * scale, y: 28 * scale))
         wing.line(to: CGPoint(x: 28 * scale, y: 28 * scale))
-        wing.line(to: CGPoint(x: 33 * scale, y: 34 * scale))
+        wing.line(to: CGPoint(x: 34 * scale, y: 34 * scale))
         wing.stroke()
 
-        let spread = NSBezierPath()
-        spread.lineWidth = max(1.9 * scale, 1.0)
-        spread.lineCapStyle = .round
-        spread.move(to: CGPoint(x: 17 * scale, y: 18 * scale))
-        spread.line(to: CGPoint(x: 27 * scale, y: 18 * scale))
-        spread.move(to: CGPoint(x: 20 * scale, y: 23 * scale))
-        spread.line(to: CGPoint(x: 30 * scale, y: 23 * scale))
-        spread.stroke()
+        ink.setFill()
+        let lowerBar = CGRect(x: 16 * scale, y: 16 * scale, width: 13 * scale, height: 3.8 * scale)
+        let upperBar = CGRect(x: 19 * scale, y: 21.5 * scale, width: 13 * scale, height: 3.8 * scale)
+        NSBezierPath(roundedRect: lowerBar, xRadius: 1.9 * scale, yRadius: 1.9 * scale).fill()
+        NSBezierPath(roundedRect: upperBar, xRadius: 1.9 * scale, yRadius: 1.9 * scale).fill()
 
         return image
     }
