@@ -32,7 +32,7 @@ enum MenubarIcon {
         let yOffset = template ? -2.0 * scale : 0.0
         let ink = statusDotHealthy == nil
             ? (template ? NSColor.black : statusColor(status))
-            : NSColor.labelColor
+            : NSColor.white
         let background = template ? NSColor.clear : NSColor(red: 0.04, green: 0.07, blue: 0.06, alpha: 1.0)
 
         let badge = NSBezierPath(roundedRect: rect.insetBy(dx: 2 * scale, dy: 2 * scale), xRadius: 11 * scale, yRadius: 11 * scale)
@@ -72,12 +72,19 @@ enum MenubarIcon {
         NSBezierPath(roundedRect: upperBar, xRadius: 1.9 * scale, yRadius: 1.9 * scale).fill()
 
         if let statusDotHealthy {
-            let outerDot = CGRect(x: 30 * scale, y: 4 * scale, width: 10.5 * scale, height: 10.5 * scale)
-            NSColor.windowBackgroundColor.setFill()
-            NSBezierPath(ovalIn: outerDot).fill()
-
+            let dotRadius = min(size.width, size.height) * (22.0 / 128.0)
+            let dotCenter = CGPoint(
+                x: size.width - size.width * (27.0 / 128.0),
+                y: size.height - size.height * (20.0 / 128.0)
+            )
+            let dotRect = CGRect(
+                x: dotCenter.x - dotRadius,
+                y: dotCenter.y - dotRadius,
+                width: dotRadius * 2,
+                height: dotRadius * 2
+            )
             (statusDotHealthy ? NSColor.systemGreen : NSColor.systemRed).setFill()
-            NSBezierPath(ovalIn: outerDot.insetBy(dx: 1.8 * scale, dy: 1.8 * scale)).fill()
+            NSBezierPath(ovalIn: dotRect).fill()
         }
 
         return image
