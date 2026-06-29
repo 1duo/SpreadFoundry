@@ -1,3 +1,7 @@
+use crate::execution::{
+    conservative_credit_spread_entry_credit, conservative_short_spread_exit_debit,
+    short_put_spread_expiration_debit,
+};
 use crate::types::{
     CandidateSpread, ExitReason, OptionKey, OptionQuote, SimTrade, StrategyKind,
     contract_multiplier,
@@ -39,7 +43,7 @@ impl SpreadExitQuote {
 }
 
 pub fn conservative_entry_credit(candidate: &CandidateSpread) -> Decimal {
-    candidate.short_put.quote.bid - candidate.long_put.quote.ask
+    conservative_credit_spread_entry_credit(&candidate.short_put.quote, &candidate.long_put.quote)
 }
 
 pub fn conservative_exit_debit(
@@ -47,8 +51,7 @@ pub fn conservative_exit_debit(
     long_exit: &OptionQuote,
     width: Decimal,
 ) -> Decimal {
-    let debit = short_exit.ask - long_exit.bid;
-    debit.max(Decimal::ZERO).min(width)
+    conservative_short_spread_exit_debit(short_exit, long_exit, width)
 }
 
 pub fn simulate_quote_exit(
@@ -81,11 +84,12 @@ pub fn simulate_expiration(
     quantity: u32,
     fees: Decimal,
 ) -> SimTrade {
-    let short_intrinsic = (candidate.short_put.key.strike - underlying_close).max(Decimal::ZERO);
-    let long_intrinsic = (candidate.long_put.key.strike - underlying_close).max(Decimal::ZERO);
-    let exit_debit = (short_intrinsic - long_intrinsic)
-        .max(Decimal::ZERO)
-        .min(candidate.width);
+    let exit_debit = short_put_spread_expiration_debit(
+        candidate.short_put.key.strike,
+        candidate.long_put.key.strike,
+        underlying_close,
+        candidate.width,
+    );
     build_trade(
         candidate,
         expiration_ts,

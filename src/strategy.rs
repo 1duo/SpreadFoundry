@@ -1,3 +1,4 @@
+use crate::execution::conservative_credit_spread_entry_credit;
 use crate::types::{CandidateSpread, DataValidationError, OptionRight, OptionSnapshot};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -106,7 +107,7 @@ pub fn generate_put_spread_candidates(
                 continue;
             }
 
-            let credit = short_put.quote.bid - long_put.quote.ask;
+            let credit = conservative_credit_spread_entry_credit(&short_put.quote, &long_put.quote);
             if credit <= Decimal::ZERO {
                 report.rejected_for_credit += 1;
                 continue;

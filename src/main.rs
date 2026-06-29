@@ -8,6 +8,10 @@ use spreadfoundry::broker::{
     BrokerCapabilities, RobinhoodBrokerAdapter, RobinhoodMcpCommandExecutor,
     RobinhoodMcpToolRequest, RobinhoodMcpToolResponse,
 };
+use spreadfoundry::execution::{
+    OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
+    TimeInForce, cash_secured_put_open_intent, debit_spread_open_intent,
+};
 use spreadfoundry::fixture;
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
@@ -24,6 +28,7 @@ use spreadfoundry::research::{
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
 use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
+use spreadfoundry::types::{OptionKey, OptionRight};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -2033,7 +2038,8 @@ fn robinhood_mcp_option_order_request(
     tool: &str,
     action: &CanaryActionSummary,
 ) -> Result<RobinhoodMcpToolRequest> {
-    let arguments = robinhood_mcp_option_order_arguments(action)
+    let intent = canary_action_order_intent(action)?;
+    let arguments = robinhood_mcp_option_order_arguments(action, &intent)
         .with_context(|| format!("build Robinhood MCP {tool} arguments"))?;
     Ok(RobinhoodMcpToolRequest {
         server: "robinhood-trading".to_owned(),
@@ -2042,101 +2048,95 @@ fn robinhood_mcp_option_order_request(
     })
 }
 
-fn robinhood_mcp_option_order_arguments(action: &CanaryActionSummary) -> Result<serde_json::Value> {
+fn canary_action_order_intent(action: &CanaryActionSummary) -> Result<OptionOrderIntent> {
     if action.status != "entry_candidate" {
         anyhow::bail!("only same-day entry_candidate actions are orderable");
     }
     let symbol = require_action_field(action.symbol.as_str(), "symbol")?;
-    let expiration = require_option_string(action.expiration.as_deref(), "expiration")?;
+    let expiration = require_option_string(action.expiration.as_deref(), "expiration")?
+        .parse::<NaiveDate>()
+        .with_context(|| format!("parse expiration for {}", action.symbol))?;
     let quantity = 1_u32;
     let entry_credit = require_option_nonzero_f64(action.entry_credit, "entry_credit")?;
-    let limit_price = entry_credit.abs();
-    if limit_price <= 0.0 {
-        anyhow::bail!("entry_credit must imply a positive limit price");
-    }
-
-    let (order_effect, legs) = match action.strategy.as_str() {
+    let limit_price = decimal_from_f64(entry_credit.abs(), "entry_credit")?;
+    match action.strategy.as_str() {
         "wheel" => {
             let short_strike = require_option_f64(action.short_strike, "short_strike")?;
-            (
-                "credit",
-                vec![serde_json::json!({
-                    "side": "sell",
-                    "position_effect": "open",
-                    "option_type": "put",
-                    "symbol": symbol,
-                    "expiration": expiration,
-                    "strike": short_strike,
-                    "quantity": quantity,
-                })],
-            )
+            Ok(cash_secured_put_open_intent(
+                OptionKey::new(
+                    symbol,
+                    expiration,
+                    decimal_from_f64(short_strike, "short_strike")?,
+                    OptionRight::Put,
+                ),
+                quantity,
+                limit_price,
+                action.strategy.clone(),
+            )?)
         }
         "put_debit_spread" => {
             let short_strike = require_option_f64(action.short_strike, "short_strike")?;
             let long_strike = require_option_f64(action.long_strike, "long_strike")?;
-            (
-                "debit",
-                vec![
-                    serde_json::json!({
-                        "side": "buy",
-                        "position_effect": "open",
-                        "option_type": "put",
-                        "symbol": symbol,
-                        "expiration": expiration,
-                        "strike": long_strike,
-                        "quantity": quantity,
-                    }),
-                    serde_json::json!({
-                        "side": "sell",
-                        "position_effect": "open",
-                        "option_type": "put",
-                        "symbol": symbol,
-                        "expiration": expiration,
-                        "strike": short_strike,
-                        "quantity": quantity,
-                    }),
-                ],
-            )
+            Ok(debit_spread_open_intent(
+                OptionKey::new(
+                    symbol,
+                    expiration,
+                    decimal_from_f64(long_strike, "long_strike")?,
+                    OptionRight::Put,
+                ),
+                OptionKey::new(
+                    symbol,
+                    expiration,
+                    decimal_from_f64(short_strike, "short_strike")?,
+                    OptionRight::Put,
+                ),
+                quantity,
+                limit_price,
+                action.strategy.clone(),
+            )?)
         }
         "call_debit_spread" => {
             let short_strike = require_option_f64(action.short_strike, "short_strike")?;
             let long_strike = require_option_f64(action.long_strike, "long_strike")?;
-            (
-                "debit",
-                vec![
-                    serde_json::json!({
-                        "side": "buy",
-                        "position_effect": "open",
-                        "option_type": "call",
-                        "symbol": symbol,
-                        "expiration": expiration,
-                        "strike": long_strike,
-                        "quantity": quantity,
-                    }),
-                    serde_json::json!({
-                        "side": "sell",
-                        "position_effect": "open",
-                        "option_type": "call",
-                        "symbol": symbol,
-                        "expiration": expiration,
-                        "strike": short_strike,
-                        "quantity": quantity,
-                    }),
-                ],
-            )
+            Ok(debit_spread_open_intent(
+                OptionKey::new(
+                    symbol,
+                    expiration,
+                    decimal_from_f64(long_strike, "long_strike")?,
+                    OptionRight::Call,
+                ),
+                OptionKey::new(
+                    symbol,
+                    expiration,
+                    decimal_from_f64(short_strike, "short_strike")?,
+                    OptionRight::Call,
+                ),
+                quantity,
+                limit_price,
+                action.strategy.clone(),
+            )?)
         }
         other => anyhow::bail!("strategy {other} is not orderable through Robinhood MCP"),
-    };
+    }
+}
 
+fn robinhood_mcp_option_order_arguments(
+    action: &CanaryActionSummary,
+    intent: &OptionOrderIntent,
+) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
-        "symbol": symbol,
-        "strategy": action.strategy,
-        "quantity": quantity,
-        "order_effect": order_effect,
+        "symbol": intent.symbol,
+        "strategy": intent.strategy,
+        "quantity": intent.quantity(),
+        "order_effect": option_order_effect_value(&intent.order_effect),
         "order_type": "limit",
-        "limit_price": limit_price,
-        "time_in_force": "day",
-        "legs": legs,
+        "limit_price": decimal_to_f64(intent.limit_price, "limit_price")?,
+        "time_in_force": time_in_force_value(&intent.time_in_force),
+        "legs": intent
+            .legs
+            .iter()
+            .map(robinhood_mcp_leg_arguments)
+            .collect::<Result<Vec<_>>>()?,
         "source": {
             "system": "SpreadFoundry",
             "status": action.status,
@@ -2146,6 +2146,69 @@ fn robinhood_mcp_option_order_arguments(action: &CanaryActionSummary) -> Result<
             "reserve_basis": action.reserve_basis,
         }
     }))
+}
+
+fn robinhood_mcp_leg_arguments(leg: &OptionOrderLeg) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "side": option_order_side_value(&leg.side),
+        "position_effect": position_effect_value(&leg.position_effect),
+        "option_type": option_right_value(&leg.key.right),
+        "symbol": leg.key.underlying,
+        "expiration": leg.key.expiration,
+        "strike": decimal_to_f64(leg.key.strike, "strike")?,
+        "quantity": leg.quantity,
+    }))
+}
+
+fn decimal_from_f64(value: f64, field: &str) -> Result<Decimal> {
+    if !value.is_finite() {
+        anyhow::bail!("{field} must be finite");
+    }
+    value
+        .to_string()
+        .parse::<Decimal>()
+        .with_context(|| format!("convert {field} to Decimal"))
+}
+
+fn decimal_to_f64(value: Decimal, field: &str) -> Result<f64> {
+    value
+        .to_string()
+        .parse::<f64>()
+        .with_context(|| format!("convert {field} to f64"))
+}
+
+fn option_order_effect_value(effect: &OptionOrderEffect) -> &'static str {
+    match effect {
+        OptionOrderEffect::Credit => "credit",
+        OptionOrderEffect::Debit => "debit",
+    }
+}
+
+fn option_order_side_value(side: &OptionOrderSide) -> &'static str {
+    match side {
+        OptionOrderSide::Buy => "buy",
+        OptionOrderSide::Sell => "sell",
+    }
+}
+
+fn position_effect_value(effect: &PositionEffect) -> &'static str {
+    match effect {
+        PositionEffect::Open => "open",
+        PositionEffect::Close => "close",
+    }
+}
+
+fn time_in_force_value(time_in_force: &TimeInForce) -> &'static str {
+    match time_in_force {
+        TimeInForce::Day => "day",
+    }
+}
+
+fn option_right_value(right: &OptionRight) -> &'static str {
+    match right {
+        OptionRight::Call => "call",
+        OptionRight::Put => "put",
+    }
 }
 
 fn robinhood_mcp_order_key(request: &RobinhoodMcpToolRequest) -> String {
@@ -4822,6 +4885,39 @@ mod tests {
         assert_eq!(request.arguments["legs"][0]["side"], "sell");
         assert_eq!(request.arguments["legs"][0]["option_type"], "put");
         assert_eq!(request.arguments["legs"][0]["strike"], 80.0);
+        assert_eq!(request.arguments["source"]["reserve"], 8000.0);
+    }
+
+    #[test]
+    fn robinhood_mcp_order_arguments_builds_call_debit_spread_payload() {
+        let action = CanaryActionSummary {
+            status: "entry_candidate".to_owned(),
+            symbol: "ORCL".to_owned(),
+            strategy: "call_debit_spread".to_owned(),
+            entry_date: Some("2026-06-28".to_owned()),
+            exit_date: Some("2026-06-28".to_owned()),
+            expiration: Some("2026-07-02".to_owned()),
+            short_put: None,
+            short_strike: Some(225.0),
+            long_strike: Some(220.0),
+            width: Some(5.0),
+            entry_credit: Some(-4.50),
+            max_loss: Some(450.0),
+            reserve: Some(450.0),
+            reserve_basis: Some("max_loss".to_owned()),
+            pnl: None,
+        };
+
+        let request = robinhood_mcp_option_order_request("review_option_order", &action).unwrap();
+
+        assert_eq!(request.arguments["order_effect"], "debit");
+        assert_eq!(request.arguments["limit_price"], 4.50);
+        assert_eq!(request.arguments["legs"][0]["side"], "buy");
+        assert_eq!(request.arguments["legs"][0]["option_type"], "call");
+        assert_eq!(request.arguments["legs"][0]["strike"], 220.0);
+        assert_eq!(request.arguments["legs"][1]["side"], "sell");
+        assert_eq!(request.arguments["legs"][1]["option_type"], "call");
+        assert_eq!(request.arguments["legs"][1]["strike"], 225.0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod execution;
 pub mod fixture;
 pub mod opt;
 pub mod report;
