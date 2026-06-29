@@ -115,6 +115,36 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         require_action: bool,
     },
+    CanaryLiveReadiness {
+        #[arg(long, default_value = "candidates/weekly_selector_canary.json")]
+        candidate: PathBuf,
+        #[arg(long)]
+        as_of: Option<NaiveDate>,
+        #[arg(long, default_value_t = 45_000.0)]
+        account_cash: f64,
+        #[arg(long, default_value_t = 1_000.0)]
+        debit_max_loss: f64,
+        #[arg(long, default_value_t = 35_000.0)]
+        wheel_reserve_cap: f64,
+        #[arg(long, default_value_t = 11_250.0)]
+        free_cash_buffer: f64,
+        #[arg(long, default_value_t = 1)]
+        max_wheel_positions_per_symbol: usize,
+        #[arg(long, default_value_t = false)]
+        broker_multi_leg_options: bool,
+        #[arg(long, default_value_t = false)]
+        broker_cash_secured_puts: bool,
+        #[arg(long, default_value_t = false)]
+        broker_covered_calls: bool,
+        #[arg(long)]
+        robinhood_mcp_command: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_MAX_ORDER_AGE_SECONDS)]
+        max_order_age_seconds: u64,
+        #[arg(long, default_value_t = false)]
+        allow_blocked: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     RunPortfolioCanary {
         #[arg(long, default_value = "candidates/weekly_selector_canary.json")]
         candidate: PathBuf,
@@ -676,6 +706,37 @@ async fn main() -> Result<()> {
             as_of,
             require_action,
         } => portfolio_canary_status(&candidate, as_of, require_action),
+        Commands::CanaryLiveReadiness {
+            candidate,
+            as_of,
+            account_cash,
+            debit_max_loss,
+            wheel_reserve_cap,
+            free_cash_buffer,
+            max_wheel_positions_per_symbol,
+            broker_multi_leg_options,
+            broker_cash_secured_puts,
+            broker_covered_calls,
+            robinhood_mcp_command,
+            max_order_age_seconds,
+            allow_blocked,
+            json,
+        } => canary_live_readiness(
+            &candidate,
+            as_of,
+            account_cash,
+            debit_max_loss,
+            wheel_reserve_cap,
+            free_cash_buffer,
+            max_wheel_positions_per_symbol,
+            broker_multi_leg_options,
+            broker_cash_secured_puts,
+            broker_covered_calls,
+            robinhood_mcp_command,
+            max_order_age_seconds,
+            allow_blocked,
+            json,
+        ),
         Commands::RunPortfolioCanary {
             candidate,
             as_of,
@@ -1459,6 +1520,292 @@ fn run_portfolio_canary(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct CanaryLiveReadinessReport {
+    checked_at: chrono::DateTime<Utc>,
+    candidate: String,
+    candidate_readable: bool,
+    artifact_parse_ok: bool,
+    as_of: NaiveDate,
+    candidate_ready_for_broker_review: bool,
+    live_worker_ready_to_attempt_order: bool,
+    robinhood_mcp_command_configured: bool,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+    next_action: String,
+    decision: Option<PortfolioCanaryRunDecision>,
+    error: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canary_live_readiness(
+    candidate: &Path,
+    as_of: Option<NaiveDate>,
+    account_cash: f64,
+    debit_max_loss: f64,
+    wheel_reserve_cap: f64,
+    free_cash_buffer: f64,
+    max_wheel_positions_per_symbol: usize,
+    broker_multi_leg_options: bool,
+    broker_cash_secured_puts: bool,
+    broker_covered_calls: bool,
+    robinhood_mcp_command: Option<String>,
+    max_order_age_seconds: u64,
+    allow_blocked: bool,
+    json: bool,
+) -> Result<()> {
+    let as_of = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let risk = CanaryRiskConfig {
+        account_cash,
+        debit_max_loss,
+        wheel_reserve_cap,
+        free_cash_buffer,
+        max_wheel_positions_per_symbol,
+    };
+    validate_canary_risk_config(&risk)?;
+    let broker = canary_broker(
+        broker_multi_leg_options,
+        broker_cash_secured_puts,
+        broker_covered_calls,
+        true,
+    );
+    let candidate_body = fs::read_to_string(candidate);
+    let candidate_readable = candidate_body.is_ok();
+    let mut artifact_error = None;
+    let artifact = match candidate_body {
+        Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(artifact) => Some(artifact),
+            Err(err) => {
+                artifact_error = Some(format!("parse canary artifact: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            artifact_error = Some(format!("read canary artifact: {err}"));
+            None
+        }
+    };
+    let artifact_parse_ok = artifact.is_some();
+    let report = build_canary_live_readiness_report(
+        candidate,
+        candidate_readable,
+        artifact_parse_ok,
+        artifact.as_ref(),
+        artifact_error,
+        as_of,
+        &risk,
+        &broker,
+        robinhood_mcp_command.is_some(),
+        max_order_age_seconds,
+    );
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_canary_live_readiness_report(&report);
+    }
+    if !allow_blocked && !report.live_worker_ready_to_attempt_order {
+        anyhow::bail!("live readiness blocked: {}", report.blockers.join("; "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_canary_live_readiness_report(
+    candidate: &Path,
+    candidate_readable: bool,
+    artifact_parse_ok: bool,
+    artifact: Option<&serde_json::Value>,
+    artifact_error: Option<String>,
+    as_of: NaiveDate,
+    risk: &CanaryRiskConfig,
+    broker: &RobinhoodBrokerAdapter,
+    robinhood_mcp_command_configured: bool,
+    max_order_age_seconds: u64,
+) -> CanaryLiveReadinessReport {
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    let mut decision = None;
+    let mcp_blocker = "SPREAD_ROBINHOOD_MCP_COMMAND not configured; worker cannot call Robinhood MCP review/place";
+
+    if let Some(err) = artifact_error.as_deref() {
+        push_unique(&mut blockers, err);
+    }
+    if !robinhood_mcp_command_configured {
+        push_unique(&mut blockers, mcp_blocker);
+    }
+
+    if let Some(artifact) = artifact {
+        if let Err(err) = canary_artifact_ready_for_broker(artifact) {
+            push_unique(&mut blockers, format!("artifact readiness: {err}"));
+        }
+        match artifact_exported_at(artifact) {
+            Some(exported_at) => match canary_artifact_age_seconds(exported_at) {
+                Ok(age) => {
+                    if age > max_order_age_seconds {
+                        push_unique(
+                            &mut blockers,
+                            format!(
+                                "artifact age {age}s exceeds max {max_order_age_seconds}s; regenerate before live"
+                            ),
+                        );
+                    }
+                }
+                Err(err) => push_unique(&mut blockers, err.to_string()),
+            },
+            None => push_unique(
+                &mut blockers,
+                "artifact exported_at missing; regenerate before live",
+            ),
+        }
+
+        let fresh_action_count = canary_fresh_action_count(artifact, as_of);
+        if fresh_action_count == 0 {
+            push_unique(
+                &mut blockers,
+                format!("no fresh entry_candidate or open_candidate for {as_of}"),
+            );
+        }
+
+        let canary_decision = portfolio_canary_run_decision(
+            artifact,
+            as_of,
+            risk,
+            broker,
+            CanaryMode::Live,
+            max_order_age_seconds,
+        );
+        if let Some(action) = &canary_decision.selected_action {
+            if matches!(
+                action.strategy.as_str(),
+                "put_debit_spread" | "call_debit_spread"
+            ) && !broker.capabilities.multi_leg_options
+            {
+                push_unique(
+                    &mut blockers,
+                    "broker multi-leg options capability not enabled/proven for selected debit spread",
+                );
+            }
+            if action.strategy == "wheel" {
+                if !broker.capabilities.cash_secured_puts {
+                    push_unique(
+                        &mut blockers,
+                        "broker cash-secured put capability not enabled/proven for selected wheel entry",
+                    );
+                }
+                if !broker.capabilities.covered_calls {
+                    push_unique(
+                        &mut blockers,
+                        "broker covered-call capability not enabled/proven for selected wheel lifecycle",
+                    );
+                }
+                push_unique(
+                    &mut blockers,
+                    "autonomous wheel placement remains blocked until broker buying-power, assignment, and position reconciliation are implemented",
+                );
+            }
+        }
+        match canary_decision.status.as_str() {
+            "review_required" => warnings.push(
+                "broker review/place has not been executed by this read-only readiness command"
+                    .to_owned(),
+            ),
+            "monitor_artifact_blocked"
+            | "monitor_risk_blocked"
+            | "monitor_broker_unsupported"
+            | "monitor_open_candidate_only"
+            | "live_blocked" => push_unique(&mut blockers, canary_decision.reason.as_str()),
+            "monitor_no_action" => {}
+            other => push_unique(
+                &mut blockers,
+                format!("unexpected live readiness status {other}"),
+            ),
+        }
+        decision = Some(canary_decision);
+    }
+
+    let decision_ready_for_review = decision.as_ref().is_some_and(|decision| {
+        decision.status == "review_required"
+            && decision
+                .selected_action
+                .as_ref()
+                .is_some_and(|action| action.strategy != "wheel")
+    });
+    let candidate_ready_for_broker_review = decision_ready_for_review
+        && blockers
+            .iter()
+            .all(|blocker| blocker.as_str() == mcp_blocker);
+    let live_worker_ready_to_attempt_order =
+        decision_ready_for_review && blockers.is_empty() && robinhood_mcp_command_configured;
+    let next_action = if live_worker_ready_to_attempt_order {
+        "run the worker in live mode; it will request broker review before any placement"
+    } else if candidate_ready_for_broker_review {
+        "configure SPREAD_ROBINHOOD_MCP_COMMAND, then rerun readiness"
+    } else if blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("no fresh entry_candidate"))
+    {
+        "wait for a fresh same-day signal or regenerate/export a fresh canary artifact"
+    } else {
+        "clear blockers, then rerun canary-live-readiness"
+    }
+    .to_owned();
+
+    CanaryLiveReadinessReport {
+        checked_at: Utc::now(),
+        candidate: candidate.display().to_string(),
+        candidate_readable,
+        artifact_parse_ok,
+        as_of,
+        candidate_ready_for_broker_review,
+        live_worker_ready_to_attempt_order,
+        robinhood_mcp_command_configured,
+        blockers,
+        warnings,
+        next_action,
+        decision,
+        error: artifact_error,
+    }
+}
+
+fn print_canary_live_readiness_report(report: &CanaryLiveReadinessReport) {
+    println!(
+        "live_worker_ready_to_attempt_order={} candidate_ready_for_broker_review={} as_of={}",
+        report.live_worker_ready_to_attempt_order,
+        report.candidate_ready_for_broker_review,
+        report.as_of
+    );
+    println!("candidate={}", report.candidate);
+    println!("next_action={}", report.next_action);
+    if report.blockers.is_empty() {
+        println!("blockers=none");
+    } else {
+        for blocker in &report.blockers {
+            println!("blocker={blocker}");
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning={warning}");
+    }
+}
+
+fn canary_fresh_action_count(artifact: &serde_json::Value, as_of: NaiveDate) -> usize {
+    artifact
+        .get("latest_actions")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|action| canary_action_is_fresh(action, as_of))
+        .count()
+}
+
+fn push_unique(items: &mut Vec<String>, item: impl Into<String>) {
+    let item = item.into();
+    if !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct CanaryRiskConfig {
     account_cash: f64,
@@ -1742,6 +2089,17 @@ fn artifact_exported_at(artifact: &serde_json::Value) -> Option<chrono::DateTime
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn canary_artifact_age_seconds(exported_at: chrono::DateTime<Utc>) -> Result<u64> {
+    let age_seconds = Utc::now().signed_duration_since(exported_at).num_seconds();
+    if age_seconds < 0 {
+        anyhow::bail!(
+            "artifact exported_at {} is in the future; check system clock or exporter",
+            exported_at.to_rfc3339()
+        );
+    }
+    Ok(age_seconds as u64)
+}
+
 fn canary_artifact_fresh_enough_for_live_order(
     artifact: &serde_json::Value,
     max_order_age_seconds: u64,
@@ -1751,10 +2109,7 @@ fn canary_artifact_fresh_enough_for_live_order(
             "live placement requires artifact exported_at timestamp; regenerate and export a fresh canary artifact"
         );
     };
-    let age = Utc::now()
-        .signed_duration_since(exported_at)
-        .num_seconds()
-        .max(0) as u64;
+    let age = canary_artifact_age_seconds(exported_at)?;
     if age > max_order_age_seconds {
         anyhow::bail!(
             "live placement blocked because artifact age {}s exceeds max {}s",
@@ -4747,6 +5102,74 @@ mod tests {
     }
 
     #[test]
+    fn canary_live_readiness_accepts_service_flags() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "canary-live-readiness",
+            "--candidate",
+            "candidates/example.json",
+            "--as-of",
+            "2026-06-28",
+            "--account-cash",
+            "45000",
+            "--debit-max-loss",
+            "1000",
+            "--wheel-reserve-cap",
+            "35000",
+            "--free-cash-buffer",
+            "11250",
+            "--max-wheel-positions-per-symbol",
+            "1",
+            "--broker-multi-leg-options",
+            "--broker-cash-secured-puts",
+            "--broker-covered-calls",
+            "--robinhood-mcp-command",
+            "codex mcp exec robinhood-trading",
+            "--allow-blocked",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::CanaryLiveReadiness {
+                candidate,
+                as_of,
+                account_cash,
+                debit_max_loss,
+                wheel_reserve_cap,
+                free_cash_buffer,
+                max_wheel_positions_per_symbol,
+                broker_multi_leg_options,
+                broker_cash_secured_puts,
+                broker_covered_calls,
+                robinhood_mcp_command,
+                max_order_age_seconds,
+                allow_blocked,
+                json,
+            } => {
+                assert_eq!(candidate, PathBuf::from("candidates/example.json"));
+                assert_eq!(as_of, Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()));
+                assert_eq!(account_cash, 45_000.0);
+                assert_eq!(debit_max_loss, 1_000.0);
+                assert_eq!(wheel_reserve_cap, 35_000.0);
+                assert_eq!(free_cash_buffer, 11_250.0);
+                assert_eq!(max_wheel_positions_per_symbol, 1);
+                assert!(broker_multi_leg_options);
+                assert!(broker_cash_secured_puts);
+                assert!(broker_covered_calls);
+                assert_eq!(
+                    robinhood_mcp_command.as_deref(),
+                    Some("codex mcp exec robinhood-trading")
+                );
+                assert_eq!(max_order_age_seconds, DEFAULT_MAX_ORDER_AGE_SECONDS);
+                assert!(allow_blocked);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn portfolio_canary_status_require_action_fails_closed_without_action() {
         let path = unique_main_test_path("canary-no-action.json");
         fs::write(
@@ -5743,6 +6166,238 @@ mod tests {
             Some("review_required")
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canary_live_readiness_reports_current_static_blockers() {
+        let artifact = serde_json::json!({
+            "status":"canary_only",
+            "decision":{"canary_ready":true,"research_gate":"research_pass"},
+            "latest_actions":[
+                {"status":"recent_closed","symbol":"TSLA","strategy":"put_debit_spread","entry_date":"2026-06-25","exit_date":"2026-06-26","entry_credit":-1.0,"max_loss":100.0},
+                {"status":"entry_candidate","symbol":"CRWV","strategy":"wheel","entry_date":"2026-06-26","exit_date":"2026-06-26","max_loss":7888.0}
+            ]
+        });
+        let report = build_canary_live_readiness_report(
+            Path::new("candidates/weekly_selector_canary.json"),
+            true,
+            true,
+            Some(&artifact),
+            None,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &RobinhoodBrokerAdapter::default(),
+            false,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert!(!report.live_worker_ready_to_attempt_order);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("SPREAD_ROBINHOOD_MCP_COMMAND not configured"))
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("artifact exported_at missing"))
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("no fresh entry_candidate"))
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .all(|blocker| !blocker.contains("multi-leg options capability"))
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .all(|blocker| !blocker.contains("cash-secured put capability"))
+        );
+    }
+
+    #[test]
+    fn canary_live_readiness_fails_closed_without_allow_blocked() {
+        let path = unique_main_test_path("canary-readiness-blocked.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&test_canary_artifact(serde_json::json!([{
+                "status":"recent_closed",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":"2026-06-25",
+                "exit_date":"2026-06-26",
+                "entry_credit":-1.0,
+                "max_loss":100.0
+            }])))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = canary_live_readiness(
+            &path,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            45_000.0,
+            1_000.0,
+            35_000.0,
+            11_250.0,
+            1,
+            true,
+            false,
+            false,
+            Some("bridge".to_owned()),
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("live readiness blocked"));
+        canary_live_readiness(
+            &path,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            45_000.0,
+            1_000.0,
+            35_000.0,
+            11_250.0,
+            1,
+            true,
+            false,
+            false,
+            Some("bridge".to_owned()),
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            true,
+            true,
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canary_live_readiness_allows_fresh_debit_live_attempt_after_static_gates() {
+        let today = Utc::now().date_naive();
+        let today_s = today.to_string();
+        let artifact = test_canary_artifact(serde_json::json!([
+            {
+                "status":"entry_candidate",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":today_s,
+                "exit_date":today_s,
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+            },
+            {
+                "status":"recent_closed",
+                "symbol":"CRWV",
+                "strategy":"wheel",
+                "entry_date":"2026-06-26",
+                "exit_date":"2026-06-26",
+                "short_strike":80.0,
+                "entry_credit":1.12,
+                "max_loss":7888.0
+            }
+        ]));
+        let broker = RobinhoodBrokerAdapter {
+            capabilities: BrokerCapabilities {
+                single_leg_options: true,
+                multi_leg_options: true,
+                stock_option_combos: false,
+                cash_secured_puts: false,
+                covered_calls: false,
+            },
+            live_orders_enabled: true,
+        };
+
+        let report = build_canary_live_readiness_report(
+            Path::new("candidates/weekly_selector_canary.json"),
+            true,
+            true,
+            Some(&artifact),
+            None,
+            today,
+            &test_canary_risk(),
+            &broker,
+            true,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert!(report.candidate_ready_for_broker_review);
+        assert!(report.live_worker_ready_to_attempt_order);
+        assert!(report.blockers.is_empty());
+        assert_eq!(
+            report
+                .decision
+                .as_ref()
+                .map(|decision| decision.status.as_str()),
+            Some("review_required")
+        );
+    }
+
+    #[test]
+    fn canary_live_readiness_blocks_future_exported_at() {
+        let today = Utc::now().date_naive();
+        let today_s = today.to_string();
+        let mut artifact = test_canary_artifact(serde_json::json!([{
+            "status":"entry_candidate",
+            "symbol":"TSLA",
+            "strategy":"put_debit_spread",
+            "entry_date":today_s,
+            "exit_date":today_s,
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-1.00,
+            "max_loss":100.0
+        }]));
+        artifact["exported_at"] =
+            serde_json::json!((Utc::now() + chrono::Duration::minutes(5)).to_rfc3339());
+        let broker = RobinhoodBrokerAdapter {
+            capabilities: BrokerCapabilities {
+                single_leg_options: true,
+                multi_leg_options: true,
+                stock_option_combos: false,
+                cash_secured_puts: false,
+                covered_calls: false,
+            },
+            live_orders_enabled: true,
+        };
+
+        let report = build_canary_live_readiness_report(
+            Path::new("candidates/weekly_selector_canary.json"),
+            true,
+            true,
+            Some(&artifact),
+            None,
+            today,
+            &test_canary_risk(),
+            &broker,
+            true,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let live_err =
+            canary_artifact_fresh_enough_for_live_order(&artifact, DEFAULT_MAX_ORDER_AGE_SECONDS)
+                .unwrap_err();
+
+        assert!(!report.live_worker_ready_to_attempt_order);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("in the future"))
+        );
+        assert!(format!("{live_err:#}").contains("in the future"));
     }
 
     fn test_canary_risk() -> CanaryRiskConfig {

@@ -106,6 +106,15 @@ worker is managed as a macOS LaunchAgent so it survives the launching shell.
 JSON object for both CLI operations and the menubar. The script never computes a
 trade decision.
 
+`scripts/canary-service.sh readiness` runs a read-only live-readiness audit from
+the same persisted service environment. It reports current blockers such as
+missing fresh signal, stale export timestamp, disabled broker capability flags,
+or missing Robinhood MCP command without previewing or placing an order. The
+script exits nonzero unless the live worker is ready to attempt broker review
+for a fresh selected action. The raw `spreadfoundry canary-live-readiness`
+command has the same fail-closed default; use `--allow-blocked` only for
+exploratory reporting where a zero exit code is required despite blockers.
+
 ### Phase 4: Menubar
 
 Status: implemented.
@@ -130,13 +139,16 @@ cargo build --release
 SPREAD_ROOT=/Users/1duo/Projects/SpreadFoundry swift run -c release SpreadFoundryMenubar
 ```
 
-The app renders the Rust snapshot and exposes only `Refresh`, `Start`, `Stop`,
-`Restart`, `Log`, `Docs`, and `Quit`.
+The app renders the Rust snapshot and exposes only the canary mode switch,
+`Refresh`, `Start`, `Stop`, `Restart`, `Log`, `Docs`, and `Quit`.
 
 Essential menubar functions:
 
 - `Status`: show worker liveness, health freshness, current decision, broker
   capability mode, canary side-effect mode, and selected action.
+- `Mode`: switch the worker between `monitor`, `review`, and `live` through
+  `scripts/canary-service.sh set-mode`, which persists `SPREAD_CANARY_MODE` and
+  restarts the worker.
 - `Refresh`: force a new read of the Rust canary snapshot.
 - `Start`: start the canary worker service without changing trading gates.
 - `Restart`: restart the worker after a binary/config update.

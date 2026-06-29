@@ -1,6 +1,25 @@
 import Foundation
 import SwiftUI
 
+enum CanaryModeChoice: String, CaseIterable, Identifiable {
+    case monitor
+    case review
+    case live
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .monitor:
+            return "Monitor"
+        case .review:
+            return "Review"
+        case .live:
+            return "Live"
+        }
+    }
+}
+
 @MainActor
 final class MenubarViewModel: ObservableObject {
     @Published private(set) var snapshot: CanarySnapshot = .unavailable
@@ -13,6 +32,14 @@ final class MenubarViewModel: ObservableObject {
     init(snapshotService: SnapshotService, scriptRunner: ScriptRunner) {
         self.snapshotService = snapshotService
         self.scriptRunner = scriptRunner
+    }
+
+    var currentMode: CanaryModeChoice? {
+        snapshot.canaryMode
+    }
+
+    var modeIsKnown: Bool {
+        currentMode != nil
     }
 
     func start() {
@@ -46,6 +73,13 @@ final class MenubarViewModel: ObservableObject {
         runThenRefresh("restart")
     }
 
+    func setMode(_ mode: CanaryModeChoice) {
+        guard currentMode != mode else {
+            return
+        }
+        runThenRefresh("set-mode", arguments: [mode.rawValue])
+    }
+
     func openLog() {
         scriptRunner.openLog()
     }
@@ -54,9 +88,9 @@ final class MenubarViewModel: ObservableObject {
         scriptRunner.openDocs()
     }
 
-    private func runThenRefresh(_ command: String) {
+    private func runThenRefresh(_ command: String, arguments: [String] = []) {
         do {
-            _ = try scriptRunner.runServiceCommand(command)
+            _ = try scriptRunner.runServiceCommand(command, arguments: arguments)
             refresh()
         } catch {
             errorMessage = error.localizedDescription

@@ -28,6 +28,12 @@ struct CanarySnapshot: Decodable {
         rows: [],
         actionRows: []
     )
+
+    var canaryMode: CanaryModeChoice? {
+        rows
+            .first { $0.label == "Mode" }
+            .flatMap { CanaryModeChoice(rawValue: $0.value) }
+    }
 }
 
 struct SnapshotRow: Decodable, Identifiable {

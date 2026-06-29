@@ -9,9 +9,10 @@ struct MenubarMenuContent: View {
             panelDivider()
 
             SectionHeaderRow(title: "Canary", systemImage: "waveform.path.ecg")
-            ForEach(viewModel.snapshot.rows) { row in
+            ForEach(statusRows) { row in
                 StatusIndicatorRow(row: row)
             }
+            modePicker
 
             panelDivider()
 
@@ -94,6 +95,40 @@ struct MenubarMenuContent: View {
         default:
             return "bad"
         }
+    }
+
+    private var statusRows: [SnapshotRow] {
+        viewModel.snapshot.rows.filter { $0.label != "Mode" }
+    }
+
+    private var modePicker: some View {
+        HStack(alignment: .center, spacing: 7) {
+            MenuRowIcon(systemName: "switch.2")
+            Text("Mode")
+                .lineLimit(1)
+            if !viewModel.modeIsKnown {
+                Text("Unknown")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: MenuLayoutMetrics.columnSpacing)
+            Picker("Mode", selection: Binding(
+                get: { viewModel.currentMode },
+                set: { mode in
+                    if let mode {
+                        viewModel.setMode(mode)
+                    }
+                }
+            )) {
+                ForEach(CanaryModeChoice.allCases) { mode in
+                    Text(mode.title).tag(Optional(mode))
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 184)
+        }
+        .menuPanelRow()
     }
 
     private func panelDivider() -> some View {

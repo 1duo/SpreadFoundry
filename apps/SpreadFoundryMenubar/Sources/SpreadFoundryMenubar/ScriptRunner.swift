@@ -5,11 +5,11 @@ struct ScriptRunner {
     let rootDirectory: URL
 
     @discardableResult
-    func runServiceCommand(_ command: String) throws -> Data {
+    func runServiceCommand(_ command: String, arguments: [String] = []) throws -> Data {
         let script = rootDirectory.appendingPathComponent("scripts/canary-service.sh")
         let process = Process()
         process.executableURL = script
-        process.arguments = [command]
+        process.arguments = [command] + arguments
         process.currentDirectoryURL = rootDirectory
 
         let output = Pipe()

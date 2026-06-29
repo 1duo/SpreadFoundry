@@ -70,6 +70,24 @@ persist_canary_env() {
   mv "$tmp_file" "$env_file"
 }
 
+set_worker_mode() {
+  local mode="${1:-}"
+  case "$mode" in
+    monitor|review|live)
+      ;;
+    *)
+      echo "usage: $0 set-mode {monitor|review|live}" >&2
+      exit 2
+      ;;
+  esac
+  load_saved_canary_env
+  export SPREAD_CANARY_MODE="$mode"
+  persist_canary_env
+  stop_worker
+  start_worker
+  echo "canary worker mode=$mode"
+}
+
 start_worker() {
   mkdir -p "$(dirname "$pid_file")" "$(dirname "$health_output")" "$(dirname "$log_file")"
   load_saved_canary_env
@@ -183,6 +201,48 @@ snapshot_worker() {
   fi
 }
 
+readiness_report() {
+  load_saved_canary_env
+  spreadfoundry_bin="${SPREAD_BINARY:-$spreadfoundry_bin}"
+  local candidate="${SPREAD_CANARY_CANDIDATE:-candidates/weekly_selector_canary.json}"
+  local account_cash="${SPREAD_CANARY_ACCOUNT_CASH:-45000}"
+  local debit_max_loss="${SPREAD_CANARY_DEBIT_MAX_LOSS:-1000}"
+  local wheel_reserve_cap="${SPREAD_CANARY_WHEEL_RESERVE_CAP:-35000}"
+  local free_cash_buffer="${SPREAD_CANARY_FREE_CASH_BUFFER:-11250}"
+  local max_wheel_positions_per_symbol="${SPREAD_CANARY_MAX_WHEEL_POSITIONS_PER_SYMBOL:-1}"
+  local max_order_age_seconds="${SPREAD_CANARY_MAX_ORDER_AGE_SECONDS:-1800}"
+  local cli_args=(
+    canary-live-readiness
+    --candidate "$candidate"
+    --account-cash "$account_cash"
+    --debit-max-loss "$debit_max_loss"
+    --wheel-reserve-cap "$wheel_reserve_cap"
+    --free-cash-buffer "$free_cash_buffer"
+    --max-wheel-positions-per-symbol "$max_wheel_positions_per_symbol"
+    --max-order-age-seconds "$max_order_age_seconds"
+    --json
+  )
+
+  if [[ "${SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS:-0}" == "1" ]]; then
+    cli_args+=(--broker-multi-leg-options)
+  fi
+  if [[ "${SPREAD_CANARY_BROKER_CASH_SECURED_PUTS:-0}" == "1" ]]; then
+    cli_args+=(--broker-cash-secured-puts)
+  fi
+  if [[ "${SPREAD_CANARY_BROKER_COVERED_CALLS:-0}" == "1" ]]; then
+    cli_args+=(--broker-covered-calls)
+  fi
+  if [[ -n "${SPREAD_ROBINHOOD_MCP_COMMAND:-}" ]]; then
+    cli_args+=(--robinhood-mcp-command "$SPREAD_ROBINHOOD_MCP_COMMAND")
+  fi
+
+  if [[ -x "$spreadfoundry_bin" ]]; then
+    "$spreadfoundry_bin" "${cli_args[@]}"
+  else
+    cargo run --quiet --release -- "${cli_args[@]}"
+  fi
+}
+
 case "${1:-status}" in
   start)
     start_worker
@@ -194,8 +254,14 @@ case "${1:-status}" in
     stop_worker
     start_worker
     ;;
+  set-mode)
+    set_worker_mode "${2:-}"
+    ;;
   status|snapshot)
     snapshot_worker
+    ;;
+  readiness)
+    readiness_report
     ;;
   log)
     mkdir -p "$(dirname "$log_file")"
@@ -203,7 +269,7 @@ case "${1:-status}" in
     tail -n "${SPREAD_CANARY_LOG_LINES:-80}" "$log_file"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|snapshot|log}" >&2
+    echo "usage: $0 {start|stop|restart|set-mode|status|snapshot|readiness|log}" >&2
     exit 2
     ;;
 esac
