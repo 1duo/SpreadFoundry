@@ -9,6 +9,7 @@ health_output="${SPREAD_CANARY_HEALTH_OUTPUT:-target/canary_worker_health.json}"
 order_ledger="${SPREAD_CANARY_ORDER_LEDGER:-var/canary_order_ledger.json}"
 max_order_age_seconds="${SPREAD_CANARY_MAX_ORDER_AGE_SECONDS:-1800}"
 poll_seconds="${SPREAD_CANARY_POLL_SECONDS:-60}"
+mode="${SPREAD_CANARY_MODE:-monitor}"
 account_cash="${SPREAD_CANARY_ACCOUNT_CASH:-45000}"
 debit_max_loss="${SPREAD_CANARY_DEBIT_MAX_LOSS:-1000}"
 wheel_reserve_cap="${SPREAD_CANARY_WHEEL_RESERVE_CAP:-35000}"
@@ -24,6 +25,7 @@ cli_args=(
   --wheel-reserve-cap "$wheel_reserve_cap"
   --free-cash-buffer "$free_cash_buffer"
   --max-wheel-positions-per-symbol "$max_wheel_positions_per_symbol"
+  --mode "$mode"
   --poll-seconds "$poll_seconds"
   --health-output "$health_output"
   --order-ledger "$order_ledger"
@@ -40,17 +42,8 @@ fi
 if [[ "${SPREAD_CANARY_BROKER_COVERED_CALLS:-0}" == "1" ]]; then
   cli_args+=(--broker-covered-calls)
 fi
-if [[ "${SPREAD_CANARY_BROKER_REVIEW_OK:-0}" == "1" ]]; then
-  cli_args+=(--broker-review-ok)
-fi
-if [[ "${SPREAD_CANARY_LIVE_ORDERS_ENABLED:-0}" == "1" ]]; then
-  cli_args+=(--live-orders-enabled)
-fi
 if [[ -n "${SPREAD_ROBINHOOD_MCP_COMMAND:-}" ]]; then
   cli_args+=(--robinhood-mcp-command "$SPREAD_ROBINHOOD_MCP_COMMAND")
-fi
-if [[ "${SPREAD_CANARY_PLACE_LIVE_ORDER:-0}" == "1" ]]; then
-  cli_args+=(--place-live-order)
 fi
 if [[ "${SPREAD_CANARY_ONCE:-0}" == "1" ]]; then
   cli_args+=(--once)

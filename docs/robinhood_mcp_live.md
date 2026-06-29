@@ -89,15 +89,17 @@ that ledger entry.
 
 ## Rollout Flags
 
-Shadow monitor:
+Monitor-only production, no Robinhood calls:
 
 ```sh
+SPREAD_CANARY_MODE=monitor \
 scripts/run_canary_worker.sh
 ```
 
-Review through MCP bridge, no placement:
+Review-only production through MCP bridge, no placement:
 
 ```sh
+SPREAD_CANARY_MODE=review \
 SPREAD_ROBINHOOD_MCP_COMMAND=/path/to/bridge \
 SPREAD_CANARY_BROKER_CASH_SECURED_PUTS=1 \
 SPREAD_CANARY_BROKER_COVERED_CALLS=1 \
@@ -110,12 +112,17 @@ Debit spreads additionally require:
 SPREAD_CANARY_BROKER_MULTI_LEG_OPTIONS=1
 ```
 
-Live placement requires every prior gate plus both:
+Live placement requires every prior gate plus:
 
 ```sh
-SPREAD_CANARY_LIVE_ORDERS_ENABLED=1
-SPREAD_CANARY_PLACE_LIVE_ORDER=1
+SPREAD_CANARY_MODE=live
 ```
+
+`SPREAD_CANARY_MODE` is the only side-effect switch:
+
+- `monitor` reads artifacts, applies local gates, and writes health.
+- `review` also calls Robinhood `review_option_order`, but never places.
+- `live` also calls `place_option_order` after a matching MCP review.
 
 Autonomous placement also requires a recently exported artifact. New exports
 include `exported_at`; placement is blocked when that timestamp is older than

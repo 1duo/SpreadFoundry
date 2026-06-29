@@ -113,7 +113,7 @@ Status: implemented.
 - Add a small macOS menubar app modeled after AxiomTrade's snapshot-consumer
   pattern.
 - Display only useful operational facts: worker state, current action, broker
-  mode, live enabled/disabled, last check age, and kill-switch state.
+  mode, canary side-effect mode, last check age, and kill-switch state.
 - Keep controls minimal: refresh, open docs/log, stop worker.
 
 Success criteria:
@@ -136,7 +136,7 @@ The app renders the Rust snapshot and exposes only `Refresh`, `Start`, `Stop`,
 Essential menubar functions:
 
 - `Status`: show worker liveness, health freshness, current decision, broker
-  capability mode, live-order flag, and selected action.
+  capability mode, canary side-effect mode, and selected action.
 - `Refresh`: force a new read of the Rust canary snapshot.
 - `Start`: start the canary worker service without changing trading gates.
 - `Restart`: restart the worker after a binary/config update.

@@ -132,24 +132,20 @@ enum Commands {
         free_cash_buffer: f64,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
+        #[arg(long, value_enum, default_value = "monitor")]
+        mode: CanaryMode,
         #[arg(long, default_value_t = false)]
         broker_multi_leg_options: bool,
         #[arg(long, default_value_t = false)]
         broker_cash_secured_puts: bool,
         #[arg(long, default_value_t = false)]
         broker_covered_calls: bool,
-        #[arg(long, default_value_t = false)]
-        broker_review_ok: bool,
-        #[arg(long, default_value_t = false)]
-        live_orders_enabled: bool,
         #[arg(long)]
         robinhood_mcp_command: Option<String>,
         #[arg(long, default_value = "var/canary_order_ledger.json")]
         order_ledger: PathBuf,
         #[arg(long, default_value_t = DEFAULT_MAX_ORDER_AGE_SECONDS)]
         max_order_age_seconds: u64,
-        #[arg(long, default_value_t = false)]
-        place_live_order: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -168,24 +164,20 @@ enum Commands {
         free_cash_buffer: f64,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
+        #[arg(long, value_enum, default_value = "monitor")]
+        mode: CanaryMode,
         #[arg(long, default_value_t = false)]
         broker_multi_leg_options: bool,
         #[arg(long, default_value_t = false)]
         broker_cash_secured_puts: bool,
         #[arg(long, default_value_t = false)]
         broker_covered_calls: bool,
-        #[arg(long, default_value_t = false)]
-        broker_review_ok: bool,
-        #[arg(long, default_value_t = false)]
-        live_orders_enabled: bool,
         #[arg(long)]
         robinhood_mcp_command: Option<String>,
         #[arg(long, default_value = "var/canary_order_ledger.json")]
         order_ledger: PathBuf,
         #[arg(long, default_value_t = DEFAULT_MAX_ORDER_AGE_SECONDS)]
         max_order_age_seconds: u64,
-        #[arg(long, default_value_t = false)]
-        place_live_order: bool,
         #[arg(long, default_value_t = 60)]
         poll_seconds: u64,
         #[arg(long, default_value_t = false)]
@@ -456,6 +448,14 @@ enum OptimizeMethod {
     Random,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum CanaryMode {
+    Monitor,
+    Review,
+    Live,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProfileFamilyArg {
     Swing,
@@ -685,15 +685,13 @@ async fn main() -> Result<()> {
             wheel_reserve_cap,
             free_cash_buffer,
             max_wheel_positions_per_symbol,
+            mode,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
-            broker_review_ok,
-            live_orders_enabled,
             robinhood_mcp_command,
             order_ledger,
             max_order_age_seconds,
-            place_live_order,
             json,
         } => run_portfolio_canary(
             &candidate,
@@ -704,15 +702,13 @@ async fn main() -> Result<()> {
             wheel_reserve_cap,
             free_cash_buffer,
             max_wheel_positions_per_symbol,
+            mode,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
-            broker_review_ok,
-            live_orders_enabled,
             robinhood_mcp_command,
             order_ledger,
             max_order_age_seconds,
-            place_live_order,
             json,
         ),
         Commands::CanaryWorker {
@@ -723,15 +719,13 @@ async fn main() -> Result<()> {
             wheel_reserve_cap,
             free_cash_buffer,
             max_wheel_positions_per_symbol,
+            mode,
             broker_multi_leg_options,
             broker_cash_secured_puts,
             broker_covered_calls,
-            broker_review_ok,
-            live_orders_enabled,
             robinhood_mcp_command,
             order_ledger,
             max_order_age_seconds,
-            place_live_order,
             poll_seconds,
             once,
             health_output,
@@ -751,13 +745,12 @@ async fn main() -> Result<()> {
                     broker_multi_leg_options,
                     broker_cash_secured_puts,
                     broker_covered_calls,
-                    live_orders_enabled,
+                    mode == CanaryMode::Live,
                 ),
+                mode,
                 robinhood_mcp_command,
                 order_ledger,
                 max_order_age_seconds,
-                broker_review_ok,
-                place_live_order,
                 poll_seconds,
                 once,
                 health_output,
@@ -1381,15 +1374,13 @@ fn run_portfolio_canary(
     wheel_reserve_cap: f64,
     free_cash_buffer: f64,
     max_wheel_positions_per_symbol: usize,
+    mode: CanaryMode,
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
-    broker_review_ok: bool,
-    live_orders_enabled: bool,
     robinhood_mcp_command: Option<String>,
     order_ledger: PathBuf,
     max_order_age_seconds: u64,
-    place_live_order: bool,
     json: bool,
 ) -> Result<()> {
     if let Some(max_loss) = max_loss
@@ -1415,15 +1406,14 @@ fn run_portfolio_canary(
         broker_multi_leg_options,
         broker_cash_secured_puts,
         broker_covered_calls,
-        live_orders_enabled,
+        mode == CanaryMode::Live,
     );
     let mut decision = portfolio_canary_run_decision(
         &artifact,
         as_of,
         &risk,
         &broker,
-        broker_review_ok,
-        place_live_order,
+        mode,
         max_order_age_seconds,
     );
     apply_robinhood_mcp_bridge(
@@ -1435,8 +1425,9 @@ fn run_portfolio_canary(
         println!("{}", serde_json::to_string_pretty(&decision)?);
     } else {
         println!(
-            "status={} as_of={} debit_max_loss={:.2} wheel_reserve_cap={:.2} free_cash_buffer={:.2}",
+            "status={} mode={} as_of={} debit_max_loss={:.2} wheel_reserve_cap={:.2} free_cash_buffer={:.2}",
             decision.status,
+            canary_mode_label(decision.mode),
             decision.as_of,
             decision.risk.debit_max_loss,
             decision.risk.wheel_reserve_cap,
@@ -1487,13 +1478,12 @@ struct PortfolioCanaryRunDecision {
     status: String,
     reason: String,
     as_of: NaiveDate,
+    mode: CanaryMode,
     risk: CanaryRiskConfig,
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
     broker_review_ok: bool,
-    live_orders_enabled: bool,
-    place_live_order: bool,
     artifact_exported_at: Option<chrono::DateTime<Utc>>,
     max_order_age_seconds: u64,
     mcp_review: Option<RobinhoodMcpToolResponse>,
@@ -1525,8 +1515,7 @@ fn portfolio_canary_run_decision(
     as_of: NaiveDate,
     risk: &CanaryRiskConfig,
     broker: &RobinhoodBrokerAdapter,
-    broker_review_ok: bool,
-    place_live_order: bool,
+    mode: CanaryMode,
     max_order_age_seconds: u64,
 ) -> PortfolioCanaryRunDecision {
     if let Err(err) = canary_artifact_ready_for_broker(artifact) {
@@ -1534,10 +1523,10 @@ fn portfolio_canary_run_decision(
             "shadow_artifact_blocked",
             &err.to_string(),
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             None,
@@ -1555,12 +1544,12 @@ fn portfolio_canary_run_decision(
     if fresh_actions.is_empty() {
         return canary_run_decision(
             "shadow_no_action",
-            "no fresh entry_candidate or open_candidate; monitor only",
+            "no fresh entry_candidate or open_candidate; no broker action",
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             None,
@@ -1588,10 +1577,10 @@ fn portfolio_canary_run_decision(
                     .join("; ")
             ),
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             fresh_actions
@@ -1605,10 +1594,10 @@ fn portfolio_canary_run_decision(
             "shadow_broker_unsupported",
             &err.to_string(),
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             Some(selected),
@@ -1619,30 +1608,16 @@ fn portfolio_canary_run_decision(
             "shadow_open_candidate_monitor_only",
             "open_candidate is a backtest position that would already be open; live worker will monitor only and will not submit a catch-up order",
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             Some(selected),
         );
     }
-    if place_live_order && broker_review_ok {
-        return canary_run_decision(
-            "live_order_blocked",
-            "manual --broker-review-ok cannot authorize automated placement; use a Robinhood MCP review bridge so review and place are bound to the same order intent",
-            as_of,
-            risk,
-            broker,
-            broker_review_ok,
-            place_live_order,
-            artifact_exported_at(artifact),
-            max_order_age_seconds,
-            Some(selected),
-        );
-    }
-    if place_live_order {
+    if mode == CanaryMode::Live {
         let today = Utc::now().date_naive();
         if as_of != today {
             return canary_run_decision(
@@ -1651,10 +1626,10 @@ fn portfolio_canary_run_decision(
                     "live placement requires --as-of to match today's UTC date {today}; got {as_of}"
                 ),
                 as_of,
+                mode,
                 risk,
                 broker,
-                broker_review_ok,
-                place_live_order,
+                false,
                 artifact_exported_at(artifact),
                 max_order_age_seconds,
                 Some(selected),
@@ -1667,52 +1642,54 @@ fn portfolio_canary_run_decision(
                 "live_order_blocked",
                 &err.to_string(),
                 as_of,
+                mode,
                 risk,
                 broker,
-                broker_review_ok,
-                place_live_order,
+                false,
                 artifact_exported_at(artifact),
                 max_order_age_seconds,
                 Some(selected),
             );
         }
     }
-    if !broker_review_ok {
+    if mode == CanaryMode::Monitor {
         return canary_run_decision(
-            "review_required",
-            "broker review/preview has not succeeded; no order can be placed",
+            "ready_for_review",
+            "fresh action passed local artifact, risk, and broker capability gates; mode=monitor so Robinhood review was not requested",
             as_of,
+            mode,
             risk,
             broker,
-            broker_review_ok,
-            place_live_order,
+            false,
             artifact_exported_at(artifact),
             max_order_age_seconds,
             Some(selected),
         );
     }
-    canary_run_decision(
-        "ready_for_manual_approval",
-        "fresh action passed per-strategy risk and broker review gates; live placement was not requested",
-        as_of,
-        risk,
-        broker,
-        broker_review_ok,
-        place_live_order,
-        artifact_exported_at(artifact),
-        max_order_age_seconds,
-        Some(selected),
-    )
+    {
+        return canary_run_decision(
+            "review_required",
+            "broker review/preview has not succeeded; no order can be placed",
+            as_of,
+            mode,
+            risk,
+            broker,
+            false,
+            artifact_exported_at(artifact),
+            max_order_age_seconds,
+            Some(selected),
+        );
+    }
 }
 
 fn canary_run_decision(
     status: &str,
     reason: &str,
     as_of: NaiveDate,
+    mode: CanaryMode,
     risk: &CanaryRiskConfig,
     broker: &RobinhoodBrokerAdapter,
     broker_review_ok: bool,
-    place_live_order: bool,
     artifact_exported_at: Option<chrono::DateTime<Utc>>,
     max_order_age_seconds: u64,
     selected_action: Option<CanaryActionSummary>,
@@ -1721,13 +1698,12 @@ fn canary_run_decision(
         status: status.to_owned(),
         reason: reason.to_owned(),
         as_of,
+        mode,
         risk: risk.clone(),
         broker_multi_leg_options: broker.capabilities.multi_leg_options,
         broker_cash_secured_puts: broker.capabilities.cash_secured_puts,
         broker_covered_calls: broker.capabilities.covered_calls,
         broker_review_ok,
-        live_orders_enabled: broker.live_orders_enabled,
-        place_live_order,
         artifact_exported_at,
         max_order_age_seconds,
         mcp_review: None,
@@ -1998,7 +1974,7 @@ fn apply_robinhood_mcp_bridge(
     }
 
     decision.broker_review_ok = true;
-    if !decision.place_live_order {
+    if decision.mode != CanaryMode::Live {
         decision.status = "ready_for_manual_approval".to_owned();
         decision.reason =
             "Robinhood MCP review_option_order succeeded; live placement was not requested"
@@ -2008,13 +1984,6 @@ fn apply_robinhood_mcp_bridge(
     if action.strategy == "wheel" {
         decision.status = "ready_for_manual_approval".to_owned();
         decision.reason = "Robinhood MCP review succeeded, but autonomous wheel placement is blocked until broker buying-power, assignment, and position reconciliation are implemented".to_owned();
-        return Ok(());
-    }
-    if !decision.live_orders_enabled {
-        decision.status = "live_order_blocked".to_owned();
-        decision.reason =
-            "live order placement is disabled; use shadow-live until explicit rollout gates pass"
-                .to_owned();
         return Ok(());
     }
 
@@ -2310,11 +2279,10 @@ struct CanaryWorkerArgs {
     as_of: Option<NaiveDate>,
     risk: CanaryRiskConfig,
     broker: RobinhoodBrokerAdapter,
+    mode: CanaryMode,
     robinhood_mcp_command: Option<String>,
     order_ledger: PathBuf,
     max_order_age_seconds: u64,
-    broker_review_ok: bool,
-    place_live_order: bool,
     poll_seconds: u64,
     once: bool,
     health_output: Option<PathBuf>,
@@ -2334,9 +2302,8 @@ struct CanaryWorkerHealth {
     broker_multi_leg_options: bool,
     broker_cash_secured_puts: bool,
     broker_covered_calls: bool,
-    live_orders_enabled: bool,
+    mode: CanaryMode,
     broker_review_ok: bool,
-    place_live_order: bool,
     robinhood_mcp_command_configured: bool,
     order_ledger: String,
     decision: Option<PortfolioCanaryRunDecision>,
@@ -2460,16 +2427,12 @@ fn build_canary_worker_snapshot(
                 },
             ),
             snapshot_row(
-                "Live",
-                if health.live_orders_enabled && health.place_live_order {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                if health.live_orders_enabled && health.place_live_order {
-                    "warn"
-                } else {
-                    "ok"
+                "Mode",
+                canary_mode_label(health.mode),
+                match health.mode {
+                    CanaryMode::Monitor => "ok",
+                    CanaryMode::Review => "warn",
+                    CanaryMode::Live => "warn",
                 },
             ),
             snapshot_row(
@@ -2578,6 +2541,14 @@ fn broker_capability_summary(health: &CanaryWorkerHealth) -> String {
     }
 }
 
+fn canary_mode_label(mode: CanaryMode) -> &'static str {
+    match mode {
+        CanaryMode::Monitor => "monitor",
+        CanaryMode::Review => "review",
+        CanaryMode::Live => "live",
+    }
+}
+
 fn health_age_label(age_seconds: Option<i64>) -> String {
     match age_seconds {
         Some(age) if age < 0 => "clock skew".to_owned(),
@@ -2668,8 +2639,7 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
                     as_of,
                     &args.risk,
                     &args.broker,
-                    args.broker_review_ok,
-                    args.place_live_order,
+                    args.mode,
                     args.max_order_age_seconds,
                 );
                 if let Err(err) = apply_robinhood_mcp_bridge(
@@ -2696,7 +2666,7 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
         "unhealthy"
     } else {
         match decision.as_ref().map(|decision| decision.status.as_str()) {
-            Some("ready_for_manual_approval" | "review_required") => "ready",
+            Some("ready_for_review" | "ready_for_manual_approval" | "review_required") => "ready",
             Some("live_order_submitted" | "live_order_already_submitted") => "live",
             Some("review_failed" | "live_order_rejected") => "unhealthy",
             Some(_) => "shadow",
@@ -2716,9 +2686,11 @@ fn canary_worker_health(args: &CanaryWorkerArgs) -> CanaryWorkerHealth {
         broker_multi_leg_options: args.broker.capabilities.multi_leg_options,
         broker_cash_secured_puts: args.broker.capabilities.cash_secured_puts,
         broker_covered_calls: args.broker.capabilities.covered_calls,
-        live_orders_enabled: args.broker.live_orders_enabled,
-        broker_review_ok: args.broker_review_ok,
-        place_live_order: args.place_live_order,
+        mode: args.mode,
+        broker_review_ok: decision
+            .as_ref()
+            .map(|decision| decision.broker_review_ok)
+            .unwrap_or(false),
         robinhood_mcp_command_configured: args.robinhood_mcp_command.is_some(),
         order_ledger: args.order_ledger.display().to_string(),
         decision,
@@ -4613,12 +4585,11 @@ mod tests {
             "11250",
             "--max-wheel-positions-per-symbol",
             "1",
+            "--mode",
+            "live",
             "--broker-multi-leg-options",
             "--broker-cash-secured-puts",
             "--broker-covered-calls",
-            "--broker-review-ok",
-            "--live-orders-enabled",
-            "--place-live-order",
             "--json",
         ])
         .unwrap();
@@ -4633,15 +4604,13 @@ mod tests {
                 wheel_reserve_cap,
                 free_cash_buffer,
                 max_wheel_positions_per_symbol,
+                mode,
                 broker_multi_leg_options,
                 broker_cash_secured_puts,
                 broker_covered_calls,
-                broker_review_ok,
-                live_orders_enabled,
                 robinhood_mcp_command,
                 order_ledger,
                 max_order_age_seconds,
-                place_live_order,
                 json,
             } => {
                 assert_eq!(candidate, PathBuf::from("candidates/example.json"));
@@ -4652,15 +4621,13 @@ mod tests {
                 assert_eq!(wheel_reserve_cap, 35_000.0);
                 assert_eq!(free_cash_buffer, 11_250.0);
                 assert_eq!(max_wheel_positions_per_symbol, 1);
+                assert_eq!(mode, CanaryMode::Live);
                 assert!(broker_multi_leg_options);
                 assert!(broker_cash_secured_puts);
                 assert!(broker_covered_calls);
-                assert!(broker_review_ok);
-                assert!(live_orders_enabled);
                 assert_eq!(robinhood_mcp_command, None);
                 assert_eq!(order_ledger, PathBuf::from("var/canary_order_ledger.json"));
                 assert_eq!(max_order_age_seconds, DEFAULT_MAX_ORDER_AGE_SECONDS);
-                assert!(place_live_order);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -4794,8 +4761,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            false,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -4835,8 +4801,7 @@ mod tests {
                 max_wheel_positions_per_symbol: 1,
             },
             &broker,
-            true,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -4867,8 +4832,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            false,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -4910,8 +4874,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -4950,8 +4913,7 @@ mod tests {
             historical,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -4980,8 +4942,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            false,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -5022,8 +4983,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -5032,42 +4992,15 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_runner_blocks_manual_review_flag_from_auto_place() {
-        let artifact = test_canary_artifact(serde_json::json!([{
-            "status":"entry_candidate",
-            "symbol":"TSLA",
-            "strategy":"put_debit_spread",
-            "entry_date":"2026-06-28",
-            "exit_date":"2026-06-28",
-            "expiration":"2026-07-02",
-            "short_strike":350.0,
-            "long_strike":355.0,
-            "entry_credit":-3.35,
-            "max_loss":335.0
-        }]));
-        let broker = RobinhoodBrokerAdapter {
-            capabilities: BrokerCapabilities {
-                single_leg_options: true,
-                multi_leg_options: true,
-                stock_option_combos: false,
-                cash_secured_puts: false,
-                covered_calls: false,
-            },
-            live_orders_enabled: true,
-        };
+    fn run_portfolio_canary_rejects_legacy_manual_review_flag() {
+        let err = Cli::try_parse_from([
+            "spreadfoundry",
+            "run-portfolio-canary",
+            "--broker-review-ok",
+        ])
+        .unwrap_err();
 
-        let decision = portfolio_canary_run_decision(
-            &artifact,
-            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
-            &test_canary_risk(),
-            &broker,
-            true,
-            true,
-            DEFAULT_MAX_ORDER_AGE_SECONDS,
-        );
-
-        assert_eq!(decision.status, "live_order_blocked");
-        assert!(decision.reason.contains("MCP review bridge"));
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -5096,8 +5029,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            true,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -5112,7 +5044,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_runner_reaches_manual_approval_for_entry_after_review() {
+    fn portfolio_canary_runner_reaches_ready_for_review_in_monitor_mode() {
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"entry_candidate",
             "symbol":"ORCL",
@@ -5141,12 +5073,11 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            true,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "ready_for_manual_approval");
+        assert_eq!(decision.status, "ready_for_review");
     }
 
     #[test]
@@ -5266,8 +5197,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            false,
-            false,
+            CanaryMode::Review,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
@@ -5329,8 +5259,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
         let action = decision.selected_action.clone().unwrap();
@@ -5389,8 +5318,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
         let first_action = first.selected_action.clone().unwrap();
@@ -5420,8 +5348,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
-            false,
-            true,
+            CanaryMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
         apply_robinhood_mcp_bridge(&mut second, Some(command.as_str()), Some(&ledger)).unwrap();
@@ -5458,12 +5385,11 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &broker,
-            true,
-            false,
+            CanaryMode::Monitor,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "ready_for_manual_approval");
+        assert_eq!(decision.status, "ready_for_review");
         assert_eq!(
             decision
                 .selected_action
@@ -5490,11 +5416,10 @@ mod tests {
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             risk: test_canary_risk(),
             broker: RobinhoodBrokerAdapter::default(),
+            mode: CanaryMode::Monitor,
             robinhood_mcp_command: None,
             order_ledger: unique_main_test_path("canary-order-ledger.json"),
             max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
-            broker_review_ok: false,
-            place_live_order: false,
             poll_seconds: 60,
             once: true,
             health_output: None,
