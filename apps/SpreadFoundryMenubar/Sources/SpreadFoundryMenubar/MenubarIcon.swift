@@ -3,7 +3,7 @@ import SwiftUI
 
 enum MenubarIcon {
     static func statusImage(status: String) -> NSImage {
-        let image = drawStatusGlyph(size: CGSize(width: 21, height: 21))
+        let image = drawStatusGlyph(size: CGSize(width: 22, height: 22))
         image.isTemplate = true
         return image
     }
@@ -24,14 +24,15 @@ enum MenubarIcon {
         defer { image.unlockFocus() }
 
         let scale = min(size.width, size.height) / 28.0
+        let yOffset: CGFloat = -1.0
         NSColor.black.setFill()
 
-        roundedTile(x: 2.4, y: 2.4, width: 23.2, height: 23.2, radius: 6.0, scale: scale).fill()
+        roundedTile(x: 2.4, y: 2.4 + yOffset, width: 23.2, height: 23.2, radius: 6.0, scale: scale).fill()
 
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current?.compositingOperation = .clear
         drawSArrowMark(
-            in: CGRect(x: 4.9 * scale, y: 2.3 * scale, width: 18.2 * scale, height: 23.0 * scale),
+            in: CGRect(x: 4.9 * scale, y: (2.3 + yOffset) * scale, width: 18.2 * scale, height: 23.0 * scale),
             fontSize: 19.6 * scale,
             weight: .black,
             color: .black
