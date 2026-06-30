@@ -191,6 +191,11 @@ pub struct TradierQuote {
     pub bid: Option<f64>,
     pub ask: Option<f64>,
     pub last: Option<f64>,
+    pub bid_size: Option<f64>,
+    pub ask_size: Option<f64>,
+    pub bid_date: Option<i64>,
+    pub ask_date: Option<i64>,
+    pub trade_date: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -200,6 +205,27 @@ pub struct TradierQuotesResponse {
     pub raw: Value,
     #[serde(default)]
     pub quotes: Vec<TradierQuote>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierMarketClock {
+    pub state: Option<String>,
+    pub status: Option<String>,
+    pub description: Option<String>,
+    pub next_state: Option<String>,
+    pub next_change: Option<String>,
+    pub timestamp: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradierMarketClockResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub raw: Value,
+    #[serde(default)]
+    pub clock: Option<TradierMarketClock>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -346,6 +372,29 @@ impl TradierClient {
         }
     }
 
+    pub fn get_market_clock(&self) -> anyhow::Result<TradierMarketClockResponse> {
+        let url = format!(
+            "{}/markets/clock",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let (status, body, raw) = self.get_json(url)?;
+        if status.is_success() {
+            Ok(TradierMarketClockResponse {
+                ok: true,
+                clock: parse_tradier_market_clock(&raw),
+                raw,
+                error: None,
+            })
+        } else {
+            Ok(TradierMarketClockResponse {
+                ok: false,
+                raw,
+                clock: None,
+                error: Some(format!("Tradier API returned HTTP {status}: {body}")),
+            })
+        }
+    }
+
     fn get_json(&self, url: String) -> anyhow::Result<(reqwest::StatusCode, String, Value)> {
         let response = self
             .client
@@ -480,9 +529,26 @@ fn parse_tradier_quotes(value: &Value) -> Vec<TradierQuote> {
                 bid: number_field(map, "bid"),
                 ask: number_field(map, "ask"),
                 last: number_field(map, "last"),
+                bid_size: number_field(map, "bid_size").or_else(|| number_field(map, "bidsize")),
+                ask_size: number_field(map, "ask_size").or_else(|| number_field(map, "asksize")),
+                bid_date: integer_field(map, "bid_date"),
+                ask_date: integer_field(map, "ask_date"),
+                trade_date: integer_field(map, "trade_date").or_else(|| integer_field(map, "date")),
             })
         })
         .collect()
+}
+
+fn parse_tradier_market_clock(value: &Value) -> Option<TradierMarketClock> {
+    let clock = value.get("clock")?.as_object()?;
+    Some(TradierMarketClock {
+        state: string_field(clock, "state"),
+        status: string_field(clock, "status"),
+        description: string_field(clock, "description"),
+        next_state: string_field(clock, "next_state"),
+        next_change: string_field(clock, "next_change"),
+        timestamp: integer_field(clock, "timestamp"),
+    })
 }
 
 fn tradier_object_or_array(value: Option<&Value>) -> Vec<&Value> {
@@ -507,6 +573,15 @@ fn number_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<f64> 
         value
             .as_f64()
             .or_else(|| value.as_str()?.replace(',', "").parse::<f64>().ok())
+    })
+}
+
+fn integer_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<i64> {
+    map.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+            .or_else(|| value.as_str()?.replace(',', "").parse::<i64>().ok())
     })
 }
 

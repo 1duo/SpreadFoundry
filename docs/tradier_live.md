@@ -8,6 +8,8 @@ Official references:
 
 - [Tradier Trading API](https://docs.tradier.com/docs/trading)
 - [Tradier Orders](https://docs.tradier.com/docs/orders)
+- [Tradier Clock](https://docs.tradier.com/docs/clock)
+- [Tradier Quotes](https://docs.tradier.com/docs/quotes)
 
 ## Scope
 
@@ -19,6 +21,7 @@ Current live scope:
 - `class=multileg`
 - `type=debit`
 - `duration=day`
+- Tradier buying-power validation before preview
 - current Tradier quote validation before preview
 - preview before any placement
 
@@ -88,6 +91,7 @@ scripts/execution-service.sh set-mode live
 `review`:
 
 - requires Tradier credentials
+- checks current Tradier buying power before preview
 - validates current option quotes for debit spreads
 - submits preview only
 - records reviewed/rejected order keys to avoid repeated preview loops
@@ -98,7 +102,12 @@ scripts/execution-service.sh set-mode live
 
 - requires Tradier credentials
 - requires a fresh same-day live signal
+- requires Tradier market clock to report open
+- checks current Tradier buying power before preview/place
 - validates current option quotes and broker state
+- for debit spreads, live quote validation requires positive bid/ask size on
+  the executable sides and quote timestamps no older than
+  `SPREAD_EXECUTION_MAX_QUOTE_AGE_SECONDS` seconds; default `30`
 - currently blocks before placement until broker position reconciliation and
   exit lifecycle are implemented
 

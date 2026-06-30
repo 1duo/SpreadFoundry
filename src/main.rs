@@ -6,8 +6,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use spreadfoundry::broker::{
     BrokerCapabilities, RobinhoodBrokerAdapter, RobinhoodMcpCommandExecutor,
-    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierClient, TradierConfig, TradierOrder,
-    TradierOrderResponse, TradierPosition, TradierQuote, TradierQuotesResponse,
+    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierClient, TradierConfig,
+    TradierMarketClock, TradierMarketClockResponse, TradierOrder, TradierOrderResponse,
+    TradierPosition, TradierQuote, TradierQuotesResponse,
 };
 use spreadfoundry::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
@@ -44,6 +45,7 @@ use std::time::Duration as StdDuration;
 use wait_timeout::ChildExt;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
+const DEFAULT_MAX_QUOTE_AGE_SECONDS: i64 = 30;
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses eight non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
 const UNIVERSE_SEED_SCORE_BASIS: &str = "Static pre-research seed score: 3x option liquidity + 2x premium + 2x spread quality + price-fit + diversification + event-risk discipline. Used only to choose the default live_signal symbols; actual suitability ranking is research-evidence driven.";
@@ -1562,19 +1564,20 @@ struct MarketSessionSnapshot {
     checked_at: chrono::DateTime<Utc>,
     open: bool,
     reason: String,
+    source: String,
     date_et: NaiveDate,
     minute_et: u32,
     close_minute_et: Option<u32>,
 }
 
 fn market_session_status(require_open: bool, json: bool) -> Result<()> {
-    let snapshot = market_session_snapshot_at(Utc::now());
+    let snapshot = market_session_snapshot_for_status(Utc::now());
     if json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
     } else {
         println!(
-            "open={} date_et={} minute_et={} reason={}",
-            snapshot.open, snapshot.date_et, snapshot.minute_et, snapshot.reason
+            "open={} source={} date_et={} minute_et={} reason={}",
+            snapshot.open, snapshot.source, snapshot.date_et, snapshot.minute_et, snapshot.reason
         );
     }
     if require_open && !snapshot.open {
@@ -1619,7 +1622,7 @@ async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
     }
     let started_at = Utc::now();
     if args.market_window_only {
-        let session = market_session_snapshot_at(started_at);
+        let session = market_session_snapshot_for_refresh(started_at);
         if !session.open {
             let state = live_signal_refresh_state(
                 &args,
@@ -2660,6 +2663,73 @@ fn execution_market_window_open_at(now_utc: chrono::DateTime<Utc>) -> bool {
     market_session_snapshot_at(now_utc).open
 }
 
+fn market_session_snapshot_for_status(now_utc: chrono::DateTime<Utc>) -> MarketSessionSnapshot {
+    market_session_snapshot_from_tradier_clock(now_utc)
+        .unwrap_or_else(|| market_session_snapshot_at(now_utc))
+}
+
+fn market_session_snapshot_for_refresh(now_utc: chrono::DateTime<Utc>) -> MarketSessionSnapshot {
+    match tradier_config_from_env() {
+        Ok(config) => match TradierClient::new_with_timeout(config, StdDuration::from_secs(5))
+            .and_then(|client| client.get_market_clock())
+        {
+            Ok(clock) => tradier_market_session_snapshot_from_clock(now_utc, &clock)
+                .unwrap_or_else(|| market_session_snapshot_at(now_utc)),
+            Err(err) => {
+                let mut snapshot = market_session_snapshot_at(now_utc);
+                snapshot.open = false;
+                snapshot.source = "tradier_clock_error".to_owned();
+                snapshot.reason = format!(
+                    "Tradier market clock unavailable during configured signal refresh: {err}"
+                );
+                snapshot
+            }
+        },
+        Err(_) => market_session_snapshot_at(now_utc),
+    }
+}
+
+fn market_session_snapshot_from_tradier_clock(
+    now_utc: chrono::DateTime<Utc>,
+) -> Option<MarketSessionSnapshot> {
+    let config = tradier_config_from_env().ok()?;
+    let client = TradierClient::new_with_timeout(config, StdDuration::from_secs(5)).ok()?;
+    let clock = client.get_market_clock().ok()?;
+    tradier_market_session_snapshot_from_clock(now_utc, &clock)
+}
+
+fn tradier_market_session_snapshot_from_clock(
+    now_utc: chrono::DateTime<Utc>,
+    response: &TradierMarketClockResponse,
+) -> Option<MarketSessionSnapshot> {
+    let clock = response.clock.as_ref()?;
+    let mut snapshot = market_session_snapshot_at(now_utc);
+    snapshot.source = "tradier_clock".to_owned();
+    snapshot.open = tradier_market_clock_open(clock);
+    snapshot.reason = tradier_market_clock_reason(clock);
+    Some(snapshot)
+}
+
+fn tradier_market_clock_open(clock: &TradierMarketClock) -> bool {
+    [clock.state.as_deref(), clock.status.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value.eq_ignore_ascii_case("open"))
+        || clock.description.as_deref().is_some_and(|description| {
+            let description = description.to_ascii_lowercase();
+            description.contains("market is open") || description == "open"
+        })
+}
+
+fn tradier_market_clock_reason(clock: &TradierMarketClock) -> String {
+    clock
+        .description
+        .clone()
+        .or_else(|| clock.status.clone())
+        .or_else(|| clock.state.clone())
+        .unwrap_or_else(|| "Tradier market clock returned no status detail".to_owned())
+}
+
 fn market_session_snapshot_at(now_utc: chrono::DateTime<Utc>) -> MarketSessionSnapshot {
     let eastern_offset_hours = if us_eastern_dst_active(now_utc.date_naive()) {
         -4
@@ -2699,6 +2769,7 @@ fn market_session_snapshot_at(now_utc: chrono::DateTime<Utc>) -> MarketSessionSn
         checked_at: now_utc,
         open,
         reason,
+        source: "local_us_options_calendar".to_owned(),
         date_et,
         minute_et,
         close_minute_et,
@@ -3341,6 +3412,18 @@ fn apply_tradier_rest_bridge_with_config(
         apply_tradier_ledger_entry_to_decision(decision, &entry);
         return Ok(());
     }
+    if decision.mode == ExecutionMode::Live
+        && let Err(err) = tradier_assert_market_open(&client)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier market clock blocks live execution: {err}");
+        return Ok(());
+    }
+    if let Err(err) = tradier_assert_buying_power(&client, &action, &decision.risk) {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier buying-power precheck failed: {err}");
+        return Ok(());
+    }
     if action.strategy == "wheel"
         && let Err(err) = tradier_assert_wheel_broker_state(&client, &action, &decision.risk)
     {
@@ -3361,7 +3444,7 @@ fn apply_tradier_rest_bridge_with_config(
         action.strategy.as_str(),
         "call_debit_spread" | "put_debit_spread"
     ) {
-        match tradier_validate_current_debit_quote(&client, &payload, &action) {
+        match tradier_validate_current_debit_quote(&client, &payload, &action, decision.mode) {
             Ok(quotes) => decision.tradier_quote = Some(quotes),
             Err(err) => {
                 decision.status = "blocked".to_owned();
@@ -3671,18 +3754,51 @@ fn tradier_execution_order_payload(action: &TradeSignal) -> Result<BTreeMap<Stri
     }
 }
 
-fn tradier_assert_wheel_broker_state(
+fn tradier_assert_market_open(client: &TradierClient) -> Result<TradierMarketClockResponse> {
+    let clock = client
+        .get_market_clock()
+        .context("fetch Tradier market clock before live order")?;
+    if !clock.ok {
+        anyhow::bail!(
+            "{}",
+            clock
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier market clock request failed".to_owned())
+        );
+    }
+    let clock_detail = clock
+        .clock
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Tradier market clock response missing clock object"))?;
+    if !tradier_market_clock_open(clock_detail) {
+        anyhow::bail!("{}", tradier_market_clock_reason(clock_detail));
+    }
+    Ok(clock)
+}
+
+fn tradier_assert_buying_power(
     client: &TradierClient,
     action: &TradeSignal,
     risk: &CanaryRiskPolicy,
 ) -> Result<()> {
-    let symbol = require_action_field(action.symbol.as_str(), "symbol")?.to_ascii_uppercase();
-    let reserve = action
-        .reserve
-        .ok_or_else(|| anyhow::anyhow!("wheel action missing reserve"))?;
+    let reserve = match action.reserve {
+        Some(reserve) => reserve,
+        None => trade_signal_risk(action)
+            .map(|risk| risk.reserve)
+            .map_err(|reason| anyhow::anyhow!(reason))?,
+    };
+    if !reserve.is_finite() || reserve <= 0.0 {
+        anyhow::bail!(
+            "{} {} has invalid reserve {:.2}",
+            action.symbol,
+            action.strategy,
+            reserve
+        );
+    }
     let balances = client
         .get_balances()
-        .context("fetch Tradier balances before wheel preview")?;
+        .context("fetch Tradier balances before preview/place")?;
     if !balances.ok {
         anyhow::bail!(
             "{}",
@@ -3702,13 +3818,21 @@ fn tradier_assert_wheel_broker_state(
     let required_buying_power = reserve + risk.free_cash_buffer;
     if buying_power < required_buying_power {
         anyhow::bail!(
-            "buying power {:.2} is below wheel reserve {:.2} plus free-cash buffer {:.2}",
+            "buying power {:.2} is below order reserve {:.2} plus free-cash buffer {:.2}",
             buying_power,
             reserve,
             risk.free_cash_buffer
         );
     }
+    Ok(())
+}
 
+fn tradier_assert_wheel_broker_state(
+    client: &TradierClient,
+    action: &TradeSignal,
+    _risk: &CanaryRiskPolicy,
+) -> Result<()> {
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?.to_ascii_uppercase();
     let positions = client
         .get_positions()
         .context("fetch Tradier positions before wheel preview")?;
@@ -3811,6 +3935,7 @@ fn tradier_validate_current_debit_quote(
     client: &TradierClient,
     payload: &BTreeMap<String, String>,
     action: &TradeSignal,
+    mode: ExecutionMode,
 ) -> Result<TradierQuotesResponse> {
     let long_symbol = payload
         .get("option_symbol[0]")
@@ -3841,6 +3966,12 @@ fn tradier_validate_current_debit_quote(
     let short_quote = tradier_quote_for_symbol(&quotes.quotes, &short_symbol)?;
     let long_ask = tradier_quote_positive_value(long_quote.ask, &long_symbol, "ask")?;
     let short_bid = tradier_quote_nonnegative_value(short_quote.bid, &short_symbol, "bid")?;
+    if mode == ExecutionMode::Live {
+        tradier_quote_positive_value(long_quote.ask_size, &long_symbol, "ask_size")?;
+        tradier_quote_positive_value(short_quote.bid_size, &short_symbol, "bid_size")?;
+        tradier_assert_fresh_quote_side(long_quote, &long_symbol, "ask")?;
+        tradier_assert_fresh_quote_side(short_quote, &short_symbol, "bid")?;
+    }
     let current_debit = long_ask - short_bid;
     if !current_debit.is_finite() || current_debit <= 0.0 {
         anyhow::bail!(
@@ -3865,6 +3996,47 @@ fn tradier_validate_current_debit_quote(
         );
     }
     Ok(quotes)
+}
+
+fn tradier_assert_fresh_quote_side(quote: &TradierQuote, symbol: &str, side: &str) -> Result<()> {
+    let timestamp = match side {
+        "ask" => quote.ask_date.or(quote.trade_date),
+        "bid" => quote.bid_date.or(quote.trade_date),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("Tradier quote {symbol} missing {side} timestamp"))?;
+    let quote_time = tradier_quote_timestamp_utc(timestamp)
+        .ok_or_else(|| anyhow::anyhow!("Tradier quote {symbol} has invalid {side} timestamp"))?;
+    let age_seconds = Utc::now()
+        .signed_duration_since(quote_time)
+        .num_seconds()
+        .abs();
+    let max_age_seconds = env_i64(
+        "SPREAD_EXECUTION_MAX_QUOTE_AGE_SECONDS",
+        DEFAULT_MAX_QUOTE_AGE_SECONDS,
+    )?;
+    if max_age_seconds <= 0 {
+        anyhow::bail!("SPREAD_EXECUTION_MAX_QUOTE_AGE_SECONDS must be positive");
+    }
+    if age_seconds > max_age_seconds {
+        anyhow::bail!(
+            "Tradier quote {symbol} {side} age {}s exceeds max {}s",
+            age_seconds,
+            max_age_seconds
+        );
+    }
+    Ok(())
+}
+
+fn tradier_quote_timestamp_utc(timestamp: i64) -> Option<chrono::DateTime<Utc>> {
+    if timestamp <= 0 {
+        return None;
+    }
+    if timestamp > 10_000_000_000 {
+        chrono::DateTime::<Utc>::from_timestamp_millis(timestamp)
+    } else {
+        chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+    }
 }
 
 fn tradier_quote_for_symbol<'a>(
@@ -4511,6 +4683,7 @@ fn build_execution_worker_snapshot(
 ) -> ExecutionWorkerSnapshot {
     let now = Utc::now();
     let worker_running = pid_file_running(pid_file);
+    let refresh_snapshot = read_signal_refresh_snapshot();
     let health = fs::read_to_string(health_output)
         .ok()
         .and_then(|body| serde_json::from_str::<ExecutionWorkerHealth>(&body).ok());
@@ -4522,20 +4695,21 @@ fn build_execution_worker_snapshot(
         .map(|age| age < 0 || age as u64 > max_age_seconds)
         .unwrap_or(true);
     let status = snapshot_status(health.as_ref(), worker_running, health_stale);
-    let tray_title = match status.as_str() {
-        "monitor" => "SF monitoring",
-        "review" => "SF review",
-        "live" => "SF live",
-        "blocked" => "SF blocked",
-        _ => "SF down",
-    }
-    .to_owned();
-    let tray_tooltip = snapshot_tooltip(health.as_ref(), worker_running, health_stale);
+    let market_closed_block = health
+        .as_ref()
+        .is_some_and(|health| execution_blocked_by_market_session(health, &refresh_snapshot));
+    let tray_title = snapshot_tray_title(status.as_str(), market_closed_block);
+    let tray_tooltip = snapshot_tooltip(
+        health.as_ref(),
+        worker_running,
+        health_stale,
+        &refresh_snapshot,
+    );
     let mut rows = vec![
         snapshot_row(
             "Signal Refresh",
-            signal_refresh_snapshot_label().as_str(),
-            signal_refresh_snapshot_tone(),
+            signal_refresh_snapshot_label(&refresh_snapshot).as_str(),
+            signal_refresh_snapshot_tone(&refresh_snapshot),
         ),
         snapshot_row(
             "Worker",
@@ -4564,7 +4738,7 @@ fn build_execution_worker_snapshot(
         rows.extend([
             snapshot_row(
                 "Decision",
-                snapshot_decision_label(health).as_str(),
+                snapshot_decision_label_with_refresh(health, &refresh_snapshot).as_str(),
                 snapshot_tone(&health.status),
             ),
             snapshot_row(
@@ -4629,10 +4803,25 @@ fn snapshot_status(
     }
 }
 
+fn snapshot_tray_title(status: &str, market_closed_block: bool) -> String {
+    if market_closed_block {
+        return "SF market closed".to_owned();
+    }
+    match status {
+        "monitor" => "SF monitoring",
+        "review" => "SF review",
+        "live" => "SF live",
+        "blocked" => "SF blocked",
+        _ => "SF down",
+    }
+    .to_owned()
+}
+
 fn snapshot_tooltip(
     health: Option<&ExecutionWorkerHealth>,
     worker_running: bool,
     health_stale: bool,
+    refresh_snapshot: &SignalRefreshSnapshot,
 ) -> String {
     if !worker_running {
         return "Execution worker is not running".to_owned();
@@ -4640,10 +4829,67 @@ fn snapshot_tooltip(
     if health_stale {
         return "Execution worker health is stale or missing".to_owned();
     }
-    match health.and_then(|health| health.decision.as_ref()) {
-        Some(decision) => decision.reason.clone(),
+    match health {
+        Some(health) if execution_blocked_by_market_session(health, refresh_snapshot) => {
+            market_session_block_tooltip(health, refresh_snapshot)
+        }
+        Some(health) => match health.decision.as_ref() {
+            Some(decision) => decision.reason.clone(),
+            None => "Execution worker has no decision".to_owned(),
+        },
         None => "Execution worker has no decision".to_owned(),
     }
+}
+
+fn market_session_block_tooltip(
+    health: &ExecutionWorkerHealth,
+    refresh_snapshot: &SignalRefreshSnapshot,
+) -> String {
+    let decision_reason = health
+        .decision
+        .as_ref()
+        .map(|decision| decision.reason.as_str())
+        .unwrap_or("execution worker is blocked");
+    match signal_refresh_snapshot_reason(refresh_snapshot) {
+        Some(refresh_reason) => {
+            format!("Market/session closed: {refresh_reason}. {decision_reason}")
+        }
+        None => format!("Market/session closed. {decision_reason}"),
+    }
+}
+
+fn execution_blocked_by_market_session(
+    health: &ExecutionWorkerHealth,
+    refresh_snapshot: &SignalRefreshSnapshot,
+) -> bool {
+    let Some(decision) = health.decision.as_ref() else {
+        return false;
+    };
+    if decision.status != "blocked" {
+        return false;
+    }
+    if decision
+        .reason
+        .contains("configured regular options-market window")
+    {
+        return true;
+    }
+    signal_refresh_snapshot_status(refresh_snapshot) == Some("skipped_market_closed")
+        && signal_refresh_snapshot_run_to(refresh_snapshot) == Some(health.as_of)
+        && (decision.reason.starts_with("live signal as_of ")
+            || decision
+                .reason
+                .starts_with("live signal market_data_through "))
+}
+
+fn snapshot_decision_label_with_refresh(
+    health: &ExecutionWorkerHealth,
+    refresh_snapshot: &SignalRefreshSnapshot,
+) -> String {
+    if execution_blocked_by_market_session(health, refresh_snapshot) {
+        return "Market closed".to_owned();
+    }
+    snapshot_decision_label(health)
 }
 
 fn snapshot_action_rows(health: Option<&ExecutionWorkerHealth>) -> Vec<SnapshotRow> {
@@ -4968,30 +5214,66 @@ fn snapshot_tone(status: &str) -> &'static str {
     }
 }
 
-fn signal_refresh_snapshot_label() -> String {
-    let path = Path::new("var/live_signal_refresh_last.json");
-    let Ok(body) = fs::read_to_string(path) else {
-        return "missing".to_owned();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return "unreadable".to_owned();
-    };
-    value
-        .get("status")
-        .and_then(|status| status.as_str())
-        .map(|status| status.replace('_', " "))
-        .unwrap_or_else(|| "unknown".to_owned())
+#[derive(Debug)]
+enum SignalRefreshSnapshot {
+    Missing,
+    Unreadable,
+    Parsed(serde_json::Value),
 }
 
-fn signal_refresh_snapshot_tone() -> &'static str {
+fn read_signal_refresh_snapshot() -> SignalRefreshSnapshot {
     let path = Path::new("var/live_signal_refresh_last.json");
     let Ok(body) = fs::read_to_string(path) else {
-        return "bad";
+        return SignalRefreshSnapshot::Missing;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return "bad";
+        return SignalRefreshSnapshot::Unreadable;
     };
-    match value.get("status").and_then(|status| status.as_str()) {
+    SignalRefreshSnapshot::Parsed(value)
+}
+
+fn signal_refresh_snapshot_status(snapshot: &SignalRefreshSnapshot) -> Option<&str> {
+    match snapshot {
+        SignalRefreshSnapshot::Parsed(value) => {
+            value.get("status").and_then(|status| status.as_str())
+        }
+        SignalRefreshSnapshot::Missing | SignalRefreshSnapshot::Unreadable => None,
+    }
+}
+
+fn signal_refresh_snapshot_reason(snapshot: &SignalRefreshSnapshot) -> Option<&str> {
+    match snapshot {
+        SignalRefreshSnapshot::Parsed(value) => {
+            value.get("reason").and_then(|reason| reason.as_str())
+        }
+        SignalRefreshSnapshot::Missing | SignalRefreshSnapshot::Unreadable => None,
+    }
+}
+
+fn signal_refresh_snapshot_run_to(snapshot: &SignalRefreshSnapshot) -> Option<NaiveDate> {
+    match snapshot {
+        SignalRefreshSnapshot::Parsed(value) => value
+            .get("run_to")
+            .and_then(|run_to| run_to.as_str())
+            .and_then(|run_to| NaiveDate::parse_from_str(run_to, "%Y-%m-%d").ok()),
+        SignalRefreshSnapshot::Missing | SignalRefreshSnapshot::Unreadable => None,
+    }
+}
+
+fn signal_refresh_snapshot_label(snapshot: &SignalRefreshSnapshot) -> String {
+    match signal_refresh_snapshot_status(snapshot) {
+        Some("skipped_market_closed") => "market closed".to_owned(),
+        Some(status) => status.replace('_', " "),
+        None => match snapshot {
+            SignalRefreshSnapshot::Missing => "missing".to_owned(),
+            SignalRefreshSnapshot::Unreadable => "unreadable".to_owned(),
+            SignalRefreshSnapshot::Parsed(_) => "unknown".to_owned(),
+        },
+    }
+}
+
+fn signal_refresh_snapshot_tone(snapshot: &SignalRefreshSnapshot) -> &'static str {
+    match signal_refresh_snapshot_status(snapshot) {
         Some("exported" | "running" | "skipped_market_closed") => "ok",
         Some("selector_timeout" | "approved_strategy_not_ready") => "warn",
         _ => "bad",
@@ -5157,6 +5439,19 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
             value
                 .parse::<u64>()
                 .with_context(|| format!("parse {name}={value} as unsigned integer"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn env_i64(name: &str, default: i64) -> Result<i64> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .with_context(|| format!("parse {name}={value} as signed integer"))
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
@@ -9043,15 +9338,19 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "reviewed");
         assert!(decision.tradier_quote.is_some());
-        assert_eq!(bodies.len(), 4);
-        assert!(bodies[3].contains("preview=true"));
-        assert!(bodies[3].contains("class=multileg"));
-        assert!(bodies[3].contains("type=debit"));
+        assert_eq!(bodies.len(), 5);
+        assert!(bodies[4].contains("preview=true"));
+        assert!(bodies[4].contains("class=multileg"));
+        assert!(bodies[4].contains("type=debit"));
     }
 
     #[test]
     fn tradier_current_quote_worse_than_limit_blocks_preview() {
         let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#,
+            ),
             (200, r#"{"positions":{"position":[]}}"#),
             (200, r#"{"orders":{"order":[]}}"#),
             (
@@ -9071,13 +9370,77 @@ mod tests {
                 .reason
                 .contains("current conservative debit 5.10 exceeds order limit 4.50")
         );
-        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies.len(), 4);
         assert!(decision.tradier_preview.is_none());
     }
 
     #[test]
+    fn tradier_debit_insufficient_buying_power_blocks_preview() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"balances":{"account_number":"TEST123","option_buying_power":100,"total_cash":100}}"#,
+        )]);
+        let mut decision = tradier_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("buying-power precheck"));
+        assert_eq!(bodies.len(), 1);
+        assert!(decision.tradier_preview.is_none());
+    }
+
+    #[test]
+    fn tradier_live_closed_market_clock_blocks_before_balances() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"clock":{"state":"closed","description":"Market is closed"}}"#,
+        )]);
+        let ledger = unique_main_test_path("tradier-order-ledger-market-closed.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("market clock"));
+        assert_eq!(bodies.len(), 1);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    fn tradier_live_stale_quote_blocks_preview() {
+        let stale_ms = (Utc::now() - chrono::Duration::minutes(5)).timestamp_millis();
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_good_balances_response()),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_quote_response(stale_ms)),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-stale-quote.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("quote validation failed"));
+        assert!(decision.reason.contains("age"));
+        assert_eq!(bodies.len(), 5);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
     fn tradier_live_previews_then_places_same_payload() {
-        let (base_url, requests, handle) = spawn_tradier_debit_mock(vec![
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
             (
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
@@ -9097,19 +9460,19 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submitted");
         assert!(decision.tradier_quote.is_some());
-        assert_eq!(bodies.len(), 6);
-        assert!(bodies[3].contains("preview=true"));
-        assert!(bodies[4].contains("preview=false"));
+        assert_eq!(bodies.len(), 8);
+        assert!(bodies[5].contains("preview=true"));
+        assert!(bodies[6].contains("preview=false"));
         assert_eq!(
-            bodies[3].replace("preview=true", "preview=false"),
-            bodies[4]
+            bodies[5].replace("preview=true", "preview=false"),
+            bodies[6]
         );
         fs::remove_file(ledger).unwrap();
     }
 
     #[test]
     fn tradier_preview_result_false_blocks_live_placement() {
-        let (base_url, requests, handle) = spawn_tradier_debit_mock(vec![(
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![(
             200,
             r#"{"order":{"id":"preview","status":"ok","result":false,"reason_description":"bp fail"}}"#,
         )]);
@@ -9122,7 +9485,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "rejected");
         assert!(decision.reason.contains("bp fail"));
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 6);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -9135,7 +9498,7 @@ mod tests {
     #[test]
     fn tradier_preview_failure_blocks_live_placement() {
         let (base_url, requests, handle) =
-            spawn_tradier_debit_mock(vec![(400, r#"{"errors":"bad"}"#)]);
+            spawn_tradier_live_debit_mock(vec![(400, r#"{"errors":"bad"}"#)]);
         let ledger = unique_main_test_path("tradier-order-ledger-preview-fail.json");
         let mut decision = tradier_test_decision(ExecutionMode::Live);
         let config = test_tradier_config(base_url);
@@ -9144,7 +9507,7 @@ mod tests {
 
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "rejected");
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 6);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -9156,7 +9519,7 @@ mod tests {
 
     #[test]
     fn tradier_rejected_preview_body_blocks_live_placement() {
-        let (base_url, requests, handle) = spawn_tradier_debit_mock(vec![(
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![(
             200,
             r#"{"order":{"id":"preview","status":"rejected","result":false,"reason":"test rejection"}}"#,
         )]);
@@ -9168,7 +9531,7 @@ mod tests {
 
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "rejected");
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 6);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -9263,7 +9626,7 @@ mod tests {
 
     #[test]
     fn tradier_place_transport_failure_is_unknown_not_rejected() {
-        let (base_url, requests, handle) = spawn_tradier_debit_mock(vec![(
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![(
             200,
             r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
         )]);
@@ -9276,7 +9639,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submit_unknown");
         assert!(decision.reason.contains("check Tradier before retrying"));
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 6);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -9288,7 +9651,7 @@ mod tests {
 
     #[test]
     fn tradier_place_error_status_is_rejected_not_submitted() {
-        let (base_url, requests, handle) = spawn_tradier_debit_mock(vec![
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
             (
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
@@ -9307,7 +9670,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "rejected");
         assert!(decision.reason.contains("broker rejected"));
-        assert_eq!(bodies.len(), 5);
+        assert_eq!(bodies.len(), 7);
         fs::remove_file(ledger).unwrap();
     }
 
@@ -9466,7 +9829,7 @@ mod tests {
         assert!(
             decision
                 .reason
-                .contains("Tradier duplicate-exposure precheck failed")
+                .contains("Tradier buying-power precheck failed")
         );
     }
 
@@ -9531,6 +9894,80 @@ mod tests {
         );
         fs::remove_file(health_path).unwrap();
         fs::remove_file(pid_file).unwrap();
+    }
+
+    #[test]
+    fn execution_worker_snapshot_labels_market_closed_date_mismatch() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let broker = execution_broker(BrokerKind::Tradier, true, true, false, true);
+        let risk = test_canary_risk();
+        let decision = execution_decision(
+            "blocked",
+            "live signal as_of 2026-06-29 does not match requested as_of 2026-06-30",
+            as_of,
+            ExecutionMode::Live,
+            &risk,
+            &broker,
+            false,
+            None,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            None,
+        );
+        let health = ExecutionWorkerHealth {
+            checked_at: Utc::now(),
+            service: "execution_worker".to_owned(),
+            status: "blocked".to_owned(),
+            live_signal: "var/live_signal.json".to_owned(),
+            live_signal_readable: true,
+            live_signal_parse_ok: true,
+            as_of,
+            risk,
+            broker_multi_leg_options: true,
+            broker_cash_secured_puts: true,
+            broker_covered_calls: false,
+            broker: BrokerKind::Tradier,
+            mode: ExecutionMode::Live,
+            broker_review_ok: false,
+            robinhood_mcp_command_configured: false,
+            tradier_credentials_configured: true,
+            order_ledger: "var/execution_order_ledger.json".to_owned(),
+            broker_account: None,
+            decision: Some(decision),
+            error: None,
+        };
+        let refresh_snapshot = SignalRefreshSnapshot::Parsed(serde_json::json!({
+            "status": "skipped_market_closed",
+            "run_to": "2026-06-30",
+            "reason": "after configured options-market refresh window"
+        }));
+
+        assert!(execution_blocked_by_market_session(
+            &health,
+            &refresh_snapshot
+        ));
+        assert_eq!(snapshot_tray_title("blocked", true), "SF market closed");
+        assert_eq!(
+            snapshot_decision_label_with_refresh(&health, &refresh_snapshot),
+            "Market closed"
+        );
+        assert_eq!(
+            signal_refresh_snapshot_label(&refresh_snapshot),
+            "market closed"
+        );
+        assert!(
+            snapshot_tooltip(Some(&health), true, false, &refresh_snapshot)
+                .contains("Market/session closed")
+        );
+
+        let stale_refresh_snapshot = SignalRefreshSnapshot::Parsed(serde_json::json!({
+            "status": "skipped_market_closed",
+            "run_to": "2026-06-29",
+            "reason": "after configured options-market refresh window"
+        }));
+        assert!(!execution_blocked_by_market_session(
+            &health,
+            &stale_refresh_snapshot
+        ));
     }
 
     #[test]
@@ -10061,6 +10498,33 @@ mod tests {
         assert!(!market_session_snapshot_at(after_early_close).open);
     }
 
+    #[test]
+    fn market_session_snapshot_can_use_tradier_clock() {
+        let clock = TradierMarketClockResponse {
+            ok: true,
+            raw: serde_json::json!({}),
+            clock: Some(TradierMarketClock {
+                state: Some("open".to_owned()),
+                status: None,
+                description: Some("Market is open".to_owned()),
+                next_state: None,
+                next_change: None,
+                timestamp: None,
+            }),
+            error: None,
+        };
+
+        let snapshot = tradier_market_session_snapshot_from_clock(
+            test_market_open_utc(Utc::now().date_naive()),
+            &clock,
+        )
+        .unwrap();
+
+        assert!(snapshot.open);
+        assert_eq!(snapshot.source, "tradier_clock");
+        assert_eq!(snapshot.reason, "Market is open");
+    }
+
     fn test_canary_risk() -> CanaryRiskPolicy {
         CanaryRiskPolicy {
             account_cash: 45_000.0,
@@ -10310,18 +10774,22 @@ mod tests {
         }
     }
 
-    fn spawn_tradier_mock(
-        responses: Vec<(u16, &'static str)>,
+    fn spawn_tradier_mock<S>(
+        responses: Vec<(u16, S)>,
     ) -> (
         String,
         std::sync::mpsc::Receiver<String>,
         std::thread::JoinHandle<()>,
-    ) {
+    )
+    where
+        S: Into<String> + Send + 'static,
+    {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             for (status, body) in responses {
+                let body = body.into();
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 tx.send(request).unwrap();
@@ -10337,23 +10805,72 @@ mod tests {
         (base_url, rx, handle)
     }
 
-    fn spawn_tradier_debit_mock(
-        mut responses: Vec<(u16, &'static str)>,
+    fn spawn_tradier_debit_mock<S>(
+        responses: Vec<(u16, S)>,
     ) -> (
         String,
         std::sync::mpsc::Receiver<String>,
         std::thread::JoinHandle<()>,
-    ) {
-        let mut all = vec![
-            (200, r#"{"positions":{"position":[]}}"#),
-            (200, r#"{"orders":{"order":[]}}"#),
-            (
-                200,
-                r#"{"quotes":{"quote":[{"symbol":"ORCL260702C00220000","bid":4.90,"ask":5.00},{"symbol":"ORCL260702C00225000","bid":0.55,"ask":0.65}]}}"#,
-            ),
-        ];
-        all.append(&mut responses);
+    )
+    where
+        S: Into<String>,
+    {
+        let mut all = tradier_debit_base_responses(false);
+        all.extend(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.into())),
+        );
         spawn_tradier_mock(all)
+    }
+
+    fn spawn_tradier_live_debit_mock<S>(
+        responses: Vec<(u16, S)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    )
+    where
+        S: Into<String>,
+    {
+        let mut all = tradier_debit_base_responses(true);
+        all.extend(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.into())),
+        );
+        spawn_tradier_mock(all)
+    }
+
+    fn tradier_debit_base_responses(live: bool) -> Vec<(u16, String)> {
+        let mut responses = Vec::new();
+        if live {
+            responses.push((
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ));
+        }
+        responses.push((200, tradier_good_balances_response()));
+        responses.push((200, r#"{"positions":{"position":[]}}"#.to_owned()));
+        responses.push((200, r#"{"orders":{"order":[]}}"#.to_owned()));
+        responses.push((200, tradier_good_debit_quote_response()));
+        responses
+    }
+
+    fn tradier_good_balances_response() -> String {
+        r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned()
+    }
+
+    fn tradier_good_debit_quote_response() -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        tradier_debit_quote_response(now_ms)
+    }
+
+    fn tradier_debit_quote_response(timestamp_ms: i64) -> String {
+        format!(
+            r#"{{"quotes":{{"quote":[{{"symbol":"ORCL260702C00220000","bid":4.90,"ask":5.00,"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}},{{"symbol":"ORCL260702C00225000","bid":0.55,"ask":0.65,"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}}]}}}}"#
+        )
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {

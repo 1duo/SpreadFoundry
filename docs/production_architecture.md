@@ -24,8 +24,11 @@ flowchart LR
   `configs/approved_strategy.json`.
 - `signal_refresh`: market-open job that applies one approved strategy to fresh
   data and writes a typed live signal.
-- `live_signal_artifact`: JSON contract at `var/live_signal.json`; this is the
-  only input the execution worker may trade from.
+- `live_signal_artifact`: atomic JSON contract at `var/live_signal.json`; this
+  is the only input the execution worker may trade from. A database is not used
+  yet because the current production handoff has one writer, one reader, and no
+  query/lease workload. Move this boundary to SQLite only when we need durable
+  history, multiple consumers, replay queries, or leased signal processing.
 - `execution_worker`: always-on service that validates mode, risk, broker state,
   preview/place results, ledger idempotency, notifications, and health.
 - `execution_decision`: worker output. Mode is separate from status.
@@ -85,9 +88,18 @@ loading, logs, state files, timeouts, and scheduling. Market-session checks and
 live signal contract validation are Rust code paths.
 Refresh runs through the Rust `refresh-live-signal` command, so market-session
 checks, approved profile selection, live-signal export, and refresh state are one
-typed code path. The approved profile, symbol list, and portfolio constraints
-come from `configs/approved_strategy.json` rather than service environment
-overrides.
+typed code path. When Tradier is configured, the refresh market-session gate uses
+Tradier's market clock and fails closed if that clock is unavailable. The local
+US options calendar remains a fallback for unconfigured/offline checks.
+The approved profile, symbol list, and portfolio constraints come from
+`configs/approved_strategy.json` rather than service environment overrides.
+
+Current implementation note: signal refresh still invokes the approved
+portfolio selector profile to produce the daily live signal. It is deterministic
+and does not re-rank strategies, but it is heavier than the target lean
+market-open detector. The next architecture cleanup is to extract the approved
+signal construction into a small detector module shared by refresh, simulation,
+and research.
 
 `scripts/execution-service.sh` starts, stops, configures, and checks the
 execution worker. It writes `var/execution_worker_health.json`, logs to
@@ -115,11 +127,15 @@ Tradier order flow:
 
 1. Local live signal contract validation.
 2. Canary risk policy validation.
-3. Broker account, position, and active-order checks.
-4. Current Tradier quote validation for debit spreads.
-5. Tradier preview.
-6. Ledger idempotency and rejection suppression.
-7. Autonomous placement stays blocked until broker position reconciliation and
+3. Ledger idempotency and rejection suppression.
+4. Tradier market-clock gate before live order work.
+5. Broker buying-power check from current Tradier balances.
+6. Position and active-order checks.
+7. Current Tradier quote validation for debit spreads, including conservative
+   debit, quote side size, and live quote timestamp freshness.
+8. Tradier preview.
+9. Ledger reservation before place.
+10. Autonomous placement stays blocked until broker position reconciliation and
    exit lifecycle are implemented.
 
 Notifications are best-effort and never block monitoring or order handling.
