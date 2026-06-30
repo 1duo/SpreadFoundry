@@ -9227,8 +9227,19 @@ fn write_cached_json(path: &Path, json: &Value) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
     }
     write_result?;
-    research_store::record_cached_theta_json(path, json)
+    if let Err(error) = research_store::record_cached_theta_json(path, json)
         .with_context(|| format!("record ThetaData cache {} in DuckDB store", path.display()))
+    {
+        if is_research_store_operational_error(&error) {
+            eprintln!(
+                "wrote ThetaData cache {} but could not record DuckDB metadata: {error:#}",
+                path.display()
+            );
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn cache_temp_path(path: &Path) -> PathBuf {
