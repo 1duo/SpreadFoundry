@@ -50,7 +50,10 @@ signal_refresh_env_names() {
 	    SPREAD_SELECTOR_SYMBOL_CONCURRENCY \
 	    SPREAD_SELECTOR_MAX_EXPIRATIONS \
 	    SPREAD_SELECTOR_CACHE_ONLY \
-	    SPREAD_SELECTOR_FORCE_REFRESH
+	    SPREAD_SELECTOR_FORCE_REFRESH \
+	    SPREAD_TRADIER_ACCOUNT_ID \
+	    SPREAD_TRADIER_TOKEN \
+	    SPREAD_TRADIER_BASE_URL
 }
 
 load_saved_signal_refresh_env() {
@@ -66,10 +69,24 @@ load_saved_signal_refresh_env() {
   done < "$env_file"
 }
 
+load_saved_execution_tradier_env() {
+  local execution_env="${SPREAD_EXECUTION_ENV_FILE:-var/execution_worker.env}"
+  [[ -f "$execution_env" ]] || return 0
+  local line assignment name
+  while IFS= read -r line; do
+    [[ "$line" == export\ SPREAD_TRADIER_* ]] || continue
+    assignment="${line#export }"
+    name="${assignment%%=*}"
+    if [[ "$name" =~ ^SPREAD_TRADIER_[A-Z0-9_]+$ && -z "${!name+x}" ]]; then
+      eval "$line"
+    fi
+  done < "$execution_env"
+}
+
 persist_signal_refresh_env() {
   mkdir -p "$(dirname "$env_file")"
   local tmp_file="${env_file}.tmp"
-  : > "$tmp_file"
+  (umask 077 && : > "$tmp_file")
   local env_name
   while IFS= read -r env_name; do
     if [[ -n "${!env_name+x}" ]]; then
@@ -77,10 +94,12 @@ persist_signal_refresh_env() {
     fi
   done < <(signal_refresh_env_names)
   mv "$tmp_file" "$env_file"
+  chmod 600 "$env_file"
 }
 
 configure_refresh() {
   load_saved_signal_refresh_env
+  load_saved_execution_tradier_env
   export SPREAD_SIGNAL_REFRESH_INTERVAL_SECONDS="${SPREAD_SIGNAL_REFRESH_INTERVAL_SECONDS:-300}"
   export SPREAD_SIGNAL_REFRESH_MARKET_WINDOW_ONLY="${SPREAD_SIGNAL_REFRESH_MARKET_WINDOW_ONLY:-1}"
   export SPREAD_SIGNAL_REFRESH_TIMEOUT_SECONDS="${SPREAD_SIGNAL_REFRESH_TIMEOUT_SECONDS:-900}"
@@ -95,9 +114,11 @@ configure_refresh() {
 
 start_refresh() {
   load_saved_signal_refresh_env
+  load_saved_execution_tradier_env
   if [[ ! -f "$env_file" ]]; then
     configure_refresh
     load_saved_signal_refresh_env
+    load_saved_execution_tradier_env
   fi
   persist_signal_refresh_env
   mkdir -p "$(dirname "$pid_file")" "$(dirname "$state_file")" "$(dirname "$log_file")"
@@ -195,6 +216,7 @@ EOF
 
 status_refresh() {
   load_saved_signal_refresh_env
+  load_saved_execution_tradier_env
   local pid
   pid="$(read_pid || true)"
   if is_running "$pid"; then
@@ -239,6 +261,7 @@ import_legacy_refresh_env() {
 migrate_legacy() {
   stop_legacy_auto_research
   load_saved_signal_refresh_env
+  load_saved_execution_tradier_env
   import_legacy_refresh_env
   persist_signal_refresh_env
   echo "legacy refresh service stopped; signal refresh env persisted at $env_file"
