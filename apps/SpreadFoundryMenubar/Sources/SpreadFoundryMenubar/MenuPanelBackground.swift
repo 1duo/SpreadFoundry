@@ -4,16 +4,6 @@ import SwiftUI
 extension View {
     func menuPanelBackground() -> some View {
         background {
-            MenuPanelBackgroundView()
-        }
-    }
-}
-
-private struct MenuPanelBackgroundView: View {
-    var body: some View {
-        if #available(macOS 26.0, *) {
-            Color.clear
-        } else {
             MenuPanelGlassEffectRepresentable()
         }
     }
