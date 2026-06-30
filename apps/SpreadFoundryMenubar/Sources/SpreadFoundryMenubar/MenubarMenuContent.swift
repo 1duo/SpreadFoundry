@@ -61,7 +61,7 @@ struct MenubarMenuContent: View {
         HStack(alignment: .center, spacing: 8) {
             Image(nsImage: MenubarIcon.brandImage(status: viewModel.snapshot.status))
                 .resizable()
-                .frame(width: 28, height: 28)
+                .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("SpreadFoundry")

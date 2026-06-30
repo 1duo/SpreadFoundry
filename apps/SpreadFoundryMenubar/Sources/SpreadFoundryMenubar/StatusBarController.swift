@@ -30,6 +30,7 @@ final class StatusBarController: NSObject {
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.sendAction(on: [.leftMouseUp])
+            button.imageScaling = .scaleProportionallyDown
         }
 
         cancellable = Publishers.CombineLatest(viewModel.$snapshot, viewModel.$errorMessage)
