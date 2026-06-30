@@ -5,6 +5,7 @@ pub mod live_signal;
 pub mod opt;
 pub mod report;
 pub mod research;
+pub mod research_store;
 pub mod sim;
 pub mod strategy;
 pub mod theta;

@@ -5,3 +5,5 @@
 /var
 /data/raw
 /data/normalized
+/data/*.duckdb
+/data/*.duckdb.wal

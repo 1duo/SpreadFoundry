@@ -31,6 +31,10 @@ use spreadfoundry::research::{
     run_portfolio_selector_research_for_profile, run_portfolio_wheel_research, run_symbol_research,
     warm_option_cache_coverage,
 };
+use spreadfoundry::research_store::{
+    DEFAULT_RESEARCH_STORE_PATH, ResearchStore, ResearchStoreHealth, ResearchStoreImportReport,
+    ResearchStorePerfReport, import_research_store, research_store_perf_check,
+};
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
 use spreadfoundry::theta::{ThetaClient, ThetaUniverseRequest};
@@ -281,6 +285,28 @@ enum Commands {
         pid_file: PathBuf,
         #[arg(long, default_value_t = 180)]
         max_age_seconds: u64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ResearchStoreHealth {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ResearchStoreImport {
+        #[arg(long, default_value = "data/raw/theta")]
+        raw_root: PathBuf,
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
+        #[arg(long)]
+        max_files_per_symbol: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ResearchStorePerfCheck {
+        #[arg(long, default_value = "data/raw/theta")]
+        raw_root: PathBuf,
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1004,6 +1030,43 @@ async fn main() -> Result<()> {
             max_age_seconds,
             json,
         } => execution_worker_snapshot(&health_output, &pid_file, max_age_seconds, json),
+        Commands::ResearchStoreHealth { json } => {
+            let store = ResearchStore::open_default()?;
+            let report = store.health(Path::new(DEFAULT_RESEARCH_STORE_PATH))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_research_store_health(&report);
+            }
+            Ok(())
+        }
+        Commands::ResearchStoreImport {
+            raw_root,
+            symbols,
+            max_files_per_symbol,
+            json,
+        } => {
+            let report = import_research_store(&raw_root, &symbols, max_files_per_symbol)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_research_store_import_report(&report);
+            }
+            Ok(())
+        }
+        Commands::ResearchStorePerfCheck {
+            raw_root,
+            symbols,
+            json,
+        } => {
+            let report = research_store_perf_check(&raw_root, &symbols)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_research_store_perf_report(&report);
+            }
+            Ok(())
+        }
         Commands::AuditOptionCacheCoverage {
             symbols,
             from,
@@ -5881,6 +5944,81 @@ fn print_warm_option_cache_coverage_report(report: &WarmOptionCacheCoverageRepor
     }
 }
 
+fn print_research_store_health(report: &ResearchStoreHealth) {
+    println!("Research store: {}", report.path);
+    println!("cache_windows\t{}", report.cache_windows);
+    println!("option_rows\t{}", report.option_rows);
+    println!("backfill_attempts\t{}", report.backfill_attempts);
+    println!("research_runs\t{}", report.research_runs);
+    println!("profile_results\t{}", report.profile_results);
+    println!("trade_summaries\t{}", report.trade_summaries);
+    if !report.date_ranges.is_empty() {
+        println!("\nDate ranges");
+        println!("symbol\trows\tfirst_date\tlast_date");
+        for row in &report.date_ranges {
+            println!(
+                "{}\t{}\t{}\t{}",
+                row.symbol,
+                row.rows,
+                row.first_date.as_deref().unwrap_or("-"),
+                row.last_date.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    if !report.failed_cache_windows.is_empty() {
+        println!("\nFailed cache windows");
+        println!("symbol\tright\tdataset\texpiration\tfrom\tto\tstatus\terror");
+        for row in &report.failed_cache_windows {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.symbol,
+                row.right,
+                row.dataset,
+                row.expiration,
+                row.start_date,
+                row.end_date,
+                row.status,
+                row.error.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    if !report.latest_runs.is_empty() {
+        println!("\nLatest runs");
+        println!("run_id\tfamily\tsymbols\tfrom\tto\tartifact");
+        for row in &report.latest_runs {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                row.run_id,
+                row.command_family,
+                row.symbols_json,
+                row.from_date,
+                row.to_date,
+                row.artifact_path
+            );
+        }
+    }
+}
+
+fn print_research_store_import_report(report: &ResearchStoreImportReport) {
+    println!("raw_root\t{}", report.raw_root);
+    println!("symbols\t{}", report.symbols.join(","));
+    println!("files_seen\t{}", report.files_seen);
+    println!("cache_windows_recorded\t{}", report.cache_windows_recorded);
+    println!("files_imported\t{}", report.files_imported);
+    println!("files_failed\t{}", report.files_failed);
+    println!("option_rows_imported\t{}", report.option_rows_imported);
+}
+
+fn print_research_store_perf_report(report: &ResearchStorePerfReport) {
+    println!("raw_root\t{}", report.raw_root);
+    println!("symbols\t{}", report.symbols.join(","));
+    println!("files_scanned\t{}", report.files_scanned);
+    println!("sync_ms\t{}", report.sync_ms);
+    println!("count_query_ms\t{}", report.count_query_ms);
+    println!("cache_windows\t{}", report.cache_windows);
+    println!("option_rows\t{}", report.option_rows);
+}
+
 fn print_weekly_signal_gate_audit_report(report: &WeeklySignalGateAuditReport) {
     println!("symbol\tfamily\tfrom\tto\tcache_only\tdiscovered\taudited\tloaded\tfailed\trows");
     println!(
@@ -7380,6 +7518,48 @@ mod tests {
             Commands::ResearchWeeklyUniverse { profile_family, .. } => {
                 assert_eq!(profile_family, ProfileFamilyArg::WeeklyCallCredit);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn research_store_import_accepts_symbols_and_json() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "research-store-import",
+            "--raw-root",
+            "tmp/raw",
+            "--symbols",
+            "NVDA,TSLA",
+            "--max-files-per-symbol",
+            "10",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResearchStoreImport {
+                raw_root,
+                symbols,
+                max_files_per_symbol,
+                json,
+            } => {
+                assert_eq!(raw_root, PathBuf::from("tmp/raw"));
+                assert_eq!(symbols, vec!["NVDA".to_owned(), "TSLA".to_owned()]);
+                assert_eq!(max_files_per_symbol, Some(10));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn research_store_health_accepts_json() {
+        let cli =
+            Cli::try_parse_from(["spreadfoundry", "research-store-health", "--json"]).unwrap();
+
+        match cli.command {
+            Commands::ResearchStoreHealth { json } => assert!(json),
             other => panic!("unexpected command: {other:?}"),
         }
     }

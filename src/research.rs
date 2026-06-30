@@ -22,6 +22,7 @@ use crate::execution::{
     conservative_debit_spread_entry_debit_f64, conservative_long_spread_exit_credit_f64,
     conservative_short_spread_exit_debit_f64,
 };
+use crate::research_store;
 #[cfg(test)]
 use crate::types::{OptionKey as ExecutionOptionKey, OptionRight as ExecutionOptionRight};
 #[cfg(test)]
@@ -118,6 +119,10 @@ impl OptionRight {
             Self::Put => "research",
             Self::Call => "research_call",
         }
+    }
+
+    fn store_value(self) -> &'static str {
+        self.query_value()
     }
 }
 
@@ -1423,6 +1428,11 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
                     }
                 }
                 Err((expiration, error)) => {
+                    if is_research_store_operational_error(&error) {
+                        return Err(error).with_context(|| {
+                            format!("loading {expiration} from DuckDB research store")
+                        });
+                    }
                     let failure = expiration_load_failure_from_error(expiration, &error);
                     eprintln!(
                         "skipping {} after expiration load failure: {}",
@@ -1506,11 +1516,12 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         profiles: profile_results,
     };
 
-    fs::write(
-        run_dir.join("research.json"),
-        serde_json::to_string_pretty(&report)?,
-    )?;
-    fs::write(run_dir.join("report.md"), research_markdown(&report))?;
+    let artifact_path = run_dir.join("research.json");
+    let report_path = run_dir.join("report.md");
+    fs::write(&artifact_path, serde_json::to_string_pretty(&report)?)?;
+    fs::write(&report_path, research_markdown(&report))?;
+    research_store::record_research_report(&report, &artifact_path, &report_path)
+        .with_context(|| format!("record research run {} in DuckDB store", report.run_id))?;
     println!("{}", run_dir.display());
     Ok(report)
 }
@@ -1653,7 +1664,11 @@ pub async fn audit_weekly_signal_gates(
                         call_rows_by_expiration.insert(expiration, rows.calls);
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    if is_research_store_operational_error(&error) {
+                        return Err(error)
+                            .context("loading option rows from DuckDB research store");
+                    }
                     expirations_failed += 1;
                 }
             }
@@ -1992,23 +2007,30 @@ async fn warm_symbol_option_cache_coverage(
 
     let mut candidates = Vec::new();
     let mut error = None;
-    let coverage_index = match OptionCacheCoverageIndex::build(&raw_dir) {
-        Ok(index) => index,
-        Err(cache_error) => {
-            error = Some(compact_error_message(&format!("{cache_error:#}")));
-            OptionCacheCoverageIndex::default()
-        }
-    };
+    if let Err(cache_error) = research_store::sync_cache_windows_for_symbol(symbol, &raw_dir) {
+        error = Some(compact_error_message(&format!("{cache_error:#}")));
+    }
 
     for expiration in &candidate_expirations {
         let Some((start, end)) = expiration_load_window(*expiration, bounds) else {
             continue;
         };
-        let exp = yyyymmdd(*expiration);
-        let put_complete_before =
-            coverage_index.has_complete_coverage(&exp, start, end, OptionRight::Put);
-        let call_complete_before =
-            coverage_index.has_complete_coverage(&exp, start, end, OptionRight::Call);
+        let put_complete_before = duckdb_cache_complete(
+            symbol,
+            *expiration,
+            start,
+            end,
+            OptionRight::Put,
+            &mut error,
+        );
+        let call_complete_before = duckdb_cache_complete(
+            symbol,
+            *expiration,
+            start,
+            end,
+            OptionRight::Call,
+            &mut error,
+        );
         if !put_complete_before || !call_complete_before {
             candidates.push(WarmOptionCacheCandidate {
                 expiration: *expiration,
@@ -2077,12 +2099,25 @@ async fn warm_option_cache_window(
     .err()
     .map(|error| compact_error_message(&format!("{error:#}")));
 
-    let exp = yyyymmdd(candidate.expiration);
-    let post_index = OptionCacheCoverageIndex::build(raw_dir).unwrap_or_default();
-    let put_complete_after =
-        post_index.has_complete_coverage(&exp, candidate.start, candidate.end, OptionRight::Put);
-    let call_complete_after =
-        post_index.has_complete_coverage(&exp, candidate.start, candidate.end, OptionRight::Call);
+    let mut store_error = None;
+    let _ = research_store::sync_cache_windows_for_symbol(symbol, raw_dir)
+        .map_err(|error| store_error = Some(compact_error_message(&format!("{error:#}"))));
+    let put_complete_after = duckdb_cache_complete(
+        symbol,
+        candidate.expiration,
+        candidate.start,
+        candidate.end,
+        OptionRight::Put,
+        &mut store_error,
+    );
+    let call_complete_after = duckdb_cache_complete(
+        symbol,
+        candidate.expiration,
+        candidate.start,
+        candidate.end,
+        OptionRight::Call,
+        &mut store_error,
+    );
     WarmOptionCacheCoverageWindow {
         expiration: candidate.expiration,
         start: candidate.start,
@@ -2092,7 +2127,32 @@ async fn warm_option_cache_window(
         put_complete_after,
         call_complete_after,
         both_complete_after: put_complete_after && call_complete_after,
-        error: load_error,
+        error: load_error.or(store_error),
+    }
+}
+
+fn duckdb_cache_complete(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    option_right: OptionRight,
+    error: &mut Option<String>,
+) -> bool {
+    match research_store::cache_has_complete_coverage(
+        symbol,
+        expiration,
+        start,
+        end,
+        option_right.store_value(),
+    ) {
+        Ok(complete) => complete,
+        Err(cache_error) => {
+            if error.is_none() {
+                *error = Some(compact_error_message(&format!("{cache_error:#}")));
+            }
+            false
+        }
     }
 }
 
@@ -2148,21 +2208,30 @@ async fn audit_symbol_option_cache_coverage(
     let mut last_complete_call_expiration = None;
     let mut missing_call_examples = Vec::new();
     let mut error = None;
-    let coverage_index = match OptionCacheCoverageIndex::build(&raw_dir) {
-        Ok(index) => index,
-        Err(cache_error) => {
-            error = Some(compact_error_message(&format!("{cache_error:#}")));
-            OptionCacheCoverageIndex::default()
-        }
-    };
+    if let Err(cache_error) = research_store::sync_cache_windows_for_symbol(symbol, &raw_dir) {
+        error = Some(compact_error_message(&format!("{cache_error:#}")));
+    }
 
     for expiration in &candidate_expirations {
         let Some((start, end)) = expiration_load_window(*expiration, bounds) else {
             continue;
         };
-        let exp = yyyymmdd(*expiration);
-        let put_ok = coverage_index.has_complete_coverage(&exp, start, end, OptionRight::Put);
-        let call_ok = coverage_index.has_complete_coverage(&exp, start, end, OptionRight::Call);
+        let put_ok = duckdb_cache_complete(
+            symbol,
+            *expiration,
+            start,
+            end,
+            OptionRight::Put,
+            &mut error,
+        );
+        let call_ok = duckdb_cache_complete(
+            symbol,
+            *expiration,
+            start,
+            end,
+            OptionRight::Call,
+            &mut error,
+        );
         if put_ok {
             put_complete += 1;
         }
@@ -2356,14 +2425,20 @@ async fn run_portfolio_research(
         profiles: profile_results,
     };
 
+    let artifact_path = run_dir.join("portfolio_research.json");
+    let report_path = run_dir.join("report.md");
+    fs::write(&artifact_path, serde_json::to_string_pretty(&report)?)?;
     fs::write(
-        run_dir.join("portfolio_research.json"),
-        serde_json::to_string_pretty(&report)?,
-    )?;
-    fs::write(
-        run_dir.join("report.md"),
+        &report_path,
         portfolio_wheel_markdown(&report, report_title),
     )?;
+    research_store::record_portfolio_report(&report, run_prefix, &artifact_path, &report_path)
+        .with_context(|| {
+            format!(
+                "record portfolio research run {} in DuckDB store",
+                report.run_id
+            )
+        })?;
     Ok(report)
 }
 
@@ -2593,6 +2668,11 @@ async fn load_portfolio_wheel_symbol_data(
                     }
                 }
                 Err((expiration, error)) => {
+                    if is_research_store_operational_error(&error) {
+                        return Err(error).with_context(|| {
+                            format!("loading {expiration} from DuckDB research store")
+                        });
+                    }
                     expiration_load_failures
                         .push(expiration_load_failure_from_error(expiration, &error));
                 }
@@ -8188,6 +8268,12 @@ async fn load_expiration_rows(
     cache_only: bool,
     option_right: OptionRight,
 ) -> Result<Vec<OptionDay>> {
+    if !force_refresh
+        && duckdb_option_rows_have_complete_coverage(symbol, expiration, start, end, option_right)?
+    {
+        return load_duckdb_option_rows(symbol, expiration, start, end, option_right);
+    }
+
     let oi_map = load_open_interest_map(
         symbol,
         expiration,
@@ -8218,7 +8304,99 @@ async fn load_expiration_rows(
             .cmp(&b.date)
             .then_with(|| a.strike.total_cmp(&b.strike))
     });
-    Ok(rows)
+    persist_duckdb_option_rows(symbol, expiration, start, end, raw_dir, option_right, &rows)?;
+    load_duckdb_option_rows(symbol, expiration, start, end, option_right)
+}
+
+fn duckdb_option_rows_have_complete_coverage(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    option_right: OptionRight,
+) -> Result<bool> {
+    research_store::option_rows_have_complete_coverage(
+        symbol,
+        expiration,
+        start,
+        end,
+        option_right.store_value(),
+    )
+}
+
+fn load_duckdb_option_rows(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    option_right: OptionRight,
+) -> Result<Vec<OptionDay>> {
+    let rows = research_store::option_rows_for_window(
+        symbol,
+        expiration,
+        start,
+        end,
+        option_right.store_value(),
+    )?;
+    Ok(rows.into_iter().map(option_day_from_store_row).collect())
+}
+
+fn option_day_from_store_row(row: research_store::ResearchStoreOptionRow) -> OptionDay {
+    OptionDay {
+        date: row.date,
+        strike: row.strike,
+        bid: row.bid,
+        ask: row.ask,
+        delta: row.delta,
+        implied_vol: row.implied_vol,
+        underlying_price: row.underlying_price,
+        open_interest: row.open_interest,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_duckdb_option_rows(
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    raw_dir: &Path,
+    option_right: OptionRight,
+    rows: &[OptionDay],
+) -> Result<()> {
+    let source_path = raw_dir.display().to_string();
+    let store_rows = rows
+        .iter()
+        .map(|row| research_store::ResearchStoreOptionRow {
+            symbol: symbol.to_uppercase(),
+            date: row.date,
+            expiration,
+            right: option_right.store_value().to_owned(),
+            strike: row.strike,
+            bid: row.bid,
+            ask: row.ask,
+            mark: (row.bid + row.ask) / 2.0,
+            delta: row.delta,
+            implied_vol: row.implied_vol,
+            underlying_price: row.underlying_price,
+            open_interest: row.open_interest,
+            source_path: source_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    research_store::replace_option_rows_for_window(
+        symbol,
+        expiration,
+        start,
+        end,
+        option_right.store_value(),
+        &store_rows,
+    )
+    .with_context(|| {
+        format!(
+            "persist option rows to DuckDB for {symbol} {expiration} {} {start}..{end}",
+            option_right.store_value()
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8480,6 +8658,24 @@ fn option_cache_has_complete_coverage(
     end: NaiveDate,
     option_right: OptionRight,
 ) -> Result<bool> {
+    if let (Some(symbol), Some(expiration)) = (
+        raw_dir.file_name().and_then(|name| name.to_str()),
+        parse_yyyymmdd(exp),
+    ) && raw_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("theta")
+    {
+        research_store::sync_cache_windows_for_symbol(symbol, raw_dir)?;
+        return research_store::cache_has_complete_coverage(
+            symbol,
+            expiration,
+            start,
+            end,
+            option_right.store_value(),
+        );
+    }
     Ok(!cached_option_cache_covering_sequence(
         raw_dir,
         exp,
@@ -8563,26 +8759,6 @@ impl OptionCacheCoverageIndex {
             });
         }
         Ok(index)
-    }
-
-    fn has_complete_coverage(
-        &self,
-        exp: &str,
-        start: NaiveDate,
-        end: NaiveDate,
-        option_right: OptionRight,
-    ) -> bool {
-        self.covering_sequence(
-            exp,
-            start,
-            end,
-            option_right,
-            CachedOptionDataset::OpenInterest,
-        )
-        .is_some()
-            && self
-                .covering_sequence(exp, start, end, option_right, CachedOptionDataset::Greeks)
-                .is_some()
     }
 
     fn covering_sequence(
@@ -8865,6 +9041,13 @@ fn is_non_retryable_thetadata_error(error: &anyhow::Error) -> bool {
         && message.contains("STANDARD subscription")
 }
 
+fn is_research_store_operational_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("research store")
+        || message.contains("spreadfoundry.duckdb")
+        || message.contains("DuckDB")
+}
+
 fn read_cached_json(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
@@ -8877,6 +9060,8 @@ fn read_cached_json(path: &Path) -> Result<Option<Value>> {
                 "ignoring corrupt ThetaData cache {}: {error}",
                 path.display()
             );
+            research_store::record_bad_theta_json(path, &format!("{error:#}"))
+                .with_context(|| format!("record corrupt ThetaData cache {}", path.display()))?;
             Ok(None)
         }
     }
@@ -8902,7 +9087,9 @@ fn write_cached_json(path: &Path, json: &Value) -> Result<()> {
     if write_result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
-    write_result
+    write_result?;
+    research_store::record_cached_theta_json(path, json)
+        .with_context(|| format!("record ThetaData cache {} in DuckDB store", path.display()))
 }
 
 fn cache_temp_path(path: &Path) -> PathBuf {
@@ -14134,6 +14321,19 @@ mod tests {
 
         assert!(is_non_retryable_thetadata_error(&denied));
         assert!(!is_non_retryable_thetadata_error(&transient));
+    }
+
+    #[test]
+    fn duckdb_store_errors_are_operational_not_data_misses() {
+        let locked = anyhow::anyhow!(
+            "open research store data/spreadfoundry.duckdb: IO Error: Could not set lock"
+        );
+        let theta_miss = anyhow::anyhow!(
+            "cache-only ThetaData miss: data/raw/theta/GME/research_oi_20211119_20211115_20211119.json"
+        );
+
+        assert!(is_research_store_operational_error(&locked));
+        assert!(!is_research_store_operational_error(&theta_miss));
     }
 
     #[test]
