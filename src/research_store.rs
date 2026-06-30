@@ -3,14 +3,14 @@ use chrono::{NaiveDate, Utc};
 use duckdb::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::live_market::LiveMarketSnapshotRecord;
-use crate::research::{PortfolioWheelReport, ResearchReport, ResearchTrade, SpreadStructure};
+use crate::research::{PortfolioWheelReport, ResearchReport};
 
 pub const DEFAULT_RESEARCH_STORE_PATH: &str = "data/spreadfoundry.duckdb";
 const RESEARCH_STORE_PATH_ENV: &str = "SPREAD_RESEARCH_STORE_PATH";
@@ -18,6 +18,8 @@ const RESEARCH_STORE_SKIP_CACHE_SYNC_ENV: &str = "SPREAD_RESEARCH_STORE_SKIP_CAC
 const STORE_DATA_VERSION: &str = "duckdb-v1";
 
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CACHE_SYNCED_SYMBOL_DIRS: OnceLock<Mutex<HashSet<(PathBuf, String, PathBuf)>>> =
+    OnceLock::new();
 
 pub struct ResearchStore {
     conn: Connection,
@@ -299,6 +301,11 @@ impl ResearchStore {
                 reason VARCHAR NOT NULL,
                 raw_json VARCHAR NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS cache_windows_lookup_idx
+                ON cache_windows(symbol, option_right, dataset, expiration, status, start_date, end_date);
+            CREATE INDEX IF NOT EXISTS option_rows_lookup_idx
+                ON option_rows(symbol, option_right, expiration, date, strike);
             "#,
         )?;
         Ok(())
@@ -450,7 +457,7 @@ impl ResearchStore {
             r#"
             SELECT start_date, end_date
             FROM cache_windows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND dataset = ?
               AND expiration = ?
@@ -481,7 +488,7 @@ impl ResearchStore {
             r#"
             SELECT start_date, end_date
             FROM cache_windows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND dataset = ?
               AND expiration = ?
@@ -512,7 +519,7 @@ impl ResearchStore {
             SELECT symbol, date, expiration, option_right, strike, bid, ask, mark, delta,
                    implied_vol, underlying_price, open_interest, source_path
             FROM option_rows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND expiration = ?
               AND date >= ?
@@ -648,49 +655,92 @@ impl ResearchStore {
         &mut self,
         report: &ResearchReport,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM profile_results WHERE run_id = ?",
             params![report.run_id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM trade_summaries WHERE run_id = ?",
             params![report.run_id],
         )?;
-        for (rank, profile_result) in report.profiles.iter().enumerate() {
-            let gate_status = if rank == 0 {
-                report.deployment_gate.status.as_str()
-            } else {
-                "not_selected"
-            };
-            let gate_pass = rank == 0 && report.deployment_gate.pass;
-            self.insert_profile_result(
-                &report.run_id,
-                rank,
-                &profile_result.profile.name,
-                profile_result.profile.structure,
-                profile_result.metrics.trades,
-                profile_result.metrics.total_pnl,
-                profile_result.metrics.score,
-                profile_result.metrics.robust_score,
-                profile_result.metrics.max_drawdown,
-                profile_result.metrics.win_rate,
-                profile_result.metrics.profit_factor,
-                profile_result.metrics.trades_per_year,
-                gate_status,
-                gate_pass,
+        {
+            let mut insert_profile = tx.prepare(
+                r#"
+                INSERT INTO profile_results (
+                    run_id, profile_rank, profile_name, structure, trades, total_pnl, score,
+                    robust_score, max_drawdown, win_rate, profit_factor, trades_per_year,
+                    gate_status, gate_pass
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
             )?;
-            for (trade_index, trade) in profile_result.trades.iter().enumerate() {
-                self.insert_trade_summary(
+            let mut insert_trade = tx.prepare(
+                r#"
+                INSERT INTO trade_summaries (
+                    run_id, profile_rank, profile_name, trade_index, symbol, structure, entry_date,
+                    exit_date, expiration, dte_entry, days_held, pnl, max_loss, return_on_risk,
+                    exit_reason, short_strike, long_strike, width, entry_credit, exit_debit,
+                    short_delta, long_delta, short_oi, long_oi, underlying_price
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )?;
+            for (rank, profile_result) in report.profiles.iter().enumerate() {
+                let gate_status = if rank == 0 {
+                    report.deployment_gate.status.as_str()
+                } else {
+                    "not_selected"
+                };
+                let gate_pass = rank == 0 && report.deployment_gate.pass;
+                insert_profile.execute(params![
                     &report.run_id,
-                    rank,
+                    rank as i64,
                     &profile_result.profile.name,
-                    trade_index,
-                    &report.symbol,
-                    profile_result.profile.structure,
-                    trade,
-                )?;
+                    profile_result.profile.structure.as_str(),
+                    profile_result.metrics.trades as i64,
+                    profile_result.metrics.total_pnl,
+                    profile_result.metrics.score,
+                    profile_result.metrics.robust_score,
+                    profile_result.metrics.max_drawdown,
+                    profile_result.metrics.win_rate,
+                    profile_result.metrics.profit_factor,
+                    profile_result.metrics.trades_per_year,
+                    gate_status,
+                    gate_pass,
+                ])?;
+                for (trade_index, trade) in profile_result.trades.iter().enumerate() {
+                    insert_trade.execute(params![
+                        &report.run_id,
+                        rank as i64,
+                        &profile_result.profile.name,
+                        trade_index as i64,
+                        &report.symbol,
+                        profile_result.profile.structure.as_str(),
+                        date_s(trade.entry_date),
+                        date_s(trade.exit_date),
+                        date_s(trade.expiration),
+                        trade.dte_entry,
+                        trade.days_held,
+                        trade.pnl,
+                        trade.max_loss,
+                        trade.return_on_risk,
+                        &trade.exit_reason,
+                        trade.short_put,
+                        trade.long_put,
+                        trade.width,
+                        trade.entry_credit,
+                        trade.exit_debit,
+                        trade.short_delta,
+                        trade.long_delta,
+                        trade.short_oi as i64,
+                        trade.long_oi as i64,
+                        trade.underlying_price,
+                    ])?;
+                }
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -698,142 +748,86 @@ impl ResearchStore {
         &mut self,
         report: &PortfolioWheelReport,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM profile_results WHERE run_id = ?",
             params![report.run_id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM trade_summaries WHERE run_id = ?",
             params![report.run_id],
         )?;
-        for (rank, profile_result) in report.profiles.iter().enumerate() {
-            self.insert_profile_result(
-                &report.run_id,
-                rank,
-                &profile_result.profile.name,
-                profile_result.profile.structure,
-                profile_result.metrics.trades,
-                profile_result.metrics.total_pnl,
-                profile_result.metrics.score,
-                profile_result.metrics.robust_score,
-                profile_result.metrics.max_drawdown,
-                profile_result.metrics.win_rate,
-                profile_result.metrics.profit_factor,
-                profile_result.metrics.trades_per_year,
-                &profile_result.gate_status,
-                profile_result.gate_pass,
+        {
+            let mut insert_profile = tx.prepare(
+                r#"
+                INSERT INTO profile_results (
+                    run_id, profile_rank, profile_name, structure, trades, total_pnl, score,
+                    robust_score, max_drawdown, win_rate, profit_factor, trades_per_year,
+                    gate_status, gate_pass
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
             )?;
-            for (trade_index, trade) in profile_result.trades.iter().enumerate() {
-                self.insert_trade_summary(
+            let mut insert_trade = tx.prepare(
+                r#"
+                INSERT INTO trade_summaries (
+                    run_id, profile_rank, profile_name, trade_index, symbol, structure, entry_date,
+                    exit_date, expiration, dte_entry, days_held, pnl, max_loss, return_on_risk,
+                    exit_reason, short_strike, long_strike, width, entry_credit, exit_debit,
+                    short_delta, long_delta, short_oi, long_oi, underlying_price
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )?;
+            for (rank, profile_result) in report.profiles.iter().enumerate() {
+                insert_profile.execute(params![
                     &report.run_id,
-                    rank,
+                    rank as i64,
                     &profile_result.profile.name,
-                    trade_index,
-                    &trade.symbol,
-                    trade.strategy,
-                    &trade.trade,
-                )?;
+                    profile_result.profile.structure.as_str(),
+                    profile_result.metrics.trades as i64,
+                    profile_result.metrics.total_pnl,
+                    profile_result.metrics.score,
+                    profile_result.metrics.robust_score,
+                    profile_result.metrics.max_drawdown,
+                    profile_result.metrics.win_rate,
+                    profile_result.metrics.profit_factor,
+                    profile_result.metrics.trades_per_year,
+                    &profile_result.gate_status,
+                    profile_result.gate_pass,
+                ])?;
+                for (trade_index, trade) in profile_result.trades.iter().enumerate() {
+                    insert_trade.execute(params![
+                        &report.run_id,
+                        rank as i64,
+                        &profile_result.profile.name,
+                        trade_index as i64,
+                        &trade.symbol,
+                        trade.strategy.as_str(),
+                        date_s(trade.trade.entry_date),
+                        date_s(trade.trade.exit_date),
+                        date_s(trade.trade.expiration),
+                        trade.trade.dte_entry,
+                        trade.trade.days_held,
+                        trade.trade.pnl,
+                        trade.trade.max_loss,
+                        trade.trade.return_on_risk,
+                        &trade.trade.exit_reason,
+                        trade.trade.short_put,
+                        trade.trade.long_put,
+                        trade.trade.width,
+                        trade.trade.entry_credit,
+                        trade.trade.exit_debit,
+                        trade.trade.short_delta,
+                        trade.trade.long_delta,
+                        trade.trade.short_oi as i64,
+                        trade.trade.long_oi as i64,
+                        trade.trade.underlying_price,
+                    ])?;
+                }
             }
         }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn insert_profile_result(
-        &self,
-        run_id: &str,
-        profile_rank: usize,
-        profile_name: &str,
-        structure: SpreadStructure,
-        trades: usize,
-        total_pnl: f64,
-        score: f64,
-        robust_score: f64,
-        max_drawdown: f64,
-        win_rate: f64,
-        profit_factor: f64,
-        trades_per_year: f64,
-        gate_status: &str,
-        gate_pass: bool,
-    ) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO profile_results (
-                run_id, profile_rank, profile_name, structure, trades, total_pnl, score,
-                robust_score, max_drawdown, win_rate, profit_factor, trades_per_year,
-                gate_status, gate_pass
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                run_id,
-                profile_rank as i64,
-                profile_name,
-                structure.as_str(),
-                trades as i64,
-                total_pnl,
-                score,
-                robust_score,
-                max_drawdown,
-                win_rate,
-                profit_factor,
-                trades_per_year,
-                gate_status,
-                gate_pass,
-            ],
-        )?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn insert_trade_summary(
-        &self,
-        run_id: &str,
-        profile_rank: usize,
-        profile_name: &str,
-        trade_index: usize,
-        symbol: &str,
-        structure: SpreadStructure,
-        trade: &ResearchTrade,
-    ) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO trade_summaries (
-                run_id, profile_rank, profile_name, trade_index, symbol, structure, entry_date,
-                exit_date, expiration, dte_entry, days_held, pnl, max_loss, return_on_risk,
-                exit_reason, short_strike, long_strike, width, entry_credit, exit_debit,
-                short_delta, long_delta, short_oi, long_oi, underlying_price
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                run_id,
-                profile_rank as i64,
-                profile_name,
-                trade_index as i64,
-                symbol,
-                structure.as_str(),
-                date_s(trade.entry_date),
-                date_s(trade.exit_date),
-                date_s(trade.expiration),
-                trade.dte_entry,
-                trade.days_held,
-                trade.pnl,
-                trade.max_loss,
-                trade.return_on_risk,
-                &trade.exit_reason,
-                trade.short_put,
-                trade.long_put,
-                trade.width,
-                trade.entry_credit,
-                trade.exit_debit,
-                trade.short_delta,
-                trade.long_delta,
-                trade.short_oi as i64,
-                trade.long_oi as i64,
-                trade.underlying_price,
-            ],
-        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -859,7 +853,7 @@ impl ResearchStore {
             r#"
             SELECT COUNT(*)
             FROM cache_windows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND dataset = ?
               AND expiration = ?
@@ -886,7 +880,7 @@ impl ResearchStore {
         self.conn.execute(
             r#"
             DELETE FROM cache_windows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND dataset = ?
               AND expiration = ?
@@ -946,7 +940,7 @@ impl ResearchStore {
         tx.execute(
             r#"
             DELETE FROM option_rows
-            WHERE upper(symbol) = upper(?)
+            WHERE symbol = upper(?)
               AND option_right = ?
               AND expiration = ?
               AND date >= ?
@@ -988,10 +982,50 @@ impl ResearchStore {
                 ])?;
             }
         }
-        tx.commit()?;
         let mut loaded_window = window.clone();
         loaded_window.dataset = "option_rows".to_owned();
-        self.upsert_cache_window(&loaded_window, "success", Some(rows.len() as i64), None)?;
+        tx.execute(
+            r#"
+            DELETE FROM cache_windows
+            WHERE symbol = upper(?)
+              AND option_right = ?
+              AND dataset = ?
+              AND expiration = ?
+              AND start_date = ?
+              AND end_date = ?
+            "#,
+            params![
+                &loaded_window.symbol,
+                &loaded_window.right,
+                &loaded_window.dataset,
+                date_s(loaded_window.expiration),
+                date_s(loaded_window.start),
+                date_s(loaded_window.end),
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO cache_windows (
+                symbol, option_right, dataset, expiration, start_date, end_date, status,
+                source_path, row_count, error, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                loaded_window.symbol.to_uppercase(),
+                &loaded_window.right,
+                &loaded_window.dataset,
+                date_s(loaded_window.expiration),
+                date_s(loaded_window.start),
+                date_s(loaded_window.end),
+                "success",
+                loaded_window.source_path.display().to_string(),
+                rows.len() as i64,
+                None::<String>,
+                now_s(),
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1269,6 +1303,34 @@ pub fn sync_cache_windows_for_symbol(symbol: &str, raw_dir: &Path) -> Result<()>
         store.sync_symbol_cache_dir(symbol, raw_dir, None)?;
         Ok(())
     })
+}
+
+pub fn sync_cache_windows_for_symbol_once(symbol: &str, raw_dir: &Path) -> Result<()> {
+    if !research_store_cache_sync_enabled() {
+        return Ok(());
+    }
+    let key = (
+        default_research_store_path(),
+        symbol.trim().to_uppercase(),
+        raw_dir.to_path_buf(),
+    );
+    let synced = CACHE_SYNCED_SYMBOL_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let synced = synced
+            .lock()
+            .map_err(|_| anyhow::anyhow!("research store cache-sync marker lock poisoned"))?;
+        if synced.contains(&key) {
+            return Ok(());
+        }
+    }
+
+    sync_cache_windows_for_symbol(symbol, raw_dir)?;
+
+    synced
+        .lock()
+        .map_err(|_| anyhow::anyhow!("research store cache-sync marker lock poisoned"))?
+        .insert(key);
+    Ok(())
 }
 
 pub fn cache_has_complete_coverage(

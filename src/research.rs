@@ -2012,15 +2012,14 @@ async fn warm_symbol_option_cache_coverage(
 
     let mut candidates = Vec::new();
     let mut error = None;
-    if let Err(cache_error) = research_store::sync_cache_windows_for_symbol(symbol, &raw_dir) {
-        error = Some(compact_error_message(&format!("{cache_error:#}")));
-    }
+    let store = open_symbol_cache_store_for_coverage(symbol, &raw_dir, &mut error);
 
     for expiration in &candidate_expirations {
         let Some((start, end)) = expiration_load_window(*expiration, bounds) else {
             continue;
         };
-        let put_complete_before = duckdb_cache_complete(
+        let put_complete_before = duckdb_cache_complete_with_store(
+            store.as_ref(),
             symbol,
             *expiration,
             start,
@@ -2028,7 +2027,8 @@ async fn warm_symbol_option_cache_coverage(
             OptionRight::Put,
             &mut error,
         );
-        let call_complete_before = duckdb_cache_complete(
+        let call_complete_before = duckdb_cache_complete_with_store(
+            store.as_ref(),
             symbol,
             *expiration,
             start,
@@ -2188,13 +2188,36 @@ fn duckdb_cache_complete(
     option_right: OptionRight,
     error: &mut Option<String>,
 ) -> bool {
-    match research_store::cache_has_complete_coverage(
-        symbol,
-        expiration,
-        start,
-        end,
-        option_right.store_value(),
-    ) {
+    duckdb_cache_complete_with_store(None, symbol, expiration, start, end, option_right, error)
+}
+
+fn duckdb_cache_complete_with_store(
+    store: Option<&research_store::ResearchStore>,
+    symbol: &str,
+    expiration: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    option_right: OptionRight,
+    error: &mut Option<String>,
+) -> bool {
+    let coverage = if let Some(store) = store {
+        store.cache_has_complete_coverage(
+            symbol,
+            expiration,
+            start,
+            end,
+            option_right.store_value(),
+        )
+    } else {
+        research_store::cache_has_complete_coverage(
+            symbol,
+            expiration,
+            start,
+            end,
+            option_right.store_value(),
+        )
+    };
+    match coverage {
         Ok(complete) => complete,
         Err(cache_error) => {
             if error.is_none() {
@@ -2203,6 +2226,29 @@ fn duckdb_cache_complete(
             false
         }
     }
+}
+
+fn open_symbol_cache_store_for_coverage(
+    symbol: &str,
+    raw_dir: &Path,
+    error: &mut Option<String>,
+) -> Option<research_store::ResearchStore> {
+    let mut store = match research_store::ResearchStore::open_default() {
+        Ok(store) => store,
+        Err(cache_error) => {
+            if error.is_none() {
+                *error = Some(compact_error_message(&format!("{cache_error:#}")));
+            }
+            return None;
+        }
+    };
+    if research_store::research_store_cache_sync_enabled()
+        && let Err(cache_error) = store.sync_symbol_cache_dir(symbol, raw_dir, None)
+        && error.is_none()
+    {
+        *error = Some(compact_error_message(&format!("{cache_error:#}")));
+    }
+    Some(store)
 }
 
 async fn audit_symbol_option_cache_coverage(
@@ -2257,15 +2303,14 @@ async fn audit_symbol_option_cache_coverage(
     let mut last_complete_call_expiration = None;
     let mut missing_call_examples = Vec::new();
     let mut error = None;
-    if let Err(cache_error) = research_store::sync_cache_windows_for_symbol(symbol, &raw_dir) {
-        error = Some(compact_error_message(&format!("{cache_error:#}")));
-    }
+    let store = open_symbol_cache_store_for_coverage(symbol, &raw_dir, &mut error);
 
     for expiration in &candidate_expirations {
         let Some((start, end)) = expiration_load_window(*expiration, bounds) else {
             continue;
         };
-        let put_ok = duckdb_cache_complete(
+        let put_ok = duckdb_cache_complete_with_store(
+            store.as_ref(),
             symbol,
             *expiration,
             start,
@@ -2273,7 +2318,8 @@ async fn audit_symbol_option_cache_coverage(
             OptionRight::Put,
             &mut error,
         );
-        let call_ok = duckdb_cache_complete(
+        let call_ok = duckdb_cache_complete_with_store(
+            store.as_ref(),
             symbol,
             *expiration,
             start,
@@ -8398,7 +8444,7 @@ async fn load_expiration_rows(
             .then_with(|| a.strike.total_cmp(&b.strike))
     });
     persist_duckdb_option_rows(symbol, expiration, start, end, raw_dir, option_right, &rows)?;
-    load_duckdb_option_rows(symbol, expiration, start, end, option_right)
+    Ok(rows)
 }
 
 fn duckdb_option_rows_have_complete_coverage(
@@ -8760,7 +8806,7 @@ fn option_cache_has_complete_coverage(
         .and_then(|name| name.to_str())
         == Some("theta")
     {
-        research_store::sync_cache_windows_for_symbol(symbol, raw_dir)?;
+        research_store::sync_cache_windows_for_symbol_once(symbol, raw_dir)?;
         return research_store::cache_has_complete_coverage(
             symbol,
             expiration,
