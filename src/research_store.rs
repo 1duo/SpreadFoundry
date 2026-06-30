@@ -9,15 +9,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::live_market::LiveMarketSnapshotRecord;
 use crate::research::{PortfolioWheelReport, ResearchReport, ResearchTrade, SpreadStructure};
 
 pub const DEFAULT_RESEARCH_STORE_PATH: &str = "data/spreadfoundry.duckdb";
+const RESEARCH_STORE_PATH_ENV: &str = "SPREAD_RESEARCH_STORE_PATH";
+const RESEARCH_STORE_SKIP_CACHE_SYNC_ENV: &str = "SPREAD_RESEARCH_STORE_SKIP_CACHE_SYNC";
 const STORE_DATA_VERSION: &str = "duckdb-v1";
 
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub struct ResearchStore {
     conn: Connection,
+}
+
+struct ResearchRunUpsert<'a> {
+    run_id: &'a str,
+    command_family: &'a str,
+    symbols_json: &'a str,
+    profile_family: &'a str,
+    from: NaiveDate,
+    to: NaiveDate,
+    artifact_path: &'a Path,
+    report_path: &'a Path,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -29,6 +43,9 @@ pub struct ResearchStoreHealth {
     pub research_runs: i64,
     pub profile_results: i64,
     pub trade_summaries: i64,
+    pub live_market_snapshots: i64,
+    pub live_signal_candidates: i64,
+    pub live_provider_health: i64,
     pub date_ranges: Vec<ResearchStoreDateRange>,
     pub failed_cache_windows: Vec<ResearchStoreFailedWindow>,
     pub latest_runs: Vec<ResearchStoreRunSummary>,
@@ -119,7 +136,7 @@ pub struct ResearchStoreOptionRow {
 
 impl ResearchStore {
     pub fn open_default() -> Result<Self> {
-        Self::open(DEFAULT_RESEARCH_STORE_PATH)
+        Self::open(default_research_store_path())
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -236,6 +253,51 @@ impl ResearchStore {
                 short_oi BIGINT NOT NULL,
                 long_oi BIGINT NOT NULL,
                 underlying_price DOUBLE NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS live_market_snapshots (
+                snapshot_id VARCHAR NOT NULL,
+                observed_at VARCHAR NOT NULL,
+                as_of VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                approved_strategy_id VARCHAR NOT NULL,
+                profile_name VARCHAR NOT NULL,
+                decision_status VARCHAR NOT NULL,
+                decision_reason VARCHAR NOT NULL,
+                selected_symbol VARCHAR,
+                selected_strategy VARCHAR,
+                source_live_signal VARCHAR NOT NULL,
+                output_artifact VARCHAR NOT NULL,
+                raw_json VARCHAR NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS live_signal_candidates (
+                snapshot_id VARCHAR NOT NULL,
+                candidate_rank BIGINT NOT NULL,
+                symbol VARCHAR NOT NULL,
+                strategy VARCHAR NOT NULL,
+                signal_status VARCHAR NOT NULL,
+                entry_date VARCHAR,
+                expiration VARCHAR,
+                decision_status VARCHAR NOT NULL,
+                reason VARCHAR NOT NULL,
+                max_loss DOUBLE,
+                raw_json VARCHAR NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS live_provider_health (
+                snapshot_id VARCHAR NOT NULL,
+                checked_at VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                ok BOOLEAN NOT NULL,
+                status VARCHAR NOT NULL,
+                latency_ms BIGINT NOT NULL,
+                symbols_requested BIGINT NOT NULL,
+                symbols_ready BIGINT NOT NULL,
+                max_source_age_seconds BIGINT NOT NULL,
+                source_age_seconds BIGINT,
+                reason VARCHAR NOT NULL,
+                raw_json VARCHAR NOT NULL
             );
             "#,
         )?;
@@ -516,17 +578,17 @@ impl ResearchStore {
         artifact_path: &Path,
         report_path: &Path,
     ) -> Result<()> {
-        let symbols_json = serde_json::to_string(&[report.symbol.clone()])?;
-        self.upsert_research_run(
-            &report.run_id,
-            "symbol_research",
-            &symbols_json,
-            report.profile_family.as_str(),
-            report.from,
-            report.to,
+        let symbols_json = serde_json::to_string(std::slice::from_ref(&report.symbol))?;
+        self.upsert_research_run(ResearchRunUpsert {
+            run_id: &report.run_id,
+            command_family: "symbol_research",
+            symbols_json: &symbols_json,
+            profile_family: report.profile_family.as_str(),
+            from: report.from,
+            to: report.to,
             artifact_path,
             report_path,
-        )?;
+        })?;
         self.replace_profile_results_for_research_report(report)?;
         Ok(())
     }
@@ -539,34 +601,24 @@ impl ResearchStore {
         report_path: &Path,
     ) -> Result<()> {
         let symbols_json = serde_json::to_string(&report.symbols)?;
-        self.upsert_research_run(
-            &report.run_id,
+        self.upsert_research_run(ResearchRunUpsert {
+            run_id: &report.run_id,
             command_family,
-            &symbols_json,
-            "portfolio",
-            report.from,
-            report.to,
+            symbols_json: &symbols_json,
+            profile_family: "portfolio",
+            from: report.from,
+            to: report.to,
             artifact_path,
             report_path,
-        )?;
+        })?;
         self.replace_profile_results_for_portfolio_report(report)?;
         Ok(())
     }
 
-    fn upsert_research_run(
-        &mut self,
-        run_id: &str,
-        command_family: &str,
-        symbols_json: &str,
-        profile_family: &str,
-        from: NaiveDate,
-        to: NaiveDate,
-        artifact_path: &Path,
-        report_path: &Path,
-    ) -> Result<()> {
+    fn upsert_research_run(&mut self, run: ResearchRunUpsert<'_>) -> Result<()> {
         self.conn.execute(
             "DELETE FROM research_runs WHERE run_id = ?",
-            params![run_id],
+            params![run.run_id],
         )?;
         self.conn.execute(
             r#"
@@ -577,14 +629,14 @@ impl ResearchStore {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
-                run_id,
-                command_family,
-                symbols_json,
-                profile_family,
-                date_s(from),
-                date_s(to),
-                artifact_path.display().to_string(),
-                report_path.display().to_string(),
+                run.run_id,
+                run.command_family,
+                run.symbols_json,
+                run.profile_family,
+                date_s(run.from),
+                date_s(run.to),
+                run.artifact_path.display().to_string(),
+                run.report_path.display().to_string(),
                 STORE_DATA_VERSION,
                 now_s(),
             ],
@@ -952,10 +1004,106 @@ impl ResearchStore {
             research_runs: self.table_count("research_runs")?,
             profile_results: self.table_count("profile_results")?,
             trade_summaries: self.table_count("trade_summaries")?,
+            live_market_snapshots: self.table_count("live_market_snapshots")?,
+            live_signal_candidates: self.table_count("live_signal_candidates")?,
+            live_provider_health: self.table_count("live_provider_health")?,
             date_ranges: self.date_ranges()?,
             failed_cache_windows: self.failed_cache_windows()?,
             latest_runs: self.latest_runs()?,
         })
+    }
+
+    pub fn record_live_market_snapshot(&mut self, record: &LiveMarketSnapshotRecord) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let selected_symbol = record
+            .decision
+            .selected_signal
+            .as_ref()
+            .map(|signal| signal.symbol.as_str());
+        let selected_strategy = record
+            .decision
+            .selected_signal
+            .as_ref()
+            .map(|signal| signal.strategy.as_str());
+        tx.execute(
+            r#"
+            INSERT INTO live_market_snapshots (
+                snapshot_id, observed_at, as_of, provider, approved_strategy_id, profile_name,
+                decision_status, decision_reason, selected_symbol, selected_strategy,
+                source_live_signal, output_artifact, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                &record.snapshot_id,
+                record.observed_at.to_rfc3339(),
+                date_s(record.as_of),
+                record.provider.to_string(),
+                &record.approved_strategy_id,
+                &record.profile_name,
+                &record.decision.status,
+                &record.decision.reason,
+                selected_symbol,
+                selected_strategy,
+                &record.source_live_signal,
+                &record.output,
+                serde_json::to_string(record)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO live_provider_health (
+                snapshot_id, checked_at, provider, ok, status, latency_ms, symbols_requested,
+                symbols_ready, max_source_age_seconds, source_age_seconds, reason, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                &record.snapshot_id,
+                record.provider_health.checked_at.to_rfc3339(),
+                record.provider_health.provider.to_string(),
+                record.provider_health.ok,
+                &record.provider_health.status,
+                record.provider_health.latency_ms as i64,
+                record.provider_health.symbols_requested as i64,
+                record.provider_health.symbols_ready as i64,
+                record.provider_health.max_source_age_seconds as i64,
+                record
+                    .provider_health
+                    .source_age_seconds
+                    .map(|age| age as i64),
+                &record.provider_health.reason,
+                serde_json::to_string(&record.provider_health)?,
+            ],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                r#"
+                INSERT INTO live_signal_candidates (
+                    snapshot_id, candidate_rank, symbol, strategy, signal_status, entry_date,
+                    expiration, decision_status, reason, max_loss, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )?;
+            for candidate in &record.candidates {
+                insert.execute(params![
+                    &record.snapshot_id,
+                    candidate.candidate_rank as i64,
+                    &candidate.symbol,
+                    &candidate.strategy,
+                    candidate.signal_status.as_str(),
+                    candidate.entry_date.as_deref(),
+                    candidate.expiration.as_deref(),
+                    &candidate.decision_status,
+                    &candidate.reason,
+                    candidate.max_loss,
+                    serde_json::to_string(candidate)?,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn table_count(&self, table: &str) -> Result<i64> {
@@ -1042,6 +1190,33 @@ impl ResearchStore {
     }
 }
 
+pub fn default_research_store_path() -> PathBuf {
+    research_store_path_from_env(std::env::var_os(RESEARCH_STORE_PATH_ENV))
+}
+
+fn research_store_path_from_env(value: Option<std::ffi::OsString>) -> PathBuf {
+    value
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RESEARCH_STORE_PATH))
+}
+
+pub fn research_store_cache_sync_enabled() -> bool {
+    !env_flag_enabled(std::env::var_os(RESEARCH_STORE_SKIP_CACHE_SYNC_ENV))
+}
+
+fn env_flag_enabled(value: Option<std::ffi::OsString>) -> bool {
+    value
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn record_cached_theta_json(path: &Path, json: &Value) -> Result<()> {
     let Some(window) = cache_window_from_path(path) else {
         return Ok(());
@@ -1087,6 +1262,9 @@ pub fn record_portfolio_report(
 }
 
 pub fn sync_cache_windows_for_symbol(symbol: &str, raw_dir: &Path) -> Result<()> {
+    if !research_store_cache_sync_enabled() {
+        return Ok(());
+    }
     with_default_store(|store| {
         store.sync_symbol_cache_dir(symbol, raw_dir, None)?;
         Ok(())
@@ -1293,7 +1471,7 @@ fn read_oi_map_for_window(
 }
 
 fn read_oi_map_path(path: &Path) -> Result<HashMap<(NaiveDate, String), u32>> {
-    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let body = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let json: Value =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     parse_oi_map(&json)
@@ -1544,8 +1722,42 @@ fn compact_error(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_market::{LiveMarketEngineConfig, build_signal_artifact_live_market_snapshot};
+    use crate::live_signal::{
+        ApprovedPortfolioConstraints, ApprovedStrategy, LIVE_SIGNAL_SCHEMA_VERSION,
+        LiveSignalArtifact, ProductionApproval, ProductionApprovalStatus, SignalStatus,
+        TradeSignal,
+    };
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn research_store_path_honors_explicit_override() {
+        assert_eq!(
+            research_store_path_from_env(Some("var/research/offline.duckdb".into())),
+            PathBuf::from("var/research/offline.duckdb")
+        );
+        assert_eq!(
+            research_store_path_from_env(Some("".into())),
+            PathBuf::from(DEFAULT_RESEARCH_STORE_PATH)
+        );
+        assert_eq!(
+            research_store_path_from_env(None),
+            PathBuf::from(DEFAULT_RESEARCH_STORE_PATH)
+        );
+    }
+
+    #[test]
+    fn research_store_skip_cache_sync_flag_is_explicit() {
+        assert!(env_flag_enabled(Some("1".into())));
+        assert!(env_flag_enabled(Some("true".into())));
+        assert!(env_flag_enabled(Some("YES".into())));
+        assert!(env_flag_enabled(Some("on".into())));
+        assert!(!env_flag_enabled(Some("0".into())));
+        assert!(!env_flag_enabled(Some("false".into())));
+        assert!(!env_flag_enabled(Some("".into())));
+        assert!(!env_flag_enabled(None));
+    }
 
     #[test]
     fn schema_initializes_and_cache_window_upsert_is_idempotent() {
@@ -1722,6 +1934,129 @@ mod tests {
                 .option_rows_have_complete_coverage("NVDA", expiration, start, start, "put")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn live_market_snapshot_persists_audit_rows() {
+        let db_path = unique_test_path("live-market.duckdb");
+        let source_path = unique_test_path("live-market-source.json");
+        let output_path = unique_test_path("live-market-output.json");
+        let now = NaiveDate::from_ymd_opt(2026, 6, 30)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap()
+            .and_utc();
+        let approved = test_approved_strategy();
+        let source = test_source_artifact(
+            approved.clone(),
+            now,
+            test_trade_signal("2026-06-30", "put_debit_spread"),
+        );
+        fs::write(&source_path, serde_json::to_string(&source).unwrap()).unwrap();
+        let record = build_signal_artifact_live_market_snapshot(LiveMarketEngineConfig {
+            approved_strategy: approved,
+            source_live_signal: &source_path,
+            output: &output_path,
+            as_of: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            max_source_age_seconds: 45,
+            now,
+        })
+        .unwrap();
+
+        let mut store = ResearchStore::open(&db_path).unwrap();
+        store.record_live_market_snapshot(&record).unwrap();
+
+        assert_eq!(store.table_count("live_market_snapshots").unwrap(), 1);
+        assert_eq!(store.table_count("live_provider_health").unwrap(), 1);
+        assert_eq!(store.table_count("live_signal_candidates").unwrap(), 1);
+    }
+
+    fn test_approved_strategy() -> ApprovedStrategy {
+        ApprovedStrategy {
+            strategy_id: "approved_v1".to_owned(),
+            profile_name: "profile_v1".to_owned(),
+            research_from: None,
+            live_detector_lookback_days: Some(30),
+            symbols: vec!["TSLA".to_owned()],
+            portfolio_constraints: ApprovedPortfolioConstraints {
+                capital_budget: 10_000.0,
+                max_symbol_allocation_pct: 0.5,
+                max_open_positions: 2,
+                max_positions_per_symbol: 1,
+                max_total_trades_per_symbol: None,
+                portfolio_drawdown_cooldown_trigger_pct: None,
+                portfolio_drawdown_cooldown_days: 0,
+                symbol_drawdown_cooldown_trigger_pct: None,
+                symbol_drawdown_cooldown_days: 0,
+            },
+            allowed_live_strategies: vec!["put_debit_spread".to_owned()],
+            canary_risk_policy_id: "risk_v1".to_owned(),
+            production_approval: Some(ProductionApproval {
+                status: ProductionApprovalStatus::OperatorRiskOverride,
+                approved_at: NaiveDate::from_ymd_opt(2026, 6, 30)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+                approved_by: "test".to_owned(),
+                reason: "test approval".to_owned(),
+                source_canary_status: Some("blocked".to_owned()),
+                max_order_max_loss: Some(150.0),
+            }),
+        }
+    }
+
+    fn test_trade_signal(entry_date: &str, strategy: &str) -> TradeSignal {
+        TradeSignal {
+            status: SignalStatus::NewEntry,
+            symbol: "TSLA".to_owned(),
+            strategy: strategy.to_owned(),
+            entry_date: Some(entry_date.to_owned()),
+            exit_date: Some(entry_date.to_owned()),
+            expiration: Some("2026-07-02".to_owned()),
+            short_put: None,
+            short_strike: Some(350.0),
+            long_strike: Some(355.0),
+            wheel_covered_call_expiration: None,
+            wheel_covered_call_strike: None,
+            width: Some(5.0),
+            entry_credit: Some(-1.0),
+            max_loss: Some(100.0),
+            reserve: None,
+            reserve_basis: None,
+            pnl: None,
+            dte_entry: Some(2),
+            days_held: Some(0),
+            exit_reason: None,
+            short_delta: None,
+            long_delta: None,
+            short_oi: None,
+            long_oi: None,
+            short_iv: None,
+            long_iv: None,
+            underlying_price: None,
+            execution_rules: None,
+        }
+    }
+
+    fn test_source_artifact(
+        approved_strategy: ApprovedStrategy,
+        generated_at: chrono::DateTime<Utc>,
+        signal: TradeSignal,
+    ) -> LiveSignalArtifact {
+        LiveSignalArtifact {
+            schema_version: LIVE_SIGNAL_SCHEMA_VERSION,
+            strategy_id: approved_strategy.strategy_id.clone(),
+            profile_name: approved_strategy.profile_name.clone(),
+            as_of: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            generated_at,
+            market_data_through: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            approved_strategy,
+            signals: vec![signal.clone()],
+            selected_signal: Some(signal),
+            source_run_id: "source_run".to_owned(),
+            source_report: "source_report".to_owned(),
+        }
     }
 
     fn unique_test_path(name: &str) -> PathBuf {

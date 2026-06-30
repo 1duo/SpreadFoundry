@@ -69,8 +69,16 @@ pub enum ExecutionError {
     UnsupportedCashSecuredPut,
     #[error("credit spread intent must be two legs with the same symbol, expiration, and right")]
     UnsupportedCreditSpread,
+    #[error(
+        "credit spread close intent must buy-to-close the short leg and sell-to-close the long leg"
+    )]
+    UnsupportedCreditSpreadClose,
     #[error("debit spread intent must be two legs with the same symbol, expiration, and right")]
     UnsupportedDebitSpread,
+    #[error(
+        "debit spread close intent must sell-to-close the long leg and buy-to-close the short leg"
+    )]
+    UnsupportedDebitSpreadClose,
 }
 
 pub fn conservative_credit_spread_entry_credit(
@@ -216,6 +224,70 @@ pub fn debit_spread_open_intent(
     Ok(intent)
 }
 
+pub fn credit_spread_close_intent(
+    short_key: OptionKey,
+    long_key: OptionKey,
+    quantity: u32,
+    limit_debit: Decimal,
+    strategy: impl Into<String>,
+) -> Result<OptionOrderIntent, ExecutionError> {
+    let intent = OptionOrderIntent {
+        symbol: short_key.underlying.clone(),
+        strategy: strategy.into(),
+        order_effect: OptionOrderEffect::Debit,
+        limit_price: limit_debit,
+        time_in_force: TimeInForce::Day,
+        legs: vec![
+            OptionOrderLeg {
+                side: OptionOrderSide::Buy,
+                position_effect: PositionEffect::Close,
+                key: short_key,
+                quantity,
+            },
+            OptionOrderLeg {
+                side: OptionOrderSide::Sell,
+                position_effect: PositionEffect::Close,
+                key: long_key,
+                quantity,
+            },
+        ],
+    };
+    validate_credit_spread_close_intent(&intent)?;
+    Ok(intent)
+}
+
+pub fn debit_spread_close_intent(
+    long_key: OptionKey,
+    short_key: OptionKey,
+    quantity: u32,
+    limit_credit: Decimal,
+    strategy: impl Into<String>,
+) -> Result<OptionOrderIntent, ExecutionError> {
+    let intent = OptionOrderIntent {
+        symbol: long_key.underlying.clone(),
+        strategy: strategy.into(),
+        order_effect: OptionOrderEffect::Credit,
+        limit_price: limit_credit,
+        time_in_force: TimeInForce::Day,
+        legs: vec![
+            OptionOrderLeg {
+                side: OptionOrderSide::Sell,
+                position_effect: PositionEffect::Close,
+                key: long_key,
+                quantity,
+            },
+            OptionOrderLeg {
+                side: OptionOrderSide::Buy,
+                position_effect: PositionEffect::Close,
+                key: short_key,
+                quantity,
+            },
+        ],
+    };
+    validate_debit_spread_close_intent(&intent)?;
+    Ok(intent)
+}
+
 fn validate_common_intent(intent: &OptionOrderIntent) -> Result<(), ExecutionError> {
     if intent.legs.is_empty() {
         return Err(ExecutionError::MissingLegs);
@@ -290,6 +362,42 @@ fn validate_debit_spread_intent(intent: &OptionOrderIntent) -> Result<(), Execut
         || long_leg.key.right != short_leg.key.right
     {
         return Err(ExecutionError::UnsupportedDebitSpread);
+    }
+    Ok(())
+}
+
+fn validate_credit_spread_close_intent(intent: &OptionOrderIntent) -> Result<(), ExecutionError> {
+    validate_common_intent(intent)?;
+    let [short_leg, long_leg] = intent.legs.as_slice() else {
+        return Err(ExecutionError::UnsupportedCreditSpreadClose);
+    };
+    if intent.order_effect != OptionOrderEffect::Debit
+        || short_leg.side != OptionOrderSide::Buy
+        || long_leg.side != OptionOrderSide::Sell
+        || short_leg.position_effect != PositionEffect::Close
+        || long_leg.position_effect != PositionEffect::Close
+        || short_leg.key.expiration != long_leg.key.expiration
+        || short_leg.key.right != long_leg.key.right
+    {
+        return Err(ExecutionError::UnsupportedCreditSpreadClose);
+    }
+    Ok(())
+}
+
+fn validate_debit_spread_close_intent(intent: &OptionOrderIntent) -> Result<(), ExecutionError> {
+    validate_common_intent(intent)?;
+    let [long_leg, short_leg] = intent.legs.as_slice() else {
+        return Err(ExecutionError::UnsupportedDebitSpreadClose);
+    };
+    if intent.order_effect != OptionOrderEffect::Credit
+        || long_leg.side != OptionOrderSide::Sell
+        || short_leg.side != OptionOrderSide::Buy
+        || long_leg.position_effect != PositionEffect::Close
+        || short_leg.position_effect != PositionEffect::Close
+        || long_leg.key.expiration != short_leg.key.expiration
+        || long_leg.key.right != short_leg.key.right
+    {
+        return Err(ExecutionError::UnsupportedDebitSpreadClose);
     }
     Ok(())
 }
@@ -390,5 +498,80 @@ mod tests {
         let err = debit_spread_open_intent(long, short, 1, dec!(4.50), "bad_spread").unwrap_err();
 
         assert!(matches!(err, ExecutionError::UnsupportedDebitSpread));
+    }
+
+    #[test]
+    fn credit_spread_close_intent_is_atomic_buy_then_sell() {
+        let expiration = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let short = OptionKey::new("TSLA", expiration, dec!(350), OptionRight::Put);
+        let long = OptionKey::new("TSLA", expiration, dec!(345), OptionRight::Put);
+
+        let intent = credit_spread_close_intent(
+            short.clone(),
+            long.clone(),
+            1,
+            dec!(0.60),
+            "put_credit_spread",
+        )
+        .unwrap();
+
+        assert_eq!(intent.symbol, "TSLA");
+        assert_eq!(intent.order_effect, OptionOrderEffect::Debit);
+        assert_eq!(intent.quantity(), 1);
+        assert_eq!(intent.legs[0].side, OptionOrderSide::Buy);
+        assert_eq!(intent.legs[0].position_effect, PositionEffect::Close);
+        assert_eq!(intent.legs[0].key, short);
+        assert_eq!(intent.legs[1].side, OptionOrderSide::Sell);
+        assert_eq!(intent.legs[1].position_effect, PositionEffect::Close);
+        assert_eq!(intent.legs[1].key, long);
+    }
+
+    #[test]
+    fn credit_spread_close_intent_rejects_mismatched_rights() {
+        let expiration = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let short = OptionKey::new("TSLA", expiration, dec!(350), OptionRight::Put);
+        let long = OptionKey::new("TSLA", expiration, dec!(345), OptionRight::Call);
+
+        let err = credit_spread_close_intent(short, long, 1, dec!(0.60), "bad_close").unwrap_err();
+
+        assert!(matches!(err, ExecutionError::UnsupportedCreditSpreadClose));
+    }
+
+    #[test]
+    fn debit_spread_close_intent_is_atomic_sell_then_buy() {
+        let expiration = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let long = OptionKey::new("ORCL", expiration, dec!(220), OptionRight::Call);
+        let short = OptionKey::new("ORCL", expiration, dec!(225), OptionRight::Call);
+
+        let intent = debit_spread_close_intent(
+            long.clone(),
+            short.clone(),
+            1,
+            dec!(3.25),
+            "call_debit_spread",
+        )
+        .unwrap();
+
+        assert_eq!(intent.symbol, "ORCL");
+        assert_eq!(intent.order_effect, OptionOrderEffect::Credit);
+        assert_eq!(intent.quantity(), 1);
+        assert_eq!(intent.legs[0].side, OptionOrderSide::Sell);
+        assert_eq!(intent.legs[0].position_effect, PositionEffect::Close);
+        assert_eq!(intent.legs[0].key, long);
+        assert_eq!(intent.legs[1].side, OptionOrderSide::Buy);
+        assert_eq!(intent.legs[1].position_effect, PositionEffect::Close);
+        assert_eq!(intent.legs[1].key, short);
+    }
+
+    #[test]
+    fn debit_spread_close_intent_rejects_mismatched_expirations() {
+        let long_expiration = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let short_expiration = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let long = OptionKey::new("ORCL", long_expiration, dec!(220), OptionRight::Call);
+        let short = OptionKey::new("ORCL", short_expiration, dec!(225), OptionRight::Call);
+
+        let err = debit_spread_close_intent(long, short, 1, dec!(3.25), "bad_close").unwrap_err();
+
+        assert!(matches!(err, ExecutionError::UnsupportedDebitSpreadClose));
     }
 }

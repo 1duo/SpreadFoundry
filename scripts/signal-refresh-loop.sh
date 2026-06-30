@@ -8,6 +8,7 @@ refresh_command="scripts/refresh-live-signal.sh"
 interval_seconds="${SPREAD_SIGNAL_REFRESH_INTERVAL_SECONDS:-300}"
 timeout_seconds="${SPREAD_SIGNAL_REFRESH_TIMEOUT_SECONDS:-900}"
 state_file="${SPREAD_SIGNAL_REFRESH_STATE_FILE:-var/signal_refresh_last.json}"
+detail_state_file="${SPREAD_SIGNAL_REFRESH_DETAIL_STATE_FILE:-var/live_signal_refresh_last.json}"
 log_file="${SPREAD_SIGNAL_REFRESH_LOG_FILE:-var/signal_refresh.log}"
 mode="${1:-loop}"
 
@@ -24,6 +25,22 @@ write_state() {
   mkdir -p "$(dirname "$state_file")"
   printf '{\n  "started_at": "%s",\n  "finished_at": "%s",\n  "exit_code": %s,\n  "command": "%s"\n}\n' \
 	    "$started_at" "$finished_at" "$exit_code" "$escaped_command" > "$state_file"
+}
+
+write_detail_timeout_state() {
+  local started_at="$1"
+  local finished_at="$2"
+  local run_to approved_strategy artifact reason
+  run_to="${SPREAD_SIGNAL_REFRESH_TO:-$(date -u '+%Y-%m-%d')}"
+  approved_strategy="${SPREAD_APPROVED_STRATEGY:-configs/approved_strategy.json}"
+  artifact="${SPREAD_LIVE_SIGNAL_ARTIFACT:-var/live_signal.json}"
+  reason="approved strategy signal refresh exceeded ${timeout_seconds}s Rust timeout plus watchdog grace"
+  mkdir -p "$(dirname "$detail_state_file")"
+  printf '{\n  "started_at": "%s",\n  "finished_at": "%s",\n  "status": "selector_timeout",\n  "exit_code": 124,\n  "run_to": "%s",\n  "run_dir": "",\n  "approved_strategy": "%s",\n  "live_signal_artifact": "%s",\n  "reason": "%s"\n}\n' \
+    "$started_at" "$finished_at" "$run_to" \
+    "$(printf '%s' "$approved_strategy" | json_escape)" \
+    "$(printf '%s' "$artifact" | json_escape)" \
+    "$(printf '%s' "$reason" | json_escape)" > "$detail_state_file"
 }
 
 terminate_process_tree() {
@@ -46,7 +63,10 @@ run_once() {
   bash -lc "$refresh_command" >> "$log_file" 2>&1 &
   refresh_pid="$!"
   (
-    sleep "$timeout_seconds"
+    # The Rust refresh command has its own timeout and writes the detailed
+    # terminal state. Keep the shell watchdog later so Rust can report timeout
+    # and release its refresh lock before the process tree is terminated.
+    sleep "$((timeout_seconds + 30))"
     if kill -0 "$refresh_pid" 2>/dev/null; then
       touch "$timeout_file"
       terminate_process_tree "$refresh_pid" TERM
@@ -61,12 +81,13 @@ run_once() {
   exit_code="$?"
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
+  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   if [[ -f "$timeout_file" ]]; then
     exit_code=124
     rm -f "$timeout_file"
+    write_detail_timeout_state "$started_at" "$finished_at"
   fi
   set -e
-  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   write_state "$started_at" "$finished_at" "$exit_code"
   return "$exit_code"
 }

@@ -397,6 +397,10 @@ pub struct PortfolioLatestAction {
     #[serde(default)]
     pub long_strike: f64,
     #[serde(default)]
+    pub wheel_covered_call_expiration: Option<NaiveDate>,
+    #[serde(default)]
+    pub wheel_covered_call_strike: Option<f64>,
+    #[serde(default)]
     pub width: f64,
     pub short_delta: f64,
     #[serde(default)]
@@ -2367,7 +2371,13 @@ async fn run_portfolio_research(
                 &decision_metrics,
                 gate_pass,
             );
-            let latest_actions = portfolio_latest_actions(&allocation.trades, request.to, 7);
+            let latest_actions = portfolio_latest_actions(
+                &allocation.trades,
+                request.to,
+                7,
+                &symbol_data,
+                &selector_profile,
+            );
             PortfolioWheelProfileResult {
                 profile: selector_profile.summary_profile,
                 metrics,
@@ -3579,20 +3589,26 @@ fn portfolio_latest_actions(
     trades: &[PortfolioWheelTrade],
     as_of: NaiveDate,
     lookback_days: i64,
+    symbol_data: &[PortfolioWheelSymbolData],
+    selector_profile: &PortfolioSelectorProfile,
 ) -> Vec<PortfolioLatestAction> {
     let recent_from = as_of - Duration::days(lookback_days.max(0));
+    let symbol_data_by_symbol = symbol_data
+        .iter()
+        .map(|data| (data.summary.symbol.as_str(), data))
+        .collect::<BTreeMap<_, _>>();
     let mut actions = trades
         .iter()
-        .filter(|trade| trade.trade.entry_date >= recent_from || trade.trade.exit_date > as_of)
+        .filter(|trade| trade.trade.entry_date >= recent_from || trade.trade.exit_date >= as_of)
         .map(|trade| {
             let status = if trade.trade.entry_date == as_of {
                 "new_entry"
-            } else if trade.trade.exit_date > as_of {
+            } else if trade.trade.exit_date >= as_of {
                 "already_open"
             } else {
                 "recent_closed"
             };
-            PortfolioLatestAction {
+            let mut action = PortfolioLatestAction {
                 status: status.to_owned(),
                 symbol: trade.symbol.clone(),
                 strategy: trade.strategy,
@@ -3615,7 +3631,22 @@ fn portfolio_latest_actions(
                 short_iv: trade.trade.short_iv,
                 long_iv: trade.trade.long_iv,
                 underlying_price: trade.trade.underlying_price,
+                wheel_covered_call_expiration: None,
+                wheel_covered_call_strike: None,
+            };
+            if action.status == "already_open"
+                && action.strategy == SpreadStructure::Wheel
+                && let (Some(profile), Some(data)) = (
+                    selector_profile.wheel_profile.as_ref(),
+                    symbol_data_by_symbol.get(trade.symbol.as_str()).copied(),
+                )
+                && let Some(target) =
+                    wheel_covered_call_management_target(&trade.trade, as_of, data, profile)
+            {
+                action.wheel_covered_call_expiration = Some(target.expiration);
+                action.wheel_covered_call_strike = Some(target.row.strike);
             }
+            action
         })
         .collect::<Vec<_>>();
     actions.sort_by(|a, b| {
@@ -3627,6 +3658,23 @@ fn portfolio_latest_actions(
     });
     actions.truncate(20);
     actions
+}
+
+fn wheel_covered_call_management_target<'a>(
+    trade: &ResearchTrade,
+    as_of: NaiveDate,
+    data: &'a PortfolioWheelSymbolData,
+    profile: &ResearchProfile,
+) -> Option<CoveredCallSelection<'a>> {
+    if trade.entry_date > as_of || trade.exit_date <= as_of {
+        return None;
+    }
+    if trade.short_put <= 0.0 || !trade.short_put.is_finite() {
+        return None;
+    }
+    let minimum_call_strike =
+        trade.short_put * profile.covered_call_min_strike_pct_of_assigned.max(0.0);
+    select_covered_call_on_date(as_of, minimum_call_strike, &data.call_rows_by_date, profile)
 }
 
 fn portfolio_wheel_gate(metrics: &ResearchMetrics, capital_budget: f64) -> (String, bool, String) {
@@ -10230,18 +10278,7 @@ fn select_covered_call<'a>(
         for expiring_row in rows {
             let row = &expiring_row.row;
             let expiration = expiring_row.expiration;
-            let dte = (expiration - row.date).num_days();
-            if dte < profile.min_dte || dte > profile.max_dte {
-                continue;
-            }
-            let delta = row.delta.abs();
-            if row.strike < minimum_call_strike
-                || delta < profile.min_short_delta_abs
-                || delta > profile.max_short_delta_abs
-                || row.open_interest < profile.min_long_oi
-                || !quote_width_allowed(row, profile)
-                || !iv_allowed(row, profile)
-            {
+            if !covered_call_row_allowed(row, expiration, minimum_call_strike, profile) {
                 continue;
             }
             let candidate = CoveredCallSelection { expiration, row };
@@ -10264,6 +10301,58 @@ fn select_covered_call<'a>(
         }
     }
     best
+}
+
+fn select_covered_call_on_date<'a>(
+    date: NaiveDate,
+    minimum_call_strike: f64,
+    call_rows_by_date: &'a BTreeMap<NaiveDate, Vec<ExpiringOptionDay>>,
+    profile: &ResearchProfile,
+) -> Option<CoveredCallSelection<'a>> {
+    let rows = call_rows_by_date.get(&date)?;
+    let mut best: Option<CoveredCallSelection<'a>> = None;
+    for expiring_row in rows {
+        let row = &expiring_row.row;
+        let expiration = expiring_row.expiration;
+        if !covered_call_row_allowed(row, expiration, minimum_call_strike, profile) {
+            continue;
+        }
+        let candidate = CoveredCallSelection { expiration, row };
+        best = match best {
+            None => Some(candidate),
+            Some(current) => {
+                let order = expiration
+                    .cmp(&current.expiration)
+                    .then_with(|| row.bid.total_cmp(&current.row.bid).reverse())
+                    .then_with(|| row.strike.total_cmp(&current.row.strike));
+                if order == Ordering::Less {
+                    Some(candidate)
+                } else {
+                    Some(current)
+                }
+            }
+        };
+    }
+    best
+}
+
+fn covered_call_row_allowed(
+    row: &OptionDay,
+    expiration: NaiveDate,
+    minimum_call_strike: f64,
+    profile: &ResearchProfile,
+) -> bool {
+    let dte = (expiration - row.date).num_days();
+    if dte < profile.min_dte || dte > profile.max_dte {
+        return false;
+    }
+    let delta = row.delta.abs();
+    row.strike >= minimum_call_strike
+        && delta >= profile.min_short_delta_abs
+        && delta <= profile.max_short_delta_abs
+        && row.open_interest >= profile.min_long_oi
+        && quote_width_allowed(row, profile)
+        && iv_allowed(row, profile)
 }
 
 fn option_row_on_or_before(
@@ -13204,6 +13293,96 @@ mod tests {
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].strategy, SpreadStructure::PutCreditSpread);
         assert!((opportunities[0].trade.pnl - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn portfolio_latest_actions_export_same_day_wheel_covered_call_target() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let put_expiration = NaiveDate::from_ymd_opt(2026, 1, 9).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
+        let target_call_expiration = NaiveDate::from_ymd_opt(2026, 1, 16).unwrap();
+        let terminal_exit = NaiveDate::from_ymd_opt(2026, 1, 23).unwrap();
+        let mut profile = ResearchProfile::weekly_baseline();
+        profile.structure = SpreadStructure::Wheel;
+        profile.min_dte = 1;
+        profile.max_dte = 14;
+        profile.min_short_delta_abs = 0.10;
+        profile.max_short_delta_abs = 0.30;
+        profile.min_long_oi = 1;
+        profile.covered_call_min_strike_pct_of_assigned = 1.0;
+
+        let mut opportunity =
+            portfolio_wheel_opportunity("CRWV", entry_date, terminal_exit, 8_000.0, 250.0);
+        opportunity.trade.expiration = put_expiration;
+        opportunity.trade.short_put = 80.0;
+        opportunity.trade.long_put = 90.0;
+        opportunity.trade.exit_reason = "covered_call_assigned".to_owned();
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: opportunity.strategy,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let mut call_rows_by_expiration = BTreeMap::new();
+        call_rows_by_expiration.insert(
+            target_call_expiration,
+            vec![option_day(as_of, 85.0, 0.65, 0.80, 0.20, 83.0)],
+        );
+        let data = PortfolioWheelSymbolData {
+            summary: PortfolioWheelLoadedSymbol {
+                symbol: "CRWV".to_owned(),
+                requested_from: entry_date,
+                from: entry_date,
+                to: as_of,
+                expirations_discovered: 1,
+                expirations_skipped_before_data: 0,
+                expirations_loaded: 1,
+                put_expirations_loaded: 0,
+                call_expirations_loaded: 1,
+                rows_loaded: 1,
+                expirations_failed: 0,
+                expiration_load_failures: Vec::new(),
+            },
+            put_rows_by_expiration: BTreeMap::new(),
+            call_rows_by_expiration: call_rows_by_expiration.clone(),
+            call_rows_by_date: expiring_rows_by_date(&call_rows_by_expiration),
+            put_lookup: HashMap::new(),
+            call_lookup: build_lookup(&call_rows_by_expiration),
+            call_underlying_by_date: underlying_by_date_from_expirations(&call_rows_by_expiration),
+        };
+        let selector = PortfolioSelectorProfile::single(profile);
+
+        let actions = portfolio_latest_actions(&[trade], as_of, 7, &[data], &selector);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].status, "already_open");
+        assert_eq!(actions[0].exit_date, terminal_exit);
+        assert_eq!(actions[0].long_strike, 90.0);
+        assert_eq!(
+            actions[0].wheel_covered_call_expiration,
+            Some(target_call_expiration)
+        );
+        assert_eq!(actions[0].wheel_covered_call_strike, Some(85.0));
+    }
+
+    #[test]
+    fn portfolio_latest_actions_keeps_same_day_exit_manageable() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
+        let opportunity = portfolio_wheel_opportunity("CRWV", entry_date, as_of, 8_000.0, -250.0);
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: opportunity.strategy,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let selector = PortfolioSelectorProfile::single(ResearchProfile::weekly_wheel_baseline());
+
+        let actions = portfolio_latest_actions(&[trade], as_of, 7, &[], &selector);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].status, "already_open");
+        assert_eq!(actions[0].exit_date, as_of);
     }
 
     #[test]

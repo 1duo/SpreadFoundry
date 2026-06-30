@@ -12,11 +12,19 @@ use spreadfoundry::broker::{
 };
 use spreadfoundry::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
-    TimeInForce, cash_secured_put_open_intent, debit_spread_open_intent,
+    TimeInForce, cash_secured_put_open_intent, conservative_short_spread_exit_debit_f64,
+    credit_spread_close_intent, credit_spread_open_intent, debit_spread_close_intent,
+    debit_spread_open_intent,
 };
 use spreadfoundry::fixture;
+use spreadfoundry::live_market::{
+    DEFAULT_LIVE_MARKET_INTERVAL_SECONDS, DEFAULT_LIVE_MARKET_MAX_SOURCE_AGE_SECONDS,
+    LiveMarketDecision, LiveMarketEngineConfig, LiveMarketProviderHealth, LiveMarketSnapshotRecord,
+    build_signal_artifact_live_market_snapshot,
+};
 use spreadfoundry::live_signal::{
-    ApprovedStrategy, LIVE_SIGNAL_SCHEMA_VERSION, LiveSignalArtifact, SignalStatus, TradeSignal,
+    ApprovedStrategy, LIVE_SIGNAL_SCHEMA_VERSION, LiveExecutionRules, LiveSignalArtifact,
+    SignalStatus, TradeSignal,
 };
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
@@ -24,16 +32,16 @@ use spreadfoundry::research::{
     DEFAULT_PLATEAU_UNIVERSE_SYMBOLS, DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV, DEFAULT_RESEARCH_FROM,
     DEFAULT_WEEKLY_RESEARCH_SYMBOLS, DEFAULT_WEEKLY_RESEARCH_SYMBOLS_CSV, DetectorStrategySummary,
     ExecutionStrategySummary, OptionCacheCoverageReport, OptionCacheCoverageRequest,
-    PortfolioWheelReport, PortfolioWheelResearchRequest, ResearchMetrics, ResearchProfileFamily,
-    ResearchReport, ResearchRequest, WarmOptionCacheCoverageReport, WarmOptionCacheCoverageRequest,
-    WeeklySignalGateAuditReport, WeeklySignalGateAuditRequest, audit_option_cache_coverage,
-    audit_weekly_signal_gates, run_portfolio_selector_research,
+    PortfolioWheelReport, PortfolioWheelResearchRequest, ResearchMetrics, ResearchProfile,
+    ResearchProfileFamily, ResearchReport, ResearchRequest, WarmOptionCacheCoverageReport,
+    WarmOptionCacheCoverageRequest, WeeklySignalGateAuditReport, WeeklySignalGateAuditRequest,
+    audit_option_cache_coverage, audit_weekly_signal_gates, run_portfolio_selector_research,
     run_portfolio_selector_research_for_profile, run_portfolio_wheel_research, run_symbol_research,
     warm_option_cache_coverage,
 };
 use spreadfoundry::research_store::{
-    DEFAULT_RESEARCH_STORE_PATH, ResearchStore, ResearchStoreHealth, ResearchStoreImportReport,
-    ResearchStorePerfReport, import_research_store, research_store_perf_check,
+    ResearchStore, ResearchStoreHealth, ResearchStoreImportReport, ResearchStorePerfReport,
+    default_research_store_path, import_research_store, research_store_perf_check,
 };
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
@@ -45,7 +53,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration as StdDuration;
+use std::sync::mpsc;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 use wait_timeout::ChildExt;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
@@ -159,6 +168,30 @@ enum Commands {
         market_window_only: bool,
         #[arg(long, default_value_t = 900)]
         timeout_seconds: u64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    LiveMarketEngine {
+        #[arg(long, default_value = "configs/approved_strategy.json")]
+        approved_strategy: PathBuf,
+        #[arg(long, default_value = "var/live_signal_refresh_source.json")]
+        source_live_signal: PathBuf,
+        #[arg(long, default_value = "var/live_signal.json")]
+        output: PathBuf,
+        #[arg(long, default_value = "var/live_market_engine_health.json")]
+        state_file: PathBuf,
+        #[arg(long, default_value = "data/spreadfoundry.duckdb")]
+        store: PathBuf,
+        #[arg(long)]
+        as_of: Option<NaiveDate>,
+        #[arg(long, default_value_t = DEFAULT_LIVE_MARKET_INTERVAL_SECONDS)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = DEFAULT_LIVE_MARKET_MAX_SOURCE_AGE_SECONDS)]
+        max_source_age_seconds: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        market_window_only: bool,
+        #[arg(long, default_value_t = false)]
+        once: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -590,6 +623,16 @@ trait ExecutionBrokerView {
     fn capabilities(&self) -> &BrokerCapabilities;
     fn live_orders_enabled(&self) -> bool;
 
+    fn assert_credit_spread_live_supported(&self) -> Result<()> {
+        if !self.capabilities().multi_leg_options {
+            let broker = broker_label(self.kind());
+            anyhow::bail!(
+                "credit spread live execution is disabled: {broker} adapter has no proven atomic multi-leg support"
+            );
+        }
+        Ok(())
+    }
+
     fn assert_debit_spread_live_supported(&self) -> Result<()> {
         if !self.capabilities().multi_leg_options {
             let broker = broker_label(self.kind());
@@ -900,6 +943,34 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Commands::LiveMarketEngine {
+            approved_strategy,
+            source_live_signal,
+            output,
+            state_file,
+            store,
+            as_of,
+            interval_seconds,
+            max_source_age_seconds,
+            market_window_only,
+            once,
+            json,
+        } => {
+            run_live_market_engine(LiveMarketEngineArgs {
+                approved_strategy,
+                source_live_signal,
+                output,
+                state_file,
+                store,
+                as_of,
+                interval_seconds,
+                max_source_age_seconds,
+                market_window_only,
+                once,
+                json,
+            })
+            .await
+        }
         Commands::ExecutionReadiness {
             live_signal,
             as_of,
@@ -1032,7 +1103,8 @@ async fn main() -> Result<()> {
         } => execution_worker_snapshot(&health_output, &pid_file, max_age_seconds, json),
         Commands::ResearchStoreHealth { json } => {
             let store = ResearchStore::open_default()?;
-            let report = store.health(Path::new(DEFAULT_RESEARCH_STORE_PATH))?;
+            let store_path = default_research_store_path();
+            let report = store.health(&store_path)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1353,6 +1425,7 @@ async fn main() -> Result<()> {
             let report = if let Some(approved_strategy_path) = approved_strategy {
                 let approved_strategy = read_approved_strategy(&approved_strategy_path)?;
                 let constraints = approved_strategy.portfolio_constraints.clone();
+                let from = approved_strategy_research_from(&approved_strategy, from);
                 run_portfolio_selector_research_for_profile(
                     PortfolioWheelResearchRequest {
                         symbols: approved_strategy.symbols.clone(),
@@ -1431,6 +1504,16 @@ fn export_live_signal(
     output: &Path,
     as_of: Option<NaiveDate>,
 ) -> Result<()> {
+    export_live_signal_with_gate(run, approved_strategy_path, output, as_of, true)
+}
+
+fn export_live_signal_with_gate(
+    run: &Path,
+    approved_strategy_path: &Path,
+    output: &Path,
+    as_of: Option<NaiveDate>,
+    require_research_gate: bool,
+) -> Result<()> {
     let report_path = portfolio_report_json_path(run);
     let report: PortfolioWheelReport = serde_json::from_str(
         &fs::read_to_string(&report_path)
@@ -1462,18 +1545,27 @@ fn export_live_signal(
                 report_path.display()
             )
         })?;
-    if !profile.gate_pass {
+    if !profile.gate_pass && require_research_gate {
         anyhow::bail!(
             "approved profile {} does not pass research gate: {}",
             approved_strategy.profile_name,
             profile.gate_reason
         );
     }
+    if !profile.gate_pass && !require_research_gate {
+        approved_strategy.production_approval.as_ref().with_context(|| {
+            format!(
+                "approved profile {} failed detector-window gate and has no production approval",
+                approved_strategy.profile_name
+            )
+        })?;
+    }
     let as_of = as_of.unwrap_or(report.to);
+    let execution_rules = live_execution_rules_from_profile(&profile.profile);
     let signals = profile
         .latest_actions
         .iter()
-        .map(live_trade_signal_from_latest_action)
+        .map(|action| live_trade_signal_from_latest_action(action, &execution_rules))
         .collect::<Vec<_>>();
     let as_of_string = as_of.to_string();
     let selected_signal = signals
@@ -1509,6 +1601,7 @@ fn export_live_signal(
 
 fn live_trade_signal_from_latest_action(
     action: &spreadfoundry::research::PortfolioLatestAction,
+    execution_rules: &LiveExecutionRules,
 ) -> TradeSignal {
     let status = match action.status.as_str() {
         "new_entry" => SignalStatus::NewEntry,
@@ -1525,6 +1618,10 @@ fn live_trade_signal_from_latest_action(
         short_put: Some(action.short_strike),
         short_strike: Some(action.short_strike),
         long_strike: Some(action.long_strike),
+        wheel_covered_call_expiration: action
+            .wheel_covered_call_expiration
+            .map(|date| date.to_string()),
+        wheel_covered_call_strike: action.wheel_covered_call_strike,
         width: Some(action.width),
         entry_credit: Some(action.entry_credit),
         max_loss: Some(action.max_loss),
@@ -1541,6 +1638,16 @@ fn live_trade_signal_from_latest_action(
         short_iv: Some(action.short_iv),
         long_iv: Some(action.long_iv),
         underlying_price: Some(action.underlying_price),
+        execution_rules: Some(execution_rules.clone()),
+    }
+}
+
+fn live_execution_rules_from_profile(profile: &ResearchProfile) -> LiveExecutionRules {
+    LiveExecutionRules {
+        take_profit_pct: profile.take_profit_pct,
+        stop_loss_multiple: profile.stop_loss_multiple,
+        force_close_dte: profile.force_close_dte,
+        max_hold_days: profile.max_hold_days,
     }
 }
 
@@ -1579,7 +1686,7 @@ fn live_signal_status(
     as_of: Option<NaiveDate>,
     require_signal: bool,
 ) -> Result<()> {
-    let as_of = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let as_of = as_of.unwrap_or_else(|| execution_default_as_of(Utc::now()));
     let artifact: LiveSignalArtifact = serde_json::from_str(
         &fs::read_to_string(live_signal)
             .with_context(|| format!("read live signal artifact {}", live_signal.display()))?,
@@ -1587,17 +1694,23 @@ fn live_signal_status(
     .with_context(|| format!("parse live signal artifact {}", live_signal.display()))?;
     artifact.validate_contract()?;
     let as_of_string = as_of.to_string();
-    let selected = artifact
+    let selected_entry = artifact
         .selected_signal
         .as_ref()
         .filter(|signal| signal.entry_date.as_deref() == Some(as_of_string.as_str()));
+    let management_signals = if selected_entry.is_none() {
+        live_management_signals(&artifact, as_of).map_err(anyhow::Error::msg)?
+    } else {
+        Vec::new()
+    };
+    let actionable_signal = selected_entry.or_else(|| management_signals.first());
     println!(
         "strategy_id={} profile={} as_of={} generated_at={} selected_signal={}",
         artifact.strategy_id,
         artifact.profile_name,
         as_of,
         artifact.generated_at.to_rfc3339(),
-        selected.is_some()
+        actionable_signal.is_some()
     );
     if !artifact.signals.is_empty() {
         println!("signals={}", artifact.signals.len());
@@ -1613,9 +1726,9 @@ fn live_signal_status(
             );
         }
     }
-    if require_signal && selected.is_none() {
+    if require_signal && actionable_signal.is_none() {
         anyhow::bail!(
-            "no selected live signal in {}; refresh live signal from approved strategy",
+            "no selected live entry or open-position management signal in {}; refresh live signal from approved strategy",
             live_signal.display()
         );
     }
@@ -1649,7 +1762,7 @@ fn market_session_status(require_open: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RefreshLiveSignalArgs {
     approved_strategy: PathBuf,
     output: PathBuf,
@@ -1679,11 +1792,63 @@ struct LiveSignalRefreshState {
     reason: String,
 }
 
+#[derive(Clone, Debug)]
+struct LiveMarketEngineArgs {
+    approved_strategy: PathBuf,
+    source_live_signal: PathBuf,
+    output: PathBuf,
+    state_file: PathBuf,
+    store: PathBuf,
+    as_of: Option<NaiveDate>,
+    interval_seconds: u64,
+    max_source_age_seconds: u64,
+    market_window_only: bool,
+    once: bool,
+    json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveMarketEngineState {
+    checked_at: chrono::DateTime<Utc>,
+    status: String,
+    reason: String,
+    approved_strategy: String,
+    source_live_signal: String,
+    output: String,
+    store: String,
+    snapshot_id: Option<String>,
+    selected_signal: bool,
+    candidates_seen: usize,
+    provider_health: Option<LiveMarketProviderHealth>,
+    decision: Option<LiveMarketDecision>,
+    market_session: Option<MarketSessionSnapshot>,
+}
+
 async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         anyhow::bail!("--timeout-seconds must be positive");
     }
     let started_at = Utc::now();
+    let _refresh_lock = match acquire_live_signal_refresh_lock(
+        &args.state_file,
+        args.timeout_seconds.saturating_add(60),
+    ) {
+        Ok(lock) => lock,
+        Err(err) => {
+            let state = live_signal_refresh_state(
+                &args,
+                started_at,
+                Some(Utc::now()),
+                "refresh_already_running",
+                0,
+                "",
+                &format!("another approved strategy signal refresh is already running: {err}"),
+            );
+            write_json_atomic_value(&args.state_file, &state)?;
+            print_refresh_state(&state, args.json)?;
+            return Ok(());
+        }
+    };
     if args.market_window_only {
         let session = market_session_snapshot_for_refresh(started_at);
         if !session.open {
@@ -1713,46 +1878,42 @@ async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
     );
     write_json_atomic_value(&args.state_file, &running)?;
 
-    let refresh = async {
-        let approved_strategy = read_approved_strategy(&args.approved_strategy)?;
-        let constraints = approved_strategy.portfolio_constraints.clone();
-        let report = run_portfolio_selector_research_for_profile(
-            PortfolioWheelResearchRequest {
-                symbols: approved_strategy.symbols.clone(),
-                from: args.from,
-                to: args.to,
-                max_expirations: args.max_expirations,
-                fetch_concurrency: args.fetch_concurrency,
-                symbol_concurrency: args.symbol_concurrency,
-                force_refresh: args.force_refresh,
-                cache_only: args.cache_only,
-                capital_budget: constraints.capital_budget,
-                max_symbol_allocation_pct: constraints.max_symbol_allocation_pct,
-                max_open_positions: constraints.max_open_positions,
-                max_positions_per_symbol: constraints.max_positions_per_symbol,
-                max_total_trades_per_symbol: constraints.max_total_trades_per_symbol,
-                portfolio_drawdown_cooldown_trigger_pct: constraints
-                    .portfolio_drawdown_cooldown_trigger_pct,
-                portfolio_drawdown_cooldown_days: constraints.portfolio_drawdown_cooldown_days,
-                symbol_drawdown_cooldown_trigger_pct: constraints
-                    .symbol_drawdown_cooldown_trigger_pct,
-                symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
-            },
-            &approved_strategy.profile_name,
-        )
-        .await?;
-        let run_dir = PathBuf::from("runs").join(&report.run_id);
-        export_live_signal(
-            &run_dir,
-            &args.approved_strategy,
-            &args.output,
-            Some(args.to),
-        )?;
-        Ok::<PathBuf, anyhow::Error>(run_dir)
+    let (sender, receiver) = mpsc::channel();
+    let worker_args = args.clone();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime
+                .block_on(refresh_live_signal_selector_run(worker_args))
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(format!("create refresh worker runtime: {err}")),
+        };
+        let _ = sender.send(result);
+    });
+
+    let timeout = StdDuration::from_secs(args.timeout_seconds);
+    let wait_started = StdInstant::now();
+    let refresh_result = loop {
+        match receiver.try_recv() {
+            Ok(result) => break Some(result),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                break Some(Err(
+                    "approved strategy signal refresh worker exited without result".to_owned(),
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if wait_started.elapsed() >= timeout {
+                    break None;
+                }
+                tokio::time::sleep(StdDuration::from_millis(250)).await;
+            }
+        }
     };
 
-    match tokio::time::timeout(StdDuration::from_secs(args.timeout_seconds), refresh).await {
-        Ok(Ok(run_dir)) => {
+    match refresh_result {
+        Some(Ok(run_dir)) => {
             let state = live_signal_refresh_state(
                 &args,
                 started_at,
@@ -1765,7 +1926,7 @@ async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
             write_json_atomic_value(&args.state_file, &state)?;
             print_refresh_state(&state, args.json)
         }
-        Ok(Err(err)) => {
+        Some(Err(err)) => {
             let state = live_signal_refresh_state(
                 &args,
                 started_at,
@@ -1773,12 +1934,12 @@ async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
                 "approved_strategy_not_ready",
                 0,
                 "",
-                err.to_string().as_str(),
+                err.as_str(),
             );
             write_json_atomic_value(&args.state_file, &state)?;
             print_refresh_state(&state, args.json)
         }
-        Err(_) => {
+        None => {
             let state = live_signal_refresh_state(
                 &args,
                 started_at,
@@ -1792,17 +1953,86 @@ async fn refresh_live_signal(args: RefreshLiveSignalArgs) -> Result<()> {
                 ),
             );
             write_json_atomic_value(&args.state_file, &state)?;
-            print_refresh_state(&state, args.json)
+            print_refresh_state(&state, args.json)?;
+            drop(_refresh_lock);
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(124);
         }
     }
 }
 
+async fn refresh_live_signal_selector_run(args: RefreshLiveSignalArgs) -> Result<PathBuf> {
+    let approved_strategy = read_approved_strategy(&args.approved_strategy)?;
+    let constraints = approved_strategy.portfolio_constraints.clone();
+    let (from, require_research_gate) =
+        approved_strategy_refresh_from_and_gate(&approved_strategy, args.from, args.to);
+    let report = run_portfolio_selector_research_for_profile(
+        PortfolioWheelResearchRequest {
+            symbols: approved_strategy.symbols.clone(),
+            from,
+            to: args.to,
+            max_expirations: args.max_expirations,
+            fetch_concurrency: args.fetch_concurrency,
+            symbol_concurrency: args.symbol_concurrency,
+            force_refresh: args.force_refresh,
+            cache_only: args.cache_only,
+            capital_budget: constraints.capital_budget,
+            max_symbol_allocation_pct: constraints.max_symbol_allocation_pct,
+            max_open_positions: constraints.max_open_positions,
+            max_positions_per_symbol: constraints.max_positions_per_symbol,
+            max_total_trades_per_symbol: constraints.max_total_trades_per_symbol,
+            portfolio_drawdown_cooldown_trigger_pct: constraints
+                .portfolio_drawdown_cooldown_trigger_pct,
+            portfolio_drawdown_cooldown_days: constraints.portfolio_drawdown_cooldown_days,
+            symbol_drawdown_cooldown_trigger_pct: constraints.symbol_drawdown_cooldown_trigger_pct,
+            symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
+        },
+        &approved_strategy.profile_name,
+    )
+    .await?;
+    let run_dir = PathBuf::from("runs").join(&report.run_id);
+    export_live_signal_with_gate(
+        &run_dir,
+        &args.approved_strategy,
+        &args.output,
+        Some(args.to),
+        require_research_gate,
+    )?;
+    Ok(run_dir)
+}
+
 fn read_approved_strategy(path: &Path) -> Result<ApprovedStrategy> {
-    serde_json::from_str(
+    let approved_strategy: ApprovedStrategy = serde_json::from_str(
         &fs::read_to_string(path)
             .with_context(|| format!("read approved strategy {}", path.display()))?,
     )
-    .with_context(|| format!("parse approved strategy {}", path.display()))
+    .with_context(|| format!("parse approved strategy {}", path.display()))?;
+    approved_strategy
+        .validate_contract()
+        .with_context(|| format!("validate approved strategy {}", path.display()))?;
+    Ok(approved_strategy)
+}
+
+fn approved_strategy_research_from(
+    approved_strategy: &ApprovedStrategy,
+    fallback: NaiveDate,
+) -> NaiveDate {
+    approved_strategy.research_from.unwrap_or(fallback)
+}
+
+fn approved_strategy_refresh_from_and_gate(
+    approved_strategy: &ApprovedStrategy,
+    fallback: NaiveDate,
+    to: NaiveDate,
+) -> (NaiveDate, bool) {
+    match approved_strategy.live_detector_lookback_days {
+        Some(days) if days > 0 => (to - chrono::Duration::days(days), false),
+        _ => (
+            approved_strategy_research_from(approved_strategy, fallback),
+            true,
+        ),
+    }
 }
 
 fn live_signal_refresh_state(
@@ -1839,6 +2069,117 @@ fn print_refresh_state(state: &LiveSignalRefreshState, json: bool) -> Result<()>
     Ok(())
 }
 
+async fn run_live_market_engine(args: LiveMarketEngineArgs) -> Result<()> {
+    if args.interval_seconds == 0 {
+        anyhow::bail!("--interval-seconds must be positive");
+    }
+    if args.max_source_age_seconds == 0 {
+        anyhow::bail!("--max-source-age-seconds must be positive");
+    }
+
+    loop {
+        let state = run_live_market_engine_once(&args)?;
+        print_live_market_engine_state(&state, args.json)?;
+        if args.once {
+            return Ok(());
+        }
+        tokio::time::sleep(StdDuration::from_secs(args.interval_seconds)).await;
+    }
+}
+
+fn run_live_market_engine_once(args: &LiveMarketEngineArgs) -> Result<LiveMarketEngineState> {
+    let now = Utc::now();
+    let as_of = args.as_of.unwrap_or_else(|| execution_default_as_of(now));
+    let approved_strategy = read_approved_strategy(&args.approved_strategy)?;
+    if args.market_window_only {
+        let session = market_session_snapshot_for_refresh(now);
+        if !session.open {
+            let state = LiveMarketEngineState {
+                checked_at: now,
+                status: "skipped_market_closed".to_owned(),
+                reason: session.reason.clone(),
+                approved_strategy: args.approved_strategy.display().to_string(),
+                source_live_signal: args.source_live_signal.display().to_string(),
+                output: args.output.display().to_string(),
+                store: args.store.display().to_string(),
+                snapshot_id: None,
+                selected_signal: false,
+                candidates_seen: 0,
+                provider_health: None,
+                decision: None,
+                market_session: Some(session),
+            };
+            write_json_atomic_value(&args.state_file, &state)?;
+            return Ok(state);
+        }
+    }
+
+    let record = build_signal_artifact_live_market_snapshot(LiveMarketEngineConfig {
+        approved_strategy,
+        source_live_signal: &args.source_live_signal,
+        output: &args.output,
+        as_of,
+        max_source_age_seconds: args.max_source_age_seconds,
+        now,
+    })?;
+    write_json_atomic_value(&args.output, &record.artifact)
+        .with_context(|| format!("write live market artifact {}", args.output.display()))?;
+    let mut store = ResearchStore::open(&args.store)?;
+    store
+        .record_live_market_snapshot(&record)
+        .with_context(|| format!("record live market snapshot in {}", args.store.display()))?;
+    let state = live_market_engine_state(args, now, &record);
+    write_json_atomic_value(&args.state_file, &state)?;
+    Ok(state)
+}
+
+fn live_market_engine_state(
+    args: &LiveMarketEngineArgs,
+    checked_at: chrono::DateTime<Utc>,
+    record: &LiveMarketSnapshotRecord,
+) -> LiveMarketEngineState {
+    LiveMarketEngineState {
+        checked_at,
+        status: record.decision.status.clone(),
+        reason: record.decision.reason.clone(),
+        approved_strategy: args.approved_strategy.display().to_string(),
+        source_live_signal: args.source_live_signal.display().to_string(),
+        output: args.output.display().to_string(),
+        store: args.store.display().to_string(),
+        snapshot_id: Some(record.snapshot_id.clone()),
+        selected_signal: record.decision.selected_signal.is_some(),
+        candidates_seen: record.decision.candidates_seen,
+        provider_health: Some(record.provider_health.clone()),
+        decision: Some(record.decision.clone()),
+        market_session: None,
+    }
+}
+
+fn print_live_market_engine_state(state: &LiveMarketEngineState, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(state)?);
+    } else {
+        println!(
+            "status={} selected_signal={} candidates={} reason={}",
+            state.status, state.selected_signal, state.candidates_seen, state.reason
+        );
+        if let Some(provider) = &state.provider_health {
+            println!(
+                "provider={} provider_status={} source_age={} symbols_ready={}/{}",
+                provider.provider,
+                provider.status,
+                provider
+                    .source_age_seconds
+                    .map(|age| format!("{age}s"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                provider.symbols_ready,
+                provider.symbols_requested
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_execution_decision(
     live_signal: &Path,
@@ -1864,7 +2205,7 @@ fn run_execution_decision(
     {
         anyhow::bail!("--max-loss must be positive");
     }
-    let as_of = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let as_of = as_of.unwrap_or_else(|| execution_default_as_of(Utc::now()));
     let artifact: LiveSignalArtifact = serde_json::from_str(
         &fs::read_to_string(live_signal)
             .with_context(|| format!("read live signal artifact {}", live_signal.display()))?,
@@ -1974,7 +2315,7 @@ fn execution_readiness(
     allow_blocked: bool,
     json: bool,
 ) -> Result<()> {
-    let as_of = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let as_of = as_of.unwrap_or_else(|| execution_default_as_of(Utc::now()));
     let risk = CanaryRiskPolicy {
         account_cash,
         debit_max_loss,
@@ -2098,7 +2439,7 @@ fn build_execution_readiness_report(
     {
         push_unique(
             &mut blockers,
-            "live placement blocked until broker position reconciliation and exit lifecycle are implemented",
+            "live placement blocked because broker position reconciliation and exit lifecycle are not enabled for this broker/strategy",
         );
     }
     let ready_for_broker_review = decision_ready_for_review
@@ -2122,8 +2463,11 @@ fn build_execution_readiness_report(
                 "configure SPREAD_TRADIER_ACCOUNT_ID/SPREAD_TRADIER_TOKEN, then rerun execution readiness"
             }
         }
-    } else if blockers.iter().any(|blocker| blocker.contains("no selected live signal")) {
-        "wait for signal refresh to produce a selected live signal"
+    } else if blockers
+        .iter()
+        .any(|blocker| blocker.contains("no selected live"))
+    {
+        "wait for signal refresh to produce a selected live entry or management signal"
     } else {
         "clear blockers, then rerun execution-readiness"
     }
@@ -2192,7 +2536,7 @@ struct TradeSignalRisk {
     reserve_basis: String,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ExecutionDecision {
     status: String,
     reason: String,
@@ -2212,7 +2556,18 @@ struct ExecutionDecision {
     tradier_quote: Option<TradierQuotesResponse>,
     tradier_preview: Option<TradierOrderResponse>,
     tradier_place: Option<TradierOrderResponse>,
+    #[serde(default)]
+    action_kind: Option<ExecutionActionKind>,
+    #[serde(default)]
+    management_signals: Vec<TradeSignal>,
     selected_signal: Option<TradeSignal>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionActionKind {
+    OpenEntry,
+    ManageOpen,
 }
 
 fn compute_execution_decision(
@@ -2258,6 +2613,20 @@ fn compute_execution_decision_at(
         );
     }
     if artifact.as_of != as_of {
+        if mode == ExecutionMode::Live && !execution_market_window_open_at(now) {
+            return execution_decision(
+                "blocked",
+                "live placement requires the configured regular options-market window to be open",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                None,
+            );
+        }
         return execution_decision(
             "blocked",
             &format!(
@@ -2275,6 +2644,20 @@ fn compute_execution_decision_at(
         );
     }
     if artifact.market_data_through < as_of {
+        if mode == ExecutionMode::Live && !execution_market_window_open_at(now) {
+            return execution_decision(
+                "blocked",
+                "live placement requires the configured regular options-market window to be open",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                None,
+            );
+        }
         return execution_decision(
             "blocked",
             &format!(
@@ -2292,61 +2675,77 @@ fn compute_execution_decision_at(
         );
     }
 
-    let Some(selected) = artifact.selected_signal.clone() else {
-        return execution_decision(
-            "no_signal",
-            "no selected live signal; execution worker has nothing to submit",
-            as_of,
-            mode,
-            risk,
-            broker,
-            false,
-            Some(artifact.generated_at),
-            max_order_age_seconds,
-            None,
-        );
-    };
-    if selected.status != SignalStatus::NewEntry {
-        return execution_decision(
-            "no_signal",
-            "selected live signal is not a new entry",
-            as_of,
-            mode,
-            risk,
-            broker,
-            false,
-            Some(artifact.generated_at),
-            max_order_age_seconds,
-            Some(selected),
-        );
-    }
-    let as_of_string = as_of.to_string();
-    if selected.entry_date.as_deref() != Some(as_of_string.as_str()) {
-        return execution_decision(
-            "blocked",
-            "selected live signal entry_date does not match requested as_of",
-            as_of,
-            mode,
-            risk,
-            broker,
-            false,
-            Some(artifact.generated_at),
-            max_order_age_seconds,
-            Some(selected),
-        );
-    }
-
-    let selected = match trade_signal_allowed_by_risk(
-        &selected,
-        risk,
-        &artifact.approved_strategy.portfolio_constraints,
-        &artifact.signals,
-    ) {
-        Ok(signal_risk) => trade_signal_with_risk(selected, signal_risk),
+    let mut management_signals = Vec::new();
+    let management_candidates = match live_management_signals(artifact, as_of) {
+        Ok(candidates) => candidates,
         Err(reason) => {
             return execution_decision(
                 "blocked",
-                &format!("selected live signal failed risk policy: {reason}"),
+                &format!("live management signal selection failed: {reason}"),
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                None,
+            );
+        }
+    };
+    for candidate in management_candidates {
+        if candidate.execution_rules.is_none() {
+            return execution_decision(
+                "blocked",
+                "already-open live signal requires exported execution rules for lifecycle management",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                Some(candidate),
+            );
+        }
+        if let Err(err) = validate_live_management_signal_shape(&candidate) {
+            return execution_decision(
+                "blocked",
+                &format!("already-open live signal has invalid management shape: {err}"),
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                Some(candidate),
+            );
+        }
+        let signal_risk = match trade_signal_risk(&candidate) {
+            Ok(signal_risk) => signal_risk,
+            Err(reason) => {
+                return execution_decision(
+                    "blocked",
+                    &format!("already-open live signal failed risk annotation: {reason}"),
+                    as_of,
+                    mode,
+                    risk,
+                    broker,
+                    false,
+                    Some(artifact.generated_at),
+                    max_order_age_seconds,
+                    Some(candidate),
+                );
+            }
+        };
+        management_signals.push(trade_signal_with_risk(candidate, signal_risk));
+    }
+    let selected = if let Some(selected) = artifact.selected_signal.clone() {
+        if selected.status != SignalStatus::NewEntry {
+            return execution_decision(
+                "no_signal",
+                "selected live signal is not a new entry",
                 as_of,
                 mode,
                 risk,
@@ -2357,6 +2756,81 @@ fn compute_execution_decision_at(
                 Some(selected),
             );
         }
+        let as_of_string = as_of.to_string();
+        if selected.entry_date.as_deref() != Some(as_of_string.as_str()) {
+            return execution_decision(
+                "blocked",
+                "selected live signal entry_date does not match requested as_of",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                Some(selected),
+            );
+        }
+        if matches!(
+            selected.strategy.as_str(),
+            "call_debit_spread" | "put_debit_spread" | "call_credit_spread" | "put_credit_spread"
+        ) && selected.execution_rules.is_none()
+        {
+            return execution_decision(
+                "blocked",
+                "selected vertical-spread live entry requires exported execution rules for lifecycle management",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                Some(selected),
+            );
+        }
+
+        match trade_signal_allowed_by_risk(
+            &selected,
+            risk,
+            &artifact.approved_strategy.portfolio_constraints,
+            &artifact.signals,
+        ) {
+            Ok(signal_risk) => trade_signal_with_risk(selected, signal_risk),
+            Err(reason) => {
+                return execution_decision(
+                    "blocked",
+                    &format!("selected live signal failed risk policy: {reason}"),
+                    as_of,
+                    mode,
+                    risk,
+                    broker,
+                    false,
+                    Some(artifact.generated_at),
+                    max_order_age_seconds,
+                    Some(selected),
+                );
+            }
+        }
+    } else {
+        if management_signals.is_empty() {
+            return execution_decision(
+                "no_signal",
+                "no selected live entry or open-position management signal; execution worker has nothing to submit",
+                as_of,
+                mode,
+                risk,
+                broker,
+                false,
+                Some(artifact.generated_at),
+                max_order_age_seconds,
+                None,
+            );
+        }
+        management_signals
+            .first()
+            .cloned()
+            .expect("non-empty management candidates")
     };
     if let Err(err) = assert_trade_signal_broker_supported(&selected, broker) {
         return execution_decision(
@@ -2373,12 +2847,12 @@ fn compute_execution_decision_at(
         );
     }
     if mode == ExecutionMode::Live {
-        let today = now.date_naive();
-        if as_of != today {
+        let market_date = execution_market_date_at(now);
+        if as_of != market_date {
             return execution_decision(
                 "blocked",
                 &format!(
-                    "live placement requires --as-of to match today's UTC date {today}; got {as_of}"
+                    "live placement requires --as-of to match current U.S. options-market date {market_date}; got {as_of}"
                 ),
                 as_of,
                 mode,
@@ -2421,9 +2895,39 @@ fn compute_execution_decision_at(
             );
         }
     }
-    execution_decision(
+    let mut decision = execution_decision(
         "ready",
-        match mode {
+        execution_ready_reason(mode, execution_action_kind_for_signal(&selected)),
+        as_of,
+        mode,
+        risk,
+        broker,
+        false,
+        Some(artifact.generated_at),
+        max_order_age_seconds,
+        Some(selected),
+    );
+    decision.management_signals = management_signals;
+    decision
+}
+
+fn execution_ready_reason(
+    mode: ExecutionMode,
+    action_kind: Option<ExecutionActionKind>,
+) -> &'static str {
+    match action_kind {
+        Some(ExecutionActionKind::ManageOpen) => match mode {
+            ExecutionMode::Monitor => {
+                "open live signal passed local lifecycle validation; monitor mode does not request broker preview"
+            }
+            ExecutionMode::Review => {
+                "open live signal passed local lifecycle validation; broker position and exit preview are required next"
+            }
+            ExecutionMode::Live => {
+                "open live signal passed local lifecycle validation; broker position, exit preview, and placement are required next"
+            }
+        },
+        _ => match mode {
             ExecutionMode::Monitor => {
                 "selected live signal passed local validation; monitor mode does not request broker preview"
             }
@@ -2434,15 +2938,126 @@ fn compute_execution_decision_at(
                 "selected live signal passed local validation; broker preview and placement are required next"
             }
         },
-        as_of,
-        mode,
-        risk,
-        broker,
-        false,
-        Some(artifact.generated_at),
-        max_order_age_seconds,
-        Some(selected),
-    )
+    }
+}
+
+fn live_management_signals(
+    artifact: &LiveSignalArtifact,
+    as_of: NaiveDate,
+) -> std::result::Result<Vec<TradeSignal>, String> {
+    let approved_symbols = artifact
+        .approved_strategy
+        .symbols
+        .iter()
+        .map(|symbol| symbol.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for signal in &artifact.signals {
+        let wheel_reconciliation_probe =
+            signal.status == SignalStatus::RecentClosed && signal.strategy == "wheel";
+        if signal.status != SignalStatus::AlreadyOpen && !wheel_reconciliation_probe {
+            continue;
+        }
+        if wheel_reconciliation_probe
+            && (signal.expiration.is_none() || signal.short_put.or(signal.short_strike).is_none())
+        {
+            continue;
+        }
+        if !approved_symbols.contains(&signal.symbol.to_ascii_uppercase()) {
+            return Err(format!(
+                "management signal {} is not in the approved symbol list",
+                trade_signal_label(signal)
+            ));
+        }
+        if !artifact
+            .approved_strategy
+            .allowed_live_strategies
+            .iter()
+            .any(|strategy| strategy == &signal.strategy)
+        {
+            return Err(format!(
+                "management signal {} is not approved for live execution",
+                trade_signal_label(signal)
+            ));
+        }
+        if !matches!(
+            signal.strategy.as_str(),
+            "call_debit_spread"
+                | "put_debit_spread"
+                | "call_credit_spread"
+                | "put_credit_spread"
+                | "wheel"
+        ) {
+            return Err(format!(
+                "management signal {} has no live management implementation",
+                trade_signal_label(signal)
+            ));
+        }
+        let entry_date = trade_signal_date(signal, signal.entry_date.as_deref(), "entry_date")?;
+        if entry_date > as_of {
+            return Err(format!(
+                "management signal {} has future entry_date {entry_date}",
+                trade_signal_label(signal)
+            ));
+        }
+        let expiration = trade_signal_date(signal, signal.expiration.as_deref(), "expiration")?;
+        if expiration < as_of && signal.strategy != "wheel" {
+            return Err(format!(
+                "management signal {} expired on {expiration}; manual broker lifecycle handling is required",
+                trade_signal_label(signal)
+            ));
+        }
+        let mut candidate = signal.clone();
+        if wheel_reconciliation_probe {
+            candidate.status = SignalStatus::AlreadyOpen;
+        }
+        candidates.push(candidate);
+    }
+    candidates.sort_by(|a, b| {
+        signal_expiration_sort_key(a)
+            .cmp(&signal_expiration_sort_key(b))
+            .then_with(|| signal_entry_sort_key(a).cmp(&signal_entry_sort_key(b)))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.strategy.cmp(&b.strategy))
+    });
+    Ok(candidates)
+}
+
+fn trade_signal_date(
+    signal: &TradeSignal,
+    value: Option<&str>,
+    field: &str,
+) -> std::result::Result<NaiveDate, String> {
+    let value = value.ok_or_else(|| {
+        format!(
+            "already-open signal {} missing {field}",
+            trade_signal_label(signal)
+        )
+    })?;
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|err| {
+        format!(
+            "already-open signal {} has invalid {field} {value}: {err}",
+            trade_signal_label(signal)
+        )
+    })
+}
+
+fn signal_expiration_sort_key(signal: &TradeSignal) -> Option<NaiveDate> {
+    signal
+        .expiration
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+}
+
+fn signal_entry_sort_key(signal: &TradeSignal) -> Option<NaiveDate> {
+    signal
+        .entry_date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+}
+
+fn trade_signal_label(signal: &TradeSignal) -> String {
+    format!("{} {}", signal.symbol, signal.strategy)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2458,6 +3073,9 @@ fn execution_decision(
     max_order_age_seconds: u64,
     selected_signal: Option<TradeSignal>,
 ) -> ExecutionDecision {
+    let action_kind = selected_signal
+        .as_ref()
+        .and_then(execution_action_kind_for_signal);
     ExecutionDecision {
         status: status.to_owned(),
         reason: reason.to_owned(),
@@ -2476,7 +3094,17 @@ fn execution_decision(
         tradier_quote: None,
         tradier_preview: None,
         tradier_place: None,
+        action_kind,
+        management_signals: Vec::new(),
         selected_signal,
+    }
+}
+
+fn execution_action_kind_for_signal(signal: &TradeSignal) -> Option<ExecutionActionKind> {
+    match signal.status {
+        SignalStatus::NewEntry => Some(ExecutionActionKind::OpenEntry),
+        SignalStatus::AlreadyOpen => Some(ExecutionActionKind::ManageOpen),
+        SignalStatus::RecentClosed => None,
     }
 }
 
@@ -2533,6 +3161,24 @@ fn trade_signal_allowed_by_risk(
             if max_loss <= 0.0 || max_loss > risk.debit_max_loss {
                 return Err(format!(
                     "{} max_loss {:.2} exceeds debit cap {:.2}",
+                    action.strategy, max_loss, risk.debit_max_loss
+                ));
+            }
+        }
+        "put_credit_spread" | "call_credit_spread" => {
+            let max_loss = action
+                .max_loss
+                .ok_or_else(|| format!("{} missing max_loss", action.strategy))?;
+            let order_max_loss = credit_spread_order_max_loss(action)?;
+            if (order_max_loss - max_loss).abs() > 1.0 {
+                return Err(format!(
+                    "{} max_loss {:.2} does not match order credit-spread risk {:.2}",
+                    action.strategy, max_loss, order_max_loss
+                ));
+            }
+            if max_loss <= 0.0 || max_loss > risk.debit_max_loss {
+                return Err(format!(
+                    "{} max_loss {:.2} exceeds defined-risk spread cap {:.2}",
                     action.strategy, max_loss, risk.debit_max_loss
                 ));
             }
@@ -2676,14 +3322,18 @@ fn trade_signal_risk(action: &TradeSignal) -> std::result::Result<TradeSignalRis
     let max_loss = action
         .max_loss
         .ok_or_else(|| format!("{} missing max_loss for reserve", action.strategy))?;
-    if matches!(
-        action.strategy.as_str(),
-        "put_debit_spread" | "call_debit_spread"
-    ) {
+    if is_debit_spread_strategy(action.strategy.as_str()) {
         let order_max_loss = debit_spread_order_max_loss(action)?;
         return Ok(TradeSignalRisk {
             reserve: max_loss.max(order_max_loss),
             reserve_basis: "max_loss_and_order_debit".to_owned(),
+        });
+    }
+    if is_credit_spread_strategy(action.strategy.as_str()) {
+        let order_max_loss = credit_spread_order_max_loss(action)?;
+        return Ok(TradeSignalRisk {
+            reserve: max_loss.max(order_max_loss),
+            reserve_basis: "max_loss_and_order_credit_width".to_owned(),
         });
     }
     Ok(TradeSignalRisk {
@@ -2705,6 +3355,34 @@ fn debit_spread_order_max_loss(action: &TradeSignal) -> std::result::Result<f64,
     Ok(entry_credit.abs() * 100.0)
 }
 
+fn credit_spread_order_max_loss(action: &TradeSignal) -> std::result::Result<f64, String> {
+    let entry_credit = action
+        .entry_credit
+        .ok_or_else(|| format!("{} missing entry_credit for order risk", action.strategy))?;
+    if !entry_credit.is_finite() || entry_credit <= 0.0 {
+        return Err(format!(
+            "{} entry_credit must be a positive credit for order risk",
+            action.strategy
+        ));
+    }
+    let short_strike = action
+        .short_strike
+        .ok_or_else(|| format!("{} missing short_strike for order risk", action.strategy))?;
+    let long_strike = action
+        .long_strike
+        .ok_or_else(|| format!("{} missing long_strike for order risk", action.strategy))?;
+    validate_credit_spread_geometry(action.strategy.as_str(), short_strike, long_strike)
+        .map_err(|err| err.to_string())?;
+    let width = (long_strike - short_strike).abs();
+    if entry_credit >= width {
+        return Err(format!(
+            "{} entry_credit {:.2} must be below strike width {:.2}",
+            action.strategy, entry_credit, width
+        ));
+    }
+    Ok((width - entry_credit) * 100.0)
+}
+
 fn trade_signal_with_risk(mut action: TradeSignal, action_risk: TradeSignalRisk) -> TradeSignal {
     action.reserve = Some(action_risk.reserve);
     action.reserve_basis = Some(action_risk.reserve_basis);
@@ -2716,6 +3394,7 @@ fn assert_trade_signal_broker_supported(
     broker: &impl ExecutionBrokerView,
 ) -> anyhow::Result<()> {
     match action.strategy.as_str() {
+        "put_credit_spread" | "call_credit_spread" => broker.assert_credit_spread_live_supported(),
         "put_debit_spread" | "call_debit_spread" => broker.assert_debit_spread_live_supported(),
         "wheel" => broker.assert_wheel_live_supported(),
         other => anyhow::bail!("strategy {other} is not enabled for execution"),
@@ -2724,6 +3403,14 @@ fn assert_trade_signal_broker_supported(
 
 fn execution_market_window_open_at(now_utc: chrono::DateTime<Utc>) -> bool {
     market_session_snapshot_at(now_utc).open
+}
+
+fn execution_market_date_at(now_utc: chrono::DateTime<Utc>) -> NaiveDate {
+    market_session_snapshot_at(now_utc).date_et
+}
+
+fn execution_default_as_of(now_utc: chrono::DateTime<Utc>) -> NaiveDate {
+    execution_market_date_at(now_utc)
 }
 
 fn market_session_snapshot_for_status(now_utc: chrono::DateTime<Utc>) -> MarketSessionSnapshot {
@@ -2994,6 +3681,15 @@ fn apply_broker_bridge(
     if decision.status != "ready" || decision.mode == ExecutionMode::Monitor {
         return Ok(());
     }
+    if decision.action_kind == Some(ExecutionActionKind::ManageOpen)
+        && broker.kind() != BrokerKind::Tradier
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason =
+            "open-position lifecycle management is only implemented for Tradier strategies"
+                .to_owned();
+        return Ok(());
+    }
     if decision.mode == ExecutionMode::Live && !broker.live_orders_enabled() {
         decision.status = "blocked".to_owned();
         decision.reason =
@@ -3003,7 +3699,7 @@ fn apply_broker_bridge(
     if decision.mode == ExecutionMode::Live && !live_position_lifecycle_ready(decision) {
         decision.status = "blocked".to_owned();
         decision.reason =
-            "live order placement is blocked until broker position reconciliation and exit lifecycle are implemented".to_owned();
+            "live order placement is blocked because broker position reconciliation and exit lifecycle are not enabled for this broker/strategy".to_owned();
         return Ok(());
     }
     match broker.kind() {
@@ -3014,8 +3710,27 @@ fn apply_broker_bridge(
     }
 }
 
-fn live_position_lifecycle_ready(_decision: &ExecutionDecision) -> bool {
-    false
+fn live_position_lifecycle_ready(decision: &ExecutionDecision) -> bool {
+    if decision.broker != BrokerKind::Tradier {
+        return false;
+    }
+    let Some(action) = decision.selected_signal.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        action.strategy.as_str(),
+        "call_debit_spread"
+            | "put_debit_spread"
+            | "call_credit_spread"
+            | "put_credit_spread"
+            | "wheel"
+    ) {
+        return false;
+    }
+    matches!(
+        decision.action_kind,
+        Some(ExecutionActionKind::OpenEntry | ExecutionActionKind::ManageOpen)
+    )
 }
 
 fn apply_robinhood_mcp_bridge(
@@ -3222,7 +3937,235 @@ fn trade_signal_order_intent(action: &TradeSignal) -> Result<OptionOrderIntent> 
                 action.strategy.clone(),
             )?)
         }
+        "put_credit_spread" | "call_credit_spread" => {
+            if entry_credit <= 0.0 {
+                anyhow::bail!(
+                    "{} requires a positive entry_credit credit",
+                    action.strategy
+                );
+            }
+            let short_strike = require_option_f64(action.short_strike, "short_strike")?;
+            let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+            validate_credit_spread_order_bounds(
+                action,
+                action.strategy.as_str(),
+                short_strike,
+                long_strike,
+                entry_credit,
+            )?;
+            let (short_key, long_key) = trade_signal_credit_spread_keys(action)?;
+            Ok(credit_spread_open_intent(
+                short_key,
+                long_key,
+                quantity,
+                limit_price,
+                action.strategy.clone(),
+            )?)
+        }
         other => anyhow::bail!("strategy {other} is not orderable through the execution broker"),
+    }
+}
+
+fn is_debit_spread_strategy(strategy: &str) -> bool {
+    matches!(strategy, "call_debit_spread" | "put_debit_spread")
+}
+
+fn is_credit_spread_strategy(strategy: &str) -> bool {
+    matches!(strategy, "call_credit_spread" | "put_credit_spread")
+}
+
+fn is_vertical_spread_strategy(strategy: &str) -> bool {
+    is_debit_spread_strategy(strategy) || is_credit_spread_strategy(strategy)
+}
+
+fn trade_signal_debit_spread_keys(action: &TradeSignal) -> Result<(OptionKey, OptionKey)> {
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?;
+    let expiration = require_option_string(action.expiration.as_deref(), "expiration")?
+        .parse::<NaiveDate>()
+        .with_context(|| format!("parse expiration for {}", action.symbol))?;
+    let short_strike = require_option_f64(action.short_strike, "short_strike")?;
+    let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+    let (right, strategy) = match action.strategy.as_str() {
+        "put_debit_spread" => (OptionRight::Put, "put_debit_spread"),
+        "call_debit_spread" => (OptionRight::Call, "call_debit_spread"),
+        other => anyhow::bail!("strategy {other} is not a debit spread"),
+    };
+    validate_debit_spread_geometry(strategy, short_strike, long_strike)?;
+    Ok((
+        OptionKey::new(
+            symbol,
+            expiration,
+            decimal_from_f64(long_strike, "long_strike")?,
+            right.clone(),
+        ),
+        OptionKey::new(
+            symbol,
+            expiration,
+            decimal_from_f64(short_strike, "short_strike")?,
+            right,
+        ),
+    ))
+}
+
+fn trade_signal_credit_spread_keys(action: &TradeSignal) -> Result<(OptionKey, OptionKey)> {
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?;
+    let expiration = require_option_string(action.expiration.as_deref(), "expiration")?
+        .parse::<NaiveDate>()
+        .with_context(|| format!("parse expiration for {}", action.symbol))?;
+    let short_strike = require_option_f64(action.short_strike, "short_strike")?;
+    let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+    let (right, strategy) = match action.strategy.as_str() {
+        "put_credit_spread" => (OptionRight::Put, "put_credit_spread"),
+        "call_credit_spread" => (OptionRight::Call, "call_credit_spread"),
+        other => anyhow::bail!("strategy {other} is not a credit spread"),
+    };
+    validate_credit_spread_geometry(strategy, short_strike, long_strike)?;
+    Ok((
+        OptionKey::new(
+            symbol,
+            expiration,
+            decimal_from_f64(short_strike, "short_strike")?,
+            right.clone(),
+        ),
+        OptionKey::new(
+            symbol,
+            expiration,
+            decimal_from_f64(long_strike, "long_strike")?,
+            right,
+        ),
+    ))
+}
+
+fn trade_signal_vertical_spread_keys(action: &TradeSignal) -> Result<(OptionKey, OptionKey)> {
+    if is_debit_spread_strategy(action.strategy.as_str()) {
+        return trade_signal_debit_spread_keys(action);
+    }
+    if is_credit_spread_strategy(action.strategy.as_str()) {
+        let (short_key, long_key) = trade_signal_credit_spread_keys(action)?;
+        return Ok((long_key, short_key));
+    }
+    anyhow::bail!("strategy {} is not a vertical spread", action.strategy)
+}
+
+fn validate_live_management_signal_shape(action: &TradeSignal) -> Result<()> {
+    match action.strategy.as_str() {
+        "call_debit_spread" | "put_debit_spread" => {
+            trade_signal_debit_spread_keys(action)?;
+            Ok(())
+        }
+        "call_credit_spread" | "put_credit_spread" => {
+            trade_signal_credit_spread_keys(action)?;
+            Ok(())
+        }
+        "wheel" => {
+            trade_signal_wheel_short_put_key(action)?;
+            Ok(())
+        }
+        other => anyhow::bail!("strategy {other} is not manageable through live execution"),
+    }
+}
+
+fn trade_signal_wheel_short_put_key(action: &TradeSignal) -> Result<OptionKey> {
+    if action.strategy != "wheel" {
+        anyhow::bail!("strategy {} is not a wheel", action.strategy);
+    }
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?;
+    let expiration = require_option_string(action.expiration.as_deref(), "expiration")?
+        .parse::<NaiveDate>()
+        .with_context(|| format!("parse wheel put expiration for {}", action.symbol))?;
+    let short_put = require_option_f64(
+        action.short_put.or(action.short_strike),
+        "short_put/short_strike",
+    )?;
+    Ok(OptionKey::new(
+        symbol,
+        expiration,
+        decimal_from_f64(short_put, "short_put")?,
+        OptionRight::Put,
+    ))
+}
+
+fn trade_signal_wheel_covered_call_key(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<OptionKey> {
+    if action.strategy != "wheel" {
+        anyhow::bail!("strategy {} is not a wheel", action.strategy);
+    }
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?;
+    let expiration = trade_signal_date(
+        action,
+        action.wheel_covered_call_expiration.as_deref(),
+        "wheel_covered_call_expiration",
+    )
+    .map_err(anyhow::Error::msg)?;
+    if expiration <= as_of {
+        anyhow::bail!(
+            "wheel assigned-stock management requires a future covered-call expiration; got {expiration} for as_of {as_of}"
+        );
+    }
+    let strike = require_option_f64(
+        action.wheel_covered_call_strike,
+        "wheel_covered_call_strike",
+    )?;
+    if strike <= 0.0 || !strike.is_finite() {
+        anyhow::bail!("wheel covered-call strike must be positive and finite");
+    }
+    Ok(OptionKey::new(
+        symbol,
+        expiration,
+        decimal_from_f64(strike, "covered_call_strike")?,
+        OptionRight::Call,
+    ))
+}
+
+fn trade_signal_wheel_covered_call_key_if_exported(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<Option<OptionKey>> {
+    match (
+        action.wheel_covered_call_expiration.as_deref(),
+        action.wheel_covered_call_strike,
+    ) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => trade_signal_wheel_covered_call_key(action, as_of).map(Some),
+        _ => {
+            anyhow::bail!(
+                "wheel assigned-stock management has incomplete covered-call target fields"
+            )
+        }
+    }
+}
+
+fn validate_debit_spread_geometry(
+    strategy: &str,
+    short_strike: f64,
+    long_strike: f64,
+) -> Result<()> {
+    match strategy {
+        "put_debit_spread" if long_strike <= short_strike => {
+            anyhow::bail!("{strategy} requires long put strike above short put strike");
+        }
+        "call_debit_spread" if long_strike >= short_strike => {
+            anyhow::bail!("{strategy} requires long call strike below short call strike");
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_credit_spread_geometry(
+    strategy: &str,
+    short_strike: f64,
+    long_strike: f64,
+) -> Result<()> {
+    match strategy {
+        "put_credit_spread" if short_strike <= long_strike => {
+            anyhow::bail!("{strategy} requires short put strike above long put strike");
+        }
+        "call_credit_spread" if short_strike >= long_strike => {
+            anyhow::bail!("{strategy} requires short call strike below long call strike");
+        }
+        _ => Ok(()),
     }
 }
 
@@ -3233,15 +4176,7 @@ fn validate_debit_spread_order_bounds(
     long_strike: f64,
     entry_debit: f64,
 ) -> Result<()> {
-    match strategy {
-        "put_debit_spread" if long_strike <= short_strike => {
-            anyhow::bail!("{strategy} requires long put strike above short put strike");
-        }
-        "call_debit_spread" if long_strike >= short_strike => {
-            anyhow::bail!("{strategy} requires long call strike below short call strike");
-        }
-        _ => {}
-    }
+    validate_debit_spread_geometry(strategy, short_strike, long_strike)?;
     let width = (long_strike - short_strike).abs();
     if entry_debit > width + 0.01 {
         anyhow::bail!(
@@ -3272,6 +4207,52 @@ fn validate_debit_spread_order_bounds(
             max_loss,
             entry_debit * 100.0
         );
+    }
+    Ok(())
+}
+
+fn validate_credit_spread_order_bounds(
+    action: &TradeSignal,
+    strategy: &str,
+    short_strike: f64,
+    long_strike: f64,
+    entry_credit: f64,
+) -> Result<()> {
+    validate_credit_spread_geometry(strategy, short_strike, long_strike)?;
+    let width = (long_strike - short_strike).abs();
+    if !entry_credit.is_finite() || entry_credit <= 0.0 {
+        anyhow::bail!("{strategy} limit credit must be positive and finite");
+    }
+    if entry_credit >= width {
+        anyhow::bail!(
+            "{} limit credit {:.2} must be below strike width {:.2}",
+            strategy,
+            entry_credit,
+            width
+        );
+    }
+    if let Some(exported_width) = action.width
+        && exported_width.is_finite()
+        && exported_width > 0.0
+        && (exported_width - width).abs() > 0.01
+    {
+        anyhow::bail!(
+            "{} width {:.2} does not match strike width {:.2}",
+            strategy,
+            exported_width,
+            width
+        );
+    }
+    if let Some(max_loss) = action.max_loss {
+        let order_max_loss = (width - entry_credit) * 100.0;
+        if (order_max_loss - max_loss).abs() > 1.0 {
+            anyhow::bail!(
+                "{} max_loss {:.2} does not match credit-spread risk {:.2}",
+                strategy,
+                max_loss,
+                order_max_loss
+            );
+        }
     }
     Ok(())
 }
@@ -3421,6 +4402,9 @@ fn apply_tradier_rest_bridge_with_config(
     order_ledger: Option<&Path>,
     config: TradierConfig,
 ) -> Result<()> {
+    if decision.action_kind == Some(ExecutionActionKind::ManageOpen) {
+        return apply_tradier_management_bridge_with_config(decision, order_ledger, config);
+    }
     let Some(action) = decision.selected_signal.clone() else {
         return Ok(());
     };
@@ -3432,15 +4416,6 @@ fn apply_tradier_rest_bridge_with_config(
             return Ok(());
         }
     };
-    let client = match TradierClient::new(config.clone()) {
-        Ok(client) => client,
-        Err(err) => {
-            decision.status = "blocked".to_owned();
-            decision.reason = format!("Tradier client initialization failed: {err}");
-            return Ok(());
-        }
-    };
-    let order_key = tradier_order_key(&config, &payload, &action);
     let review_ledger_path = if decision.mode == ExecutionMode::Review {
         order_ledger
     } else {
@@ -3459,6 +4434,18 @@ fn apply_tradier_rest_bridge_with_config(
     } else {
         None
     };
+    if !apply_tradier_management_preflight_before_entry(decision, order_ledger, config.clone())? {
+        return Ok(());
+    }
+    let client = match TradierClient::new(config.clone()) {
+        Ok(client) => client,
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier client initialization failed: {err}");
+            return Ok(());
+        }
+    };
+    let order_key = tradier_order_key(&config, &payload, &action);
     if let Some(ledger_path) = review_ledger_path
         && let Some(entry) = execution_order_ledger_entry_with_statuses(
             ledger_path,
@@ -3494,20 +4481,35 @@ fn apply_tradier_rest_bridge_with_config(
         decision.reason = format!("Tradier wheel broker-state precheck failed: {err}");
         return Ok(());
     }
-    if matches!(
-        action.strategy.as_str(),
-        "call_debit_spread" | "put_debit_spread"
-    ) && let Err(err) = tradier_assert_no_symbol_exposure(&client, &action)
+    if action.strategy == "wheel" {
+        match tradier_validate_current_wheel_entry_quote(&client, &payload, decision.mode) {
+            Ok(quotes) => decision.tradier_quote = Some(quotes),
+            Err(err) => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!("Tradier wheel quote validation failed: {err}");
+                return Ok(());
+            }
+        }
+    }
+    if is_vertical_spread_strategy(action.strategy.as_str())
+        && let Err(err) = tradier_assert_vertical_spread_lifecycle_flat(&client, &action)
     {
         decision.status = "blocked".to_owned();
         decision.reason = format!("Tradier duplicate-exposure precheck failed: {err}");
         return Ok(());
     }
-    if matches!(
-        action.strategy.as_str(),
-        "call_debit_spread" | "put_debit_spread"
-    ) {
+    if is_debit_spread_strategy(action.strategy.as_str()) {
         match tradier_validate_current_debit_quote(&client, &payload, &action, decision.mode) {
+            Ok(quotes) => decision.tradier_quote = Some(quotes),
+            Err(err) => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!("Tradier quote validation failed: {err}");
+                return Ok(());
+            }
+        }
+    }
+    if is_credit_spread_strategy(action.strategy.as_str()) {
+        match tradier_validate_current_credit_quote(&client, &payload, &action, decision.mode) {
             Ok(quotes) => decision.tradier_quote = Some(quotes),
             Err(err) => {
                 decision.status = "blocked".to_owned();
@@ -3531,7 +4533,7 @@ fn apply_tradier_rest_bridge_with_config(
             execution_order_ledger_record_status(
                 ledger_path,
                 &order_key,
-                "rejected",
+                tradier_preview_rejection_ledger_status(&payload),
                 None,
                 Some(reason.as_str()),
             )?;
@@ -3636,6 +4638,1270 @@ fn apply_tradier_rest_bridge_with_config(
     Ok(())
 }
 
+fn apply_tradier_management_preflight_before_entry(
+    decision: &mut ExecutionDecision,
+    order_ledger: Option<&Path>,
+    config: TradierConfig,
+) -> Result<bool> {
+    if decision.action_kind != Some(ExecutionActionKind::OpenEntry)
+        || decision.management_signals.is_empty()
+    {
+        return Ok(true);
+    }
+    let mut management_decision = decision.clone();
+    management_decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+    management_decision.selected_signal = management_decision.management_signals.first().cloned();
+    management_decision.tradier_quote = None;
+    management_decision.tradier_preview = None;
+    management_decision.tradier_place = None;
+    apply_tradier_management_bridge_with_config(&mut management_decision, order_ledger, config)?;
+    match management_decision.status.as_str() {
+        "holding" | "no_position" => Ok(true),
+        _ => {
+            *decision = management_decision;
+            Ok(false)
+        }
+    }
+}
+
+fn apply_tradier_management_bridge_with_config(
+    decision: &mut ExecutionDecision,
+    order_ledger: Option<&Path>,
+    config: TradierConfig,
+) -> Result<()> {
+    let Some(action) = decision
+        .selected_signal
+        .as_ref()
+        .or_else(|| decision.management_signals.first())
+    else {
+        return Ok(());
+    };
+    match action.strategy.as_str() {
+        "call_debit_spread" | "put_debit_spread" | "call_credit_spread" | "put_credit_spread" => {
+            apply_tradier_vertical_spread_management_bridge_with_config(
+                decision,
+                order_ledger,
+                config,
+            )
+        }
+        "wheel" => {
+            apply_tradier_wheel_management_bridge_with_config(decision, order_ledger, config)
+        }
+        other => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier has no management bridge for strategy {other}");
+            Ok(())
+        }
+    }
+}
+
+fn apply_tradier_vertical_spread_management_bridge_with_config(
+    decision: &mut ExecutionDecision,
+    order_ledger: Option<&Path>,
+    config: TradierConfig,
+) -> Result<()> {
+    let actions = tradier_vertical_spread_management_actions(decision);
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let client = match TradierClient::new(config.clone()) {
+        Ok(client) => client,
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier client initialization failed: {err}");
+            return Ok(());
+        }
+    };
+    let review_ledger_path = if decision.mode == ExecutionMode::Review {
+        order_ledger
+    } else {
+        None
+    };
+    let live_ledger_path = if decision.mode == ExecutionMode::Live {
+        match order_ledger {
+            Some(path) => Some(path),
+            None => {
+                decision.status = "blocked".to_owned();
+                decision.reason =
+                    "live placement requires a local execution order ledger".to_owned();
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    if decision.mode == ExecutionMode::Live
+        && let Err(err) = tradier_assert_market_open(&client)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier market clock blocks live execution: {err}");
+        return Ok(());
+    }
+    let allowed_position_symbols =
+        match tradier_vertical_spread_management_position_symbols(&actions) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!("Tradier management position allow-list failed: {err}");
+                return Ok(());
+            }
+        };
+
+    let positions = match client.get_positions() {
+        Ok(response) if response.ok => response.positions,
+        Ok(response) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!(
+                "Tradier positions request failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier positions request failed".to_owned())
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier positions request failed: {err}");
+            return Ok(());
+        }
+    };
+    let orders = match client.get_orders() {
+        Ok(response) if response.ok => response.orders,
+        Ok(response) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!(
+                "Tradier orders request failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier orders request failed".to_owned())
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier orders request failed: {err}");
+            return Ok(());
+        }
+    };
+
+    let mut open_positions_checked = 0_usize;
+    let mut hold_reasons = Vec::new();
+    for action in actions {
+        let state = match tradier_vertical_spread_lifecycle_state_with_allowed_positions(
+            &action,
+            &positions,
+            &orders,
+            Some(&allowed_position_symbols),
+        ) {
+            Ok(state) => state,
+            Err(err) => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!("Tradier vertical-spread lifecycle check failed: {err}");
+                return Ok(());
+            }
+        };
+        match state {
+            TradierDebitSpreadLifecycleState::Flat => {
+                hold_reasons.push(format!(
+                    "{} has no matching Tradier open position",
+                    trade_signal_label(&action)
+                ));
+            }
+            TradierDebitSpreadLifecycleState::ActiveOrder { id, status } => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!(
+                    "active Tradier vertical-spread order id {:?} status {:?} blocks lifecycle management",
+                    id, status
+                );
+                return Ok(());
+            }
+            TradierDebitSpreadLifecycleState::Inconsistent { reason } => {
+                decision.status = "blocked".to_owned();
+                decision.reason =
+                    format!("inconsistent Tradier vertical-spread lifecycle state: {reason}");
+                return Ok(());
+            }
+            TradierDebitSpreadLifecycleState::AssignedShortLeg {
+                right,
+                long_quantity,
+                stock_quantity,
+            } => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!(
+                    "Tradier vertical-spread short {} appears assigned: stock quantity {:.4} and long hedge quantity {:.4}; manual broker assignment recovery is required before autonomous lifecycle management continues",
+                    option_right_value(&right),
+                    stock_quantity,
+                    long_quantity
+                );
+                return Ok(());
+            }
+            TradierDebitSpreadLifecycleState::Open { quantity } => {
+                open_positions_checked += 1;
+                if quantity != 1 {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = format!(
+                        "Tradier vertical-spread quantity {quantity} requires manual management; live signal quantity model supports one spread per action"
+                    );
+                    return Ok(());
+                }
+                let time_exit_reason =
+                    match live_vertical_spread_time_exit_reason(&action, decision.as_of) {
+                        Ok(reason) => reason,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason =
+                                format!("live vertical-spread exit rule evaluation failed: {err}");
+                            return Ok(());
+                        }
+                    };
+                if is_credit_spread_strategy(action.strategy.as_str()) {
+                    let (quotes, exit_debit) = match tradier_validate_current_credit_exit_quote(
+                        &client,
+                        &action,
+                        decision.mode,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason = if let Some(reason) = time_exit_reason {
+                                format!(
+                                    "Tradier credit-spread close triggered {reason}, but exit quote validation failed: {err}"
+                                )
+                            } else {
+                                format!("Tradier exit quote validation failed: {err}")
+                            };
+                            return Ok(());
+                        }
+                    };
+                    decision.tradier_quote = Some(quotes);
+                    let exit_plan =
+                        match live_credit_spread_exit_plan(&action, exit_debit, decision.as_of) {
+                            Ok(plan) => plan,
+                            Err(err) => {
+                                decision.status = "blocked".to_owned();
+                                decision.reason = format!(
+                                    "live credit-spread exit rule evaluation failed: {err}"
+                                );
+                                return Ok(());
+                            }
+                        };
+                    match exit_plan {
+                        CreditSpreadExitPlan::Hold { reason } => {
+                            hold_reasons.push(format!("{}: {reason}", trade_signal_label(&action)));
+                        }
+                        CreditSpreadExitPlan::Close {
+                            reason,
+                            limit_debit,
+                        } => {
+                            if !limit_debit.is_finite() || limit_debit <= 0.0 {
+                                decision.status = "blocked".to_owned();
+                                decision.reason = format!(
+                                    "Tradier credit-spread close triggered {reason}, but conservative exit debit {:.2} is not positive; manual close/expiry/assignment-risk review is required before autonomous lifecycle management continues",
+                                    limit_debit
+                                );
+                                return Ok(());
+                            }
+                            let payload = match tradier_multileg_credit_close_payload(
+                                &action,
+                                limit_debit,
+                                quantity,
+                            ) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    decision.status = "blocked".to_owned();
+                                    decision.reason = format!(
+                                        "Tradier close order shape rejected before preview: {err}"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                            decision.selected_signal = Some(action.clone());
+                            decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                            return apply_tradier_payload_preview_and_maybe_place(
+                                decision,
+                                &client,
+                                &config,
+                                &payload,
+                                &action,
+                                review_ledger_path,
+                                live_ledger_path,
+                                &orders,
+                                format!("Tradier credit-spread close triggered by {reason}")
+                                    .as_str(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let (quotes, exit_credit) = match tradier_validate_current_debit_exit_quote(
+                    &client,
+                    &action,
+                    decision.mode,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason = if let Some(reason) = time_exit_reason {
+                            format!(
+                                "Tradier debit-spread close triggered {reason}, but exit quote validation failed: {err}"
+                            )
+                        } else {
+                            format!("Tradier exit quote validation failed: {err}")
+                        };
+                        return Ok(());
+                    }
+                };
+                decision.tradier_quote = Some(quotes);
+                let exit_plan =
+                    match live_debit_spread_exit_plan(&action, exit_credit, decision.as_of) {
+                        Ok(plan) => plan,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason =
+                                format!("live debit-spread exit rule evaluation failed: {err}");
+                            return Ok(());
+                        }
+                    };
+                match exit_plan {
+                    DebitSpreadExitPlan::Hold { reason } => {
+                        hold_reasons.push(format!("{}: {reason}", trade_signal_label(&action)));
+                    }
+                    DebitSpreadExitPlan::Close {
+                        reason,
+                        limit_credit,
+                    } => {
+                        if !limit_credit.is_finite() || limit_credit <= 0.0 {
+                            decision.status = "blocked".to_owned();
+                            decision.reason = format!(
+                                "Tradier debit-spread close triggered {reason}, but conservative exit credit {:.2} is not positive; manual close/expiry/assignment-risk review is required before autonomous lifecycle management continues",
+                                limit_credit
+                            );
+                            return Ok(());
+                        }
+                        let payload = match tradier_multileg_debit_close_payload(
+                            &action,
+                            limit_credit,
+                            quantity,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                decision.status = "blocked".to_owned();
+                                decision.reason = format!(
+                                    "Tradier close order shape rejected before preview: {err}"
+                                );
+                                return Ok(());
+                            }
+                        };
+                        decision.selected_signal = Some(action.clone());
+                        decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                        return apply_tradier_payload_preview_and_maybe_place(
+                            decision,
+                            &client,
+                            &config,
+                            &payload,
+                            &action,
+                            review_ledger_path,
+                            live_ledger_path,
+                            &orders,
+                            format!("Tradier debit-spread close triggered by {reason}").as_str(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if open_positions_checked == 0 {
+        decision.status = "no_position".to_owned();
+        decision.reason = format!(
+            "Tradier has no matching open vertical-spread position for {} exported management signal(s)",
+            hold_reasons.len()
+        );
+    } else {
+        decision.status = "holding".to_owned();
+        decision.reason = format!(
+            "Tradier lifecycle checked {open_positions_checked} open vertical spread(s); no exit rule fired: {}",
+            hold_reasons.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn apply_tradier_wheel_management_bridge_with_config(
+    decision: &mut ExecutionDecision,
+    order_ledger: Option<&Path>,
+    config: TradierConfig,
+) -> Result<()> {
+    let actions = tradier_wheel_management_actions(decision);
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let client = match TradierClient::new(config.clone()) {
+        Ok(client) => client,
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier client initialization failed: {err}");
+            return Ok(());
+        }
+    };
+    let review_ledger_path = if decision.mode == ExecutionMode::Review {
+        order_ledger
+    } else {
+        None
+    };
+    let live_ledger_path = if decision.mode == ExecutionMode::Live {
+        match order_ledger {
+            Some(path) => Some(path),
+            None => {
+                decision.status = "blocked".to_owned();
+                decision.reason =
+                    "live placement requires a local execution order ledger".to_owned();
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    if decision.mode == ExecutionMode::Live
+        && let Err(err) = tradier_assert_market_open(&client)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier market clock blocks live execution: {err}");
+        return Ok(());
+    }
+
+    let positions = match client.get_positions() {
+        Ok(response) if response.ok => response.positions,
+        Ok(response) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!(
+                "Tradier positions request failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier positions request failed".to_owned())
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier positions request failed: {err}");
+            return Ok(());
+        }
+    };
+    let orders = match client.get_orders() {
+        Ok(response) if response.ok => response.orders,
+        Ok(response) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!(
+                "Tradier orders request failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier orders request failed".to_owned())
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier orders request failed: {err}");
+            return Ok(());
+        }
+    };
+
+    let mut open_positions_checked = 0_usize;
+    let mut hold_reasons = Vec::new();
+    for action in actions {
+        let state =
+            match tradier_wheel_lifecycle_state(&action, &positions, &orders, decision.as_of) {
+                Ok(state) => state,
+                Err(err) => {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = format!("Tradier wheel lifecycle check failed: {err}");
+                    return Ok(());
+                }
+            };
+        match state {
+            TradierWheelLifecycleState::Flat => {
+                hold_reasons.push(format!(
+                    "{} has no matching Tradier wheel position",
+                    trade_signal_label(&action)
+                ));
+            }
+            TradierWheelLifecycleState::ActiveOrder { id, status } => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!(
+                    "active Tradier wheel order id {:?} status {:?} blocks lifecycle management",
+                    id, status
+                );
+                return Ok(());
+            }
+            TradierWheelLifecycleState::Inconsistent { reason } => {
+                decision.status = "blocked".to_owned();
+                decision.reason = format!("inconsistent Tradier wheel lifecycle state: {reason}");
+                return Ok(());
+            }
+            TradierWheelLifecycleState::ShortPutOpen { quantity } => {
+                open_positions_checked += 1;
+                if quantity != 1 {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = format!(
+                        "Tradier wheel short-put quantity {quantity} requires manual management; live signal quantity model supports one contract per action"
+                    );
+                    return Ok(());
+                }
+                let put_key = match trade_signal_wheel_short_put_key(&action) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason = format!("Tradier wheel short-put target rejected: {err}");
+                        return Ok(());
+                    }
+                };
+                let put_symbol = match tradier_occ_option_symbol(&put_key) {
+                    Ok(symbol) => symbol,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("Tradier wheel short-put OCC symbol rejected: {err}");
+                        return Ok(());
+                    }
+                };
+                let (quotes, close_debit) = match tradier_validate_current_single_option_quote(
+                    &client,
+                    &put_symbol,
+                    "ask",
+                    decision.mode,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("Tradier wheel short-put quote validation failed: {err}");
+                        return Ok(());
+                    }
+                };
+                decision.tradier_quote = Some(quotes);
+                let exit_plan =
+                    match live_wheel_short_put_exit_plan(&action, close_debit, decision.as_of) {
+                        Ok(plan) => plan,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason =
+                                format!("live wheel short-put exit rule evaluation failed: {err}");
+                            return Ok(());
+                        }
+                    };
+                match exit_plan {
+                    WheelShortPutExitPlan::Hold { reason } => {
+                        hold_reasons.push(format!("{}: {reason}", trade_signal_label(&action)));
+                    }
+                    WheelShortPutExitPlan::Close {
+                        reason,
+                        limit_debit,
+                    } => {
+                        let payload = match tradier_single_option_payload(
+                            &action.symbol,
+                            &put_symbol,
+                            "buy_to_close",
+                            quantity,
+                            limit_debit,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                decision.status = "blocked".to_owned();
+                                decision.reason = format!(
+                                    "Tradier wheel short-put close order shape rejected before preview: {err}"
+                                );
+                                return Ok(());
+                            }
+                        };
+                        decision.selected_signal = Some(action.clone());
+                        decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                        return apply_tradier_payload_preview_and_maybe_place(
+                            decision,
+                            &client,
+                            &config,
+                            &payload,
+                            &action,
+                            review_ledger_path,
+                            live_ledger_path,
+                            &orders,
+                            format!("Tradier wheel short-put close triggered by {reason}").as_str(),
+                        );
+                    }
+                }
+            }
+            TradierWheelLifecycleState::AssignedStock { shares } => {
+                open_positions_checked += 1;
+                let covered_call_quantity = shares / 100.0;
+                if covered_call_quantity < 1.0
+                    || (covered_call_quantity.round() - covered_call_quantity).abs() > f64::EPSILON
+                    || covered_call_quantity.round() != 1.0
+                {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = format!(
+                        "Tradier wheel assigned stock quantity {shares:.4} requires manual management; live signal quantity model supports one covered-call contract"
+                    );
+                    return Ok(());
+                }
+                match live_wheel_called_away_mismatch_due(&action, decision.as_of) {
+                    Ok(true) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason = format!(
+                            "{} has residual Tradier stock after simulated covered-call assignment/called-away exit; manual broker reconciliation is required before autonomous wheel management continues",
+                            trade_signal_label(&action)
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("live wheel called-away reconciliation rule failed: {err}");
+                        return Ok(());
+                    }
+                }
+                if let Some(reason) =
+                    match live_wheel_stock_liquidation_reason(&action, decision.as_of) {
+                        Ok(reason) => reason,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason =
+                                format!("live wheel stock liquidation rule failed: {err}");
+                            return Ok(());
+                        }
+                    }
+                {
+                    let stock_quantity = if (shares.round() - shares).abs() <= f64::EPSILON
+                        && shares.round() > 0.0
+                    {
+                        shares.round() as u32
+                    } else {
+                        decision.status = "blocked".to_owned();
+                        decision.reason = format!(
+                            "Tradier wheel assigned stock quantity {shares:.4} is not a whole-share long position"
+                        );
+                        return Ok(());
+                    };
+                    let (quotes, limit_price) = match tradier_validate_current_equity_sell_quote(
+                        &client,
+                        &action.symbol,
+                        decision.mode,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason =
+                                format!("Tradier wheel stock quote validation failed: {err}");
+                            return Ok(());
+                        }
+                    };
+                    decision.tradier_quote = Some(quotes);
+                    let payload = match tradier_equity_sell_payload(
+                        &action.symbol,
+                        stock_quantity,
+                        limit_price,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason = format!(
+                                "Tradier wheel stock liquidation order shape rejected before preview: {err}"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    decision.selected_signal = Some(action.clone());
+                    decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                    return apply_tradier_payload_preview_and_maybe_place(
+                        decision,
+                        &client,
+                        &config,
+                        &payload,
+                        &action,
+                        review_ledger_path,
+                        live_ledger_path,
+                        &orders,
+                        format!("Tradier wheel assigned stock liquidation triggered by {reason}")
+                            .as_str(),
+                    );
+                }
+                let call_key = match trade_signal_wheel_covered_call_key_if_exported(
+                    &action,
+                    decision.as_of,
+                ) {
+                    Ok(Some(key)) => key,
+                    Ok(None) => {
+                        hold_reasons.push(format!(
+                            "{} has assigned stock but no exported covered-call target yet; waiting for next eligible call target or stock liquidation rule",
+                            trade_signal_label(&action)
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("Tradier wheel assigned-stock call target rejected: {err}");
+                        return Ok(());
+                    }
+                };
+                let call_symbol = match tradier_occ_option_symbol(&call_key) {
+                    Ok(symbol) => symbol,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("Tradier wheel covered-call OCC symbol rejected: {err}");
+                        return Ok(());
+                    }
+                };
+                let (quotes, limit_credit) = match tradier_validate_current_single_option_quote(
+                    &client,
+                    &call_symbol,
+                    "bid",
+                    decision.mode,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason =
+                            format!("Tradier wheel covered-call quote validation failed: {err}");
+                        return Ok(());
+                    }
+                };
+                decision.tradier_quote = Some(quotes);
+                let payload = match tradier_single_option_payload(
+                    &action.symbol,
+                    &call_symbol,
+                    "sell_to_open",
+                    covered_call_quantity.round() as u32,
+                    limit_credit,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        decision.status = "blocked".to_owned();
+                        decision.reason = format!(
+                            "Tradier wheel covered-call order shape rejected before preview: {err}"
+                        );
+                        return Ok(());
+                    }
+                };
+                decision.selected_signal = Some(action.clone());
+                decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                return apply_tradier_payload_preview_and_maybe_place(
+                    decision,
+                    &client,
+                    &config,
+                    &payload,
+                    &action,
+                    review_ledger_path,
+                    live_ledger_path,
+                    &orders,
+                    "Tradier wheel assigned stock covered-call open",
+                );
+            }
+            TradierWheelLifecycleState::CoveredCallOpen { quantity } => {
+                open_positions_checked += 1;
+                if quantity != 1 {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = format!(
+                        "Tradier wheel covered-call quantity {quantity} requires manual management; live signal quantity model supports one contract per action"
+                    );
+                    return Ok(());
+                }
+                hold_reasons.push(format!(
+                    "{} already has Tradier covered-call quantity {}; waiting for assignment/expiry",
+                    trade_signal_label(&action),
+                    quantity
+                ));
+            }
+        }
+    }
+    if open_positions_checked == 0 {
+        decision.status = "no_position".to_owned();
+        decision.reason = format!(
+            "Tradier has no matching wheel position for {} exported management signal(s)",
+            hold_reasons.len()
+        );
+    } else {
+        decision.status = "holding".to_owned();
+        decision.reason = format!(
+            "Tradier lifecycle checked {open_positions_checked} wheel position(s); no management order fired: {}",
+            hold_reasons.join("; ")
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_tradier_payload_preview_and_maybe_place(
+    decision: &mut ExecutionDecision,
+    client: &TradierClient,
+    config: &TradierConfig,
+    payload: &BTreeMap<String, String>,
+    action: &TradeSignal,
+    review_ledger_path: Option<&Path>,
+    live_ledger_path: Option<&Path>,
+    broker_orders: &[TradierOrder],
+    order_description: &str,
+) -> Result<()> {
+    let order_key = tradier_order_key(config, payload, action);
+    if let Some(ledger_path) = review_ledger_path
+        && let Some(entry) = execution_order_ledger_entry_with_statuses(
+            ledger_path,
+            &order_key,
+            &["reviewed", "rejected", "pending_unknown", "submitted"],
+        )?
+    {
+        apply_tradier_ledger_entry_to_decision(decision, &entry);
+        return Ok(());
+    }
+    if let Some(ledger_path) = live_ledger_path
+        && let Some(entry) = execution_order_ledger_blocking_entry(ledger_path, &order_key)?
+    {
+        if tradier_payload_is_close_order(payload) {
+            match tradier_submitted_close_ledger_decision(&entry, broker_orders, decision.as_of) {
+                Some(SubmittedCloseLedgerDecision::Retry(reason)) => {
+                    execution_order_ledger_record_status(
+                        ledger_path,
+                        &order_key,
+                        "terminal_unfilled",
+                        entry.broker_order_id.as_deref(),
+                        Some(reason.as_str()),
+                    )?;
+                }
+                Some(SubmittedCloseLedgerDecision::Block(reason)) => {
+                    decision.status = "blocked".to_owned();
+                    decision.reason = reason;
+                    return Ok(());
+                }
+                None => {
+                    apply_tradier_ledger_entry_to_decision(decision, &entry);
+                    return Ok(());
+                }
+            }
+        } else {
+            apply_tradier_ledger_entry_to_decision(decision, &entry);
+            return Ok(());
+        }
+    }
+
+    let preview = match client.preview_order(payload) {
+        Ok(response) => response,
+        Err(err) => {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("{order_description} preview request failed: {err}");
+            return Ok(());
+        }
+    };
+    let preview_result = tradier_preview_accepted(&preview);
+    decision.tradier_preview = Some(preview);
+    if let Err(reason) = preview_result {
+        if let Some(ledger_path) = review_ledger_path.or(live_ledger_path) {
+            execution_order_ledger_record_status(
+                ledger_path,
+                &order_key,
+                tradier_preview_rejection_ledger_status(payload),
+                None,
+                Some(reason.as_str()),
+            )?;
+        }
+        decision.status = "rejected".to_owned();
+        decision.reason = format!("{order_description} preview rejected the order: {reason}");
+        return Ok(());
+    }
+
+    decision.broker_review_ok = true;
+    if decision.mode != ExecutionMode::Live {
+        if let Some(ledger_path) = review_ledger_path {
+            execution_order_ledger_record_status(
+                ledger_path,
+                &order_key,
+                "reviewed",
+                None,
+                Some("Tradier preview succeeded"),
+            )?;
+        }
+        decision.status = "reviewed".to_owned();
+        decision.reason =
+            format!("{order_description} preview succeeded; live placement was not requested");
+        return Ok(());
+    }
+
+    if let Some(ledger_path) = live_ledger_path
+        && execution_order_ledger_reserve_pending(
+            ledger_path,
+            &order_key,
+            Some("Tradier place request is about to be sent"),
+        )? == ExecutionOrderLedgerReservation::AlreadyRecorded
+    {
+        decision.status = "already_submitted".to_owned();
+        decision.reason =
+            "matching Tradier order intent is already recorded in the local execution ledger"
+                .to_owned();
+        return Ok(());
+    }
+    let place = match client.place_order(payload) {
+        Ok(response) => response,
+        Err(err) => {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = format!(
+                "{order_description} place request transport failed after local ledger reservation; check Tradier before retrying: {err}"
+            );
+            return Ok(());
+        }
+    };
+    let place_result = tradier_place_accepted(&place);
+    decision.tradier_place = Some(place);
+    match place_result {
+        Ok(order_id) => {
+            let confirmed_status = match tradier_confirm_order_after_place(client, &order_id) {
+                Ok(status) => status,
+                Err(err) => {
+                    if let Some(ledger_path) = live_ledger_path {
+                        execution_order_ledger_record_status(
+                            ledger_path,
+                            &order_key,
+                            "pending_unknown",
+                            Some(order_id.as_str()),
+                            Some(err.to_string().as_str()),
+                        )?;
+                    }
+                    decision.status = "submit_unknown".to_owned();
+                    decision.reason = format!(
+                        "{order_description} returned order id {order_id}, but post-submit confirmation failed; check Tradier before retrying: {err}"
+                    );
+                    return Ok(());
+                }
+            };
+            if let Some(ledger_path) = live_ledger_path {
+                let confirmed_reason =
+                    format!("Tradier post-submit status confirmed as {confirmed_status}");
+                execution_order_ledger_record_status(
+                    ledger_path,
+                    &order_key,
+                    "submitted",
+                    Some(order_id.as_str()),
+                    Some(confirmed_reason.as_str()),
+                )?;
+            }
+            decision.status = "submitted".to_owned();
+            decision.reason = format!(
+                "{order_description} returned accepted order id {order_id} with confirmed status {confirmed_status}; broker lifecycle still requires monitoring"
+            );
+        }
+        Err(reason) => {
+            if let Some(ledger_path) = live_ledger_path {
+                execution_order_ledger_record_status(
+                    ledger_path,
+                    &order_key,
+                    "rejected",
+                    None,
+                    Some(reason.as_str()),
+                )?;
+            }
+            decision.status = "rejected".to_owned();
+            decision.reason = format!("{order_description} returned a rejection: {reason}");
+        }
+    }
+    Ok(())
+}
+
+fn tradier_vertical_spread_management_actions(decision: &ExecutionDecision) -> Vec<TradeSignal> {
+    tradier_strategy_management_actions(decision, is_vertical_spread_strategy)
+}
+
+fn tradier_wheel_management_actions(decision: &ExecutionDecision) -> Vec<TradeSignal> {
+    tradier_strategy_management_actions(decision, |strategy| strategy == "wheel")
+}
+
+fn tradier_strategy_management_actions(
+    decision: &ExecutionDecision,
+    strategy_filter: impl Fn(&str) -> bool,
+) -> Vec<TradeSignal> {
+    if !decision.management_signals.is_empty() {
+        return decision
+            .management_signals
+            .iter()
+            .filter(|action| strategy_filter(action.strategy.as_str()))
+            .cloned()
+            .collect();
+    }
+    decision
+        .selected_signal
+        .iter()
+        .filter(|action| action.status == SignalStatus::AlreadyOpen)
+        .filter(|action| strategy_filter(action.strategy.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DebitSpreadExitPlan {
+    Hold { reason: String },
+    Close { reason: String, limit_credit: f64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CreditSpreadExitPlan {
+    Hold { reason: String },
+    Close { reason: String, limit_debit: f64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum WheelShortPutExitPlan {
+    Hold { reason: String },
+    Close { reason: String, limit_debit: f64 },
+}
+
+fn live_debit_spread_exit_plan(
+    action: &TradeSignal,
+    exit_credit: f64,
+    as_of: NaiveDate,
+) -> Result<DebitSpreadExitPlan> {
+    if !exit_credit.is_finite() {
+        anyhow::bail!("exit credit must be finite");
+    }
+    let rules = action
+        .execution_rules
+        .as_ref()
+        .context("already-open signal missing execution rules")?;
+    let entry_date = trade_signal_date(action, action.entry_date.as_deref(), "entry_date")
+        .map_err(anyhow::Error::msg)?;
+    let expiration = trade_signal_date(action, action.expiration.as_deref(), "expiration")
+        .map_err(anyhow::Error::msg)?;
+    if entry_date > as_of {
+        anyhow::bail!("entry_date {entry_date} is after decision as_of {as_of}");
+    }
+    let days_held = (as_of - entry_date).num_days();
+    let dte = (expiration - as_of).num_days();
+    let entry_credit = require_option_nonzero_f64(action.entry_credit, "entry_credit")?;
+    if entry_credit >= 0.0 {
+        anyhow::bail!("debit-spread management requires a negative entry_credit debit");
+    }
+    let entry_debit = entry_credit.abs();
+    let width = debit_spread_width(action)?;
+    if entry_debit > width + 0.01 {
+        anyhow::bail!(
+            "entry debit {:.2} exceeds debit-spread width {:.2}",
+            entry_debit,
+            width
+        );
+    }
+    let max_profit_per_share = width - entry_debit;
+    let take_profit_credit = entry_debit + max_profit_per_share * rules.take_profit_pct;
+    let stop_credit = entry_debit * (1.0 - rules.stop_loss_multiple).max(0.0);
+    let close = |reason: &str| DebitSpreadExitPlan::Close {
+        reason: reason.to_owned(),
+        limit_credit: exit_credit,
+    };
+    if exit_credit >= take_profit_credit {
+        return Ok(close("take_profit"));
+    }
+    if exit_credit <= stop_credit {
+        return Ok(close("stop_loss"));
+    }
+    if let Some(reason) = live_debit_spread_time_exit_reason(action, as_of)? {
+        return Ok(close(reason));
+    }
+    Ok(DebitSpreadExitPlan::Hold {
+        reason: format!(
+            "exit_credit {:.2} below take_profit {:.2}, above stop {:.2}, days_held {}, dte {}",
+            exit_credit, take_profit_credit, stop_credit, days_held, dte
+        ),
+    })
+}
+
+fn live_credit_spread_exit_plan(
+    action: &TradeSignal,
+    exit_debit: f64,
+    as_of: NaiveDate,
+) -> Result<CreditSpreadExitPlan> {
+    if !exit_debit.is_finite() {
+        anyhow::bail!("exit debit must be finite");
+    }
+    let rules = action
+        .execution_rules
+        .as_ref()
+        .context("already-open signal missing execution rules")?;
+    let entry_date = trade_signal_date(action, action.entry_date.as_deref(), "entry_date")
+        .map_err(anyhow::Error::msg)?;
+    let expiration = trade_signal_date(action, action.expiration.as_deref(), "expiration")
+        .map_err(anyhow::Error::msg)?;
+    if entry_date > as_of {
+        anyhow::bail!("entry_date {entry_date} is after decision as_of {as_of}");
+    }
+    let days_held = (as_of - entry_date).num_days();
+    let dte = (expiration - as_of).num_days();
+    let entry_credit = require_option_nonzero_f64(action.entry_credit, "entry_credit")?;
+    if entry_credit <= 0.0 {
+        anyhow::bail!("credit-spread management requires a positive entry_credit credit");
+    }
+    let width = debit_spread_width(action)?;
+    if entry_credit >= width {
+        anyhow::bail!(
+            "entry credit {:.2} must be below credit-spread width {:.2}",
+            entry_credit,
+            width
+        );
+    }
+    let take_profit_debit = entry_credit * (1.0 - rules.take_profit_pct).max(0.0);
+    let stop_debit = entry_credit * rules.stop_loss_multiple;
+    let close = |reason: &str| CreditSpreadExitPlan::Close {
+        reason: reason.to_owned(),
+        limit_debit: exit_debit,
+    };
+    if exit_debit >= stop_debit {
+        return Ok(close("stop_loss"));
+    }
+    if exit_debit <= take_profit_debit {
+        return Ok(close("take_profit"));
+    }
+    if let Some(reason) = live_credit_spread_time_exit_reason(action, as_of)? {
+        return Ok(close(reason));
+    }
+    Ok(CreditSpreadExitPlan::Hold {
+        reason: format!(
+            "exit_debit {:.2} below stop {:.2}, above take_profit {:.2}, days_held {}, dte {}",
+            exit_debit, stop_debit, take_profit_debit, days_held, dte
+        ),
+    })
+}
+
+fn live_debit_spread_time_exit_reason(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<Option<&'static str>> {
+    let rules = action
+        .execution_rules
+        .as_ref()
+        .context("already-open signal missing execution rules")?;
+    let entry_date = trade_signal_date(action, action.entry_date.as_deref(), "entry_date")
+        .map_err(anyhow::Error::msg)?;
+    let expiration = trade_signal_date(action, action.expiration.as_deref(), "expiration")
+        .map_err(anyhow::Error::msg)?;
+    if entry_date > as_of {
+        anyhow::bail!("entry_date {entry_date} is after decision as_of {as_of}");
+    }
+    let days_held = (as_of - entry_date).num_days();
+    let dte = (expiration - as_of).num_days();
+    if rules
+        .max_hold_days
+        .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
+    {
+        return Ok(Some("max_hold"));
+    }
+    if dte <= rules.force_close_dte {
+        return Ok(Some("force_close"));
+    }
+    Ok(None)
+}
+
+fn live_credit_spread_time_exit_reason(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<Option<&'static str>> {
+    live_debit_spread_time_exit_reason(action, as_of)
+}
+
+fn live_vertical_spread_time_exit_reason(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<Option<&'static str>> {
+    live_debit_spread_time_exit_reason(action, as_of)
+}
+
+fn live_wheel_short_put_exit_plan(
+    action: &TradeSignal,
+    close_debit: f64,
+    as_of: NaiveDate,
+) -> Result<WheelShortPutExitPlan> {
+    if !close_debit.is_finite() || close_debit <= 0.0 {
+        anyhow::bail!("short-put close debit must be positive and finite");
+    }
+    let rules = action
+        .execution_rules
+        .as_ref()
+        .context("already-open wheel signal missing execution rules")?;
+    let entry_date = trade_signal_date(action, action.entry_date.as_deref(), "entry_date")
+        .map_err(anyhow::Error::msg)?;
+    let expiration = trade_signal_date(action, action.expiration.as_deref(), "expiration")
+        .map_err(anyhow::Error::msg)?;
+    if entry_date > as_of {
+        anyhow::bail!("entry_date {entry_date} is after decision as_of {as_of}");
+    }
+    if expiration < as_of {
+        anyhow::bail!("wheel short-put expiration {expiration} is before decision as_of {as_of}");
+    }
+    let entry_credit = require_option_nonzero_f64(action.entry_credit, "entry_credit")?;
+    if entry_credit <= 0.0 {
+        anyhow::bail!("wheel short-put management requires positive entry_credit");
+    }
+    let take_profit_debit = entry_credit * (1.0 - rules.take_profit_pct).max(0.0);
+    if close_debit <= take_profit_debit + 0.01 {
+        return Ok(WheelShortPutExitPlan::Close {
+            reason: "take_profit".to_owned(),
+            limit_debit: close_debit,
+        });
+    }
+    Ok(WheelShortPutExitPlan::Hold {
+        reason: format!(
+            "short_put_ask {:.2} above take_profit_debit {:.2}; wheel parity waits for put expiry/assignment instead of force-closing",
+            close_debit, take_profit_debit
+        ),
+    })
+}
+
+fn live_wheel_stock_liquidation_reason(
+    action: &TradeSignal,
+    as_of: NaiveDate,
+) -> Result<Option<String>> {
+    let expiration = trade_signal_date(action, action.expiration.as_deref(), "expiration")
+        .map_err(anyhow::Error::msg)?;
+    let exit_date = trade_signal_date(action, action.exit_date.as_deref(), "exit_date")
+        .map_err(anyhow::Error::msg)?;
+    if exit_date <= as_of
+        && matches!(
+            action.exit_reason.as_deref(),
+            Some("stock_marked_after_calls" | "stock_marked_no_call")
+        )
+    {
+        return Ok(action.exit_reason.clone());
+    }
+    let max_stock_hold_days = action
+        .execution_rules
+        .as_ref()
+        .and_then(|rules| rules.max_hold_days)
+        .unwrap_or(45)
+        .max(1);
+    let forced_stock_exit_date = expiration + chrono::Duration::days(max_stock_hold_days);
+    if as_of >= forced_stock_exit_date {
+        return Ok(Some("max_stock_hold".to_owned()));
+    }
+    Ok(None)
+}
+
+fn live_wheel_called_away_mismatch_due(action: &TradeSignal, as_of: NaiveDate) -> Result<bool> {
+    if !matches!(
+        action.exit_reason.as_deref(),
+        Some("covered_call_assigned" | "called_away")
+    ) {
+        return Ok(false);
+    }
+    let exit_date = trade_signal_date(action, action.exit_date.as_deref(), "exit_date")
+        .map_err(anyhow::Error::msg)?;
+    Ok(exit_date <= as_of)
+}
+
+fn debit_spread_width(action: &TradeSignal) -> Result<f64> {
+    if let Some(width) = action.width
+        && width.is_finite()
+        && width > 0.0
+    {
+        return Ok(width);
+    }
+    let short_strike = require_option_f64(action.short_strike, "short_strike")?;
+    let long_strike = require_option_f64(action.long_strike, "long_strike")?;
+    Ok((long_strike - short_strike).abs())
+}
+
 fn tradier_config_from_env() -> Result<TradierConfig> {
     let account_id = std::env::var("SPREAD_TRADIER_ACCOUNT_ID")
         .ok()
@@ -3721,13 +5987,133 @@ fn tradier_confirm_order_after_place(client: &TradierClient, order_id: &str) -> 
     else {
         anyhow::bail!("placed Tradier order id {order_id} was not present in orders response");
     };
-    let status = order.status.as_deref().unwrap_or("unknown").to_owned();
-    if tradier_order_status_blocks_new_entry(status.as_str()) || matches!(status.as_str(), "filled")
-    {
-        Ok(status)
+    let Some(status) = order
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    else {
+        anyhow::bail!("placed Tradier order id {order_id} returned no order status");
+    };
+    if tradier_post_submit_status_confirms(status) {
+        Ok(status.to_owned())
+    } else if tradier_order_status_blocks_new_entry(status) {
+        anyhow::bail!(
+            "placed Tradier order id {order_id} returned unrecognized active status {status}"
+        )
     } else {
         anyhow::bail!("placed Tradier order id {order_id} returned terminal status {status}");
     }
+}
+
+fn tradier_post_submit_status_confirms(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "accepted"
+            | "open"
+            | "pending"
+            | "queued"
+            | "submitted"
+            | "partially_filled"
+            | "partially-filled"
+            | "filled"
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SubmittedCloseLedgerDecision {
+    Retry(String),
+    Block(String),
+}
+
+fn tradier_submitted_close_ledger_decision(
+    entry: &ExecutionOrderLedgerEntry,
+    broker_orders: &[TradierOrder],
+    as_of: NaiveDate,
+) -> Option<SubmittedCloseLedgerDecision> {
+    if entry.status != "submitted" {
+        return None;
+    }
+    let order_id = entry.broker_order_id.as_deref()?.trim();
+    if order_id.is_empty() {
+        return None;
+    }
+    if let Some(order) = broker_orders
+        .iter()
+        .find(|order| order.id.as_deref().is_some_and(|id| id.trim() == order_id))
+    {
+        let status = order.status.as_deref().map(str::trim).unwrap_or_default();
+        if tradier_terminal_bad_status(status) {
+            return Some(SubmittedCloseLedgerDecision::Retry(format!(
+                "prior submitted DAY close order id {order_id} is terminal with broker status {status}; exposure remains and no active matching close order is present"
+            )));
+        }
+        if status.eq_ignore_ascii_case("filled") {
+            return Some(SubmittedCloseLedgerDecision::Block(format!(
+                "prior submitted close order id {order_id} is filled, but broker positions still show exposure; wait for position reconciliation or recover manually before submitting another close"
+            )));
+        }
+        return None;
+    }
+    if entry.recorded_at.date_naive() < as_of {
+        return Some(SubmittedCloseLedgerDecision::Retry(format!(
+            "prior submitted DAY close order id {order_id} is absent from current Tradier orders on {as_of}; exposure remains and no active matching close order is present"
+        )));
+    }
+    Some(SubmittedCloseLedgerDecision::Block(format!(
+        "submitted close order id {order_id} is absent from current Tradier orders on the same market date {as_of}; manual broker reconciliation is required before retrying"
+    )))
+}
+
+fn tradier_order_status_blocks_new_entry(status: &str) -> bool {
+    !matches!(
+        status.to_ascii_lowercase().as_str(),
+        "filled" | "canceled" | "cancelled" | "rejected" | "expired" | "error"
+    )
+}
+
+fn tradier_payload_is_close_order(payload: &BTreeMap<String, String>) -> bool {
+    if payload.get("class").map(String::as_str) == Some("equity")
+        && payload.get("side").map(String::as_str) == Some("sell")
+    {
+        return true;
+    }
+    payload.iter().any(|(key, value)| {
+        (key == "side" || key.starts_with("side[")) && value.ends_with("_to_close")
+    })
+}
+
+fn tradier_preview_rejection_ledger_status(payload: &BTreeMap<String, String>) -> &'static str {
+    if tradier_payload_is_close_order(payload) {
+        "preview_rejected"
+    } else {
+        "rejected"
+    }
+}
+
+fn tradier_order_key_payload(payload: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut keyed_payload = payload.clone();
+    if tradier_payload_is_close_order(payload) {
+        keyed_payload.remove("price");
+    }
+    keyed_payload
+}
+
+fn tradier_order_key(
+    config: &TradierConfig,
+    payload: &BTreeMap<String, String>,
+    action: &TradeSignal,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "broker": "tradier",
+        "account_id": config.account_id,
+        "base_url": config.base_url,
+        "strategy": action.strategy,
+        "entry_date": action.entry_date,
+        "status": action.status,
+        "payload": tradier_order_key_payload(payload),
+    }))
+    .expect("Tradier order key serialization should be infallible")
 }
 
 fn tradier_response_base_ok(response: &TradierOrderResponse) -> std::result::Result<(), String> {
@@ -3811,6 +6197,7 @@ fn tradier_terminal_bad_status(status: &str) -> bool {
 
 fn tradier_execution_order_payload(action: &TradeSignal) -> Result<BTreeMap<String, String>> {
     match action.strategy.as_str() {
+        "call_credit_spread" | "put_credit_spread" => tradier_multileg_credit_payload(action),
         "call_debit_spread" | "put_debit_spread" => tradier_multileg_debit_payload(action),
         "wheel" => tradier_cash_secured_put_payload(action),
         other => anyhow::bail!("Tradier execution does not support strategy {other}"),
@@ -3944,11 +6331,13 @@ fn tradier_assert_wheel_broker_state(
     Ok(())
 }
 
-fn tradier_assert_no_symbol_exposure(client: &TradierClient, action: &TradeSignal) -> Result<()> {
-    let symbol = require_action_field(action.symbol.as_str(), "symbol")?.to_ascii_uppercase();
+fn tradier_assert_vertical_spread_lifecycle_flat(
+    client: &TradierClient,
+    action: &TradeSignal,
+) -> Result<()> {
     let positions = client
         .get_positions()
-        .context("fetch Tradier positions before debit-spread preview")?;
+        .context("fetch Tradier positions before vertical-spread lifecycle check")?;
     if !positions.ok {
         anyhow::bail!(
             "{}",
@@ -3957,21 +6346,10 @@ fn tradier_assert_no_symbol_exposure(client: &TradierClient, action: &TradeSigna
                 .unwrap_or_else(|| "Tradier positions request failed".to_owned())
         );
     }
-    if let Some(position) = positions
-        .positions
-        .iter()
-        .find(|position| tradier_position_matches_symbol(position, &symbol))
-    {
-        anyhow::bail!(
-            "existing Tradier position {} quantity {:.4} blocks new debit-spread entry",
-            position.symbol,
-            position.quantity
-        );
-    }
 
     let orders = client
         .get_orders()
-        .context("fetch Tradier orders before debit-spread preview")?;
+        .context("fetch Tradier orders before vertical-spread lifecycle check")?;
     if !orders.ok {
         anyhow::bail!(
             "{}",
@@ -3980,18 +6358,415 @@ fn tradier_assert_no_symbol_exposure(client: &TradierClient, action: &TradeSigna
                 .unwrap_or_else(|| "Tradier orders request failed".to_owned())
         );
     }
+
+    match tradier_vertical_spread_lifecycle_state(action, &positions.positions, &orders.orders)? {
+        TradierDebitSpreadLifecycleState::Flat => Ok(()),
+        TradierDebitSpreadLifecycleState::Open { quantity } => {
+            anyhow::bail!("existing Tradier vertical spread quantity {quantity} blocks new entry")
+        }
+        TradierDebitSpreadLifecycleState::ActiveOrder { id, status } => {
+            anyhow::bail!(
+                "active Tradier vertical-spread order id {:?} status {:?} blocks new entry",
+                id,
+                status
+            )
+        }
+        TradierDebitSpreadLifecycleState::Inconsistent { reason } => {
+            anyhow::bail!("inconsistent Tradier vertical-spread lifecycle state: {reason}")
+        }
+        TradierDebitSpreadLifecycleState::AssignedShortLeg {
+            right,
+            long_quantity,
+            stock_quantity,
+        } => {
+            anyhow::bail!(
+                "Tradier vertical-spread short {} appears assigned: stock quantity {:.4} and long hedge quantity {:.4} block new entry",
+                option_right_value(&right),
+                stock_quantity,
+                long_quantity
+            )
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TradierDebitSpreadLifecycleState {
+    Flat,
+    Open {
+        quantity: u32,
+    },
+    ActiveOrder {
+        id: Option<String>,
+        status: Option<String>,
+    },
+    AssignedShortLeg {
+        right: OptionRight,
+        long_quantity: f64,
+        stock_quantity: f64,
+    },
+    Inconsistent {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TradierWheelLifecycleState {
+    Flat,
+    ShortPutOpen {
+        quantity: u32,
+    },
+    AssignedStock {
+        shares: f64,
+    },
+    CoveredCallOpen {
+        quantity: u32,
+    },
+    ActiveOrder {
+        id: Option<String>,
+        status: Option<String>,
+    },
+    Inconsistent {
+        reason: String,
+    },
+}
+
+#[allow(dead_code)]
+fn tradier_debit_spread_lifecycle_state(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+) -> Result<TradierDebitSpreadLifecycleState> {
+    tradier_vertical_spread_lifecycle_state_with_allowed_positions(action, positions, orders, None)
+}
+
+#[allow(dead_code)]
+fn tradier_debit_spread_lifecycle_state_with_allowed_positions(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+    allowed_position_symbols: Option<&BTreeSet<String>>,
+) -> Result<TradierDebitSpreadLifecycleState> {
+    tradier_vertical_spread_lifecycle_state_with_allowed_positions(
+        action,
+        positions,
+        orders,
+        allowed_position_symbols,
+    )
+}
+
+fn tradier_vertical_spread_lifecycle_state(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+) -> Result<TradierDebitSpreadLifecycleState> {
+    tradier_vertical_spread_lifecycle_state_with_allowed_positions(action, positions, orders, None)
+}
+
+fn tradier_vertical_spread_lifecycle_state_with_allowed_positions(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+    allowed_position_symbols: Option<&BTreeSet<String>>,
+) -> Result<TradierDebitSpreadLifecycleState> {
+    let (long_key, short_key) = trade_signal_vertical_spread_keys(action)?;
+    let underlying = long_key.underlying.to_ascii_uppercase();
+    let long_occ = tradier_occ_option_symbol(&long_key)?;
+    let short_occ = tradier_occ_option_symbol(&short_key)?;
+
+    if let Some(order) = orders.iter().find(|order| {
+        tradier_order_is_active(order)
+            && tradier_order_matches_debit_spread_security(
+                order,
+                &underlying,
+                &long_occ,
+                &short_occ,
+            )
+    }) {
+        return Ok(TradierDebitSpreadLifecycleState::ActiveOrder {
+            id: order.id.clone(),
+            status: order.status.clone(),
+        });
+    }
+
+    let long_quantity = tradier_position_quantity_for_security(positions, &long_occ);
+    let short_quantity = tradier_position_quantity_for_security(positions, &short_occ);
+    let stock_quantity = tradier_position_quantity_for_security(positions, &underlying);
+    let unrelated = positions.iter().find(|position| {
+        let position_symbol = position.symbol.to_ascii_uppercase();
+        position.quantity.abs() > f64::EPSILON
+            && tradier_position_matches_symbol(position, &underlying)
+            && !position.symbol.eq_ignore_ascii_case(&underlying)
+            && !position.symbol.eq_ignore_ascii_case(&long_occ)
+            && !position.symbol.eq_ignore_ascii_case(&short_occ)
+            && !allowed_position_symbols.is_some_and(|symbols| symbols.contains(&position_symbol))
+    });
+    if let Some(position) = unrelated {
+        return Ok(TradierDebitSpreadLifecycleState::Inconsistent {
+            reason: format!(
+                "unrelated symbol exposure {} quantity {:.4}",
+                position.symbol, position.quantity
+            ),
+        });
+    }
+
+    if stock_quantity.abs() > f64::EPSILON {
+        return Ok(tradier_debit_spread_assignment_lifecycle_state(
+            &long_key.right,
+            long_quantity,
+            short_quantity,
+            stock_quantity,
+        ));
+    }
+
+    if long_quantity.abs() <= f64::EPSILON && short_quantity.abs() <= f64::EPSILON {
+        return Ok(TradierDebitSpreadLifecycleState::Flat);
+    }
+    if long_quantity > 0.0
+        && short_quantity < 0.0
+        && (long_quantity + short_quantity).abs() <= f64::EPSILON
+        && (long_quantity.round() - long_quantity).abs() <= f64::EPSILON
+    {
+        return Ok(TradierDebitSpreadLifecycleState::Open {
+            quantity: long_quantity.round() as u32,
+        });
+    }
+    Ok(TradierDebitSpreadLifecycleState::Inconsistent {
+        reason: format!(
+            "expected equal positive long leg and negative short leg quantities; got long {:.4}, short {:.4}",
+            long_quantity, short_quantity
+        ),
+    })
+}
+
+fn tradier_debit_spread_assignment_lifecycle_state(
+    right: &OptionRight,
+    long_quantity: f64,
+    short_quantity: f64,
+    stock_quantity: f64,
+) -> TradierDebitSpreadLifecycleState {
+    let assigned_contracts = stock_quantity.abs() / 100.0;
+    if assigned_contracts < f64::EPSILON
+        || (assigned_contracts.round() - assigned_contracts).abs() > f64::EPSILON
+    {
+        return TradierDebitSpreadLifecycleState::Inconsistent {
+            reason: format!(
+                "underlying stock quantity {:.4} is not a whole-contract assignment multiple",
+                stock_quantity
+            ),
+        };
+    }
+    if short_quantity.abs() > f64::EPSILON {
+        return TradierDebitSpreadLifecycleState::Inconsistent {
+            reason: format!(
+                "underlying stock quantity {:.4} coexists with short leg quantity {:.4}",
+                stock_quantity, short_quantity
+            ),
+        };
+    }
+    if long_quantity < -f64::EPSILON
+        || (long_quantity.abs() > f64::EPSILON
+            && (long_quantity.round() - long_quantity).abs() > f64::EPSILON)
+    {
+        return TradierDebitSpreadLifecycleState::Inconsistent {
+            reason: format!(
+                "underlying stock quantity {:.4} has invalid long hedge quantity {:.4}",
+                stock_quantity, long_quantity
+            ),
+        };
+    }
+    if matches!(right, OptionRight::Call) && stock_quantity < 0.0
+        || matches!(right, OptionRight::Put) && stock_quantity > 0.0
+    {
+        return TradierDebitSpreadLifecycleState::AssignedShortLeg {
+            right: right.clone(),
+            long_quantity,
+            stock_quantity,
+        };
+    }
+    TradierDebitSpreadLifecycleState::Inconsistent {
+        reason: format!(
+            "{} debit spread has underlying stock quantity {:.4}, which does not match assigned short-leg direction",
+            option_right_value(right),
+            stock_quantity
+        ),
+    }
+}
+
+fn tradier_wheel_lifecycle_state(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+    _as_of: NaiveDate,
+) -> Result<TradierWheelLifecycleState> {
+    let symbol = require_action_field(action.symbol.as_str(), "symbol")?.to_ascii_uppercase();
+    let put_symbol = tradier_occ_option_symbol(&trade_signal_wheel_short_put_key(action)?)?;
+    let covered_call_positions = tradier_wheel_covered_call_positions(positions, &symbol);
+    let covered_call_symbols: BTreeSet<String> = covered_call_positions
+        .iter()
+        .map(|position| position.symbol.to_ascii_uppercase())
+        .collect();
+
     if let Some(order) = orders
-        .orders
         .iter()
         .find(|order| tradier_order_blocks_new_symbol_entry(order, &symbol))
     {
-        anyhow::bail!(
-            "active Tradier order {:?} status {:?} blocks new debit-spread entry",
-            order.id,
-            order.status
-        );
+        return Ok(TradierWheelLifecycleState::ActiveOrder {
+            id: order.id.clone(),
+            status: order.status.clone(),
+        });
     }
-    Ok(())
+
+    let short_put_quantity = tradier_position_quantity_for_security(positions, &put_symbol);
+    let covered_call_quantity: f64 = covered_call_positions
+        .iter()
+        .map(|position| position.quantity)
+        .sum();
+    let stock_quantity = tradier_position_quantity_for_security(positions, &symbol);
+    let unrelated = positions.iter().find(|position| {
+        let position_symbol = position.symbol.to_ascii_uppercase();
+        position.quantity.abs() > f64::EPSILON
+            && tradier_position_matches_symbol(position, &symbol)
+            && !position.symbol.eq_ignore_ascii_case(&symbol)
+            && !position.symbol.eq_ignore_ascii_case(&put_symbol)
+            && !covered_call_symbols.contains(&position_symbol)
+    });
+    if let Some(position) = unrelated {
+        return Ok(TradierWheelLifecycleState::Inconsistent {
+            reason: format!(
+                "unrelated wheel exposure {} quantity {:.4}",
+                position.symbol, position.quantity
+            ),
+        });
+    }
+
+    if short_put_quantity.abs() > f64::EPSILON {
+        if stock_quantity.abs() > f64::EPSILON || covered_call_quantity.abs() > f64::EPSILON {
+            return Ok(TradierWheelLifecycleState::Inconsistent {
+                reason: format!(
+                    "short put quantity {:.4} coexists with stock {:.4} or covered call {:.4}",
+                    short_put_quantity, stock_quantity, covered_call_quantity
+                ),
+            });
+        }
+        let contracts = -short_put_quantity;
+        if contracts > 0.0 && (contracts.round() - contracts).abs() <= f64::EPSILON {
+            return Ok(TradierWheelLifecycleState::ShortPutOpen {
+                quantity: contracts.round() as u32,
+            });
+        }
+        return Ok(TradierWheelLifecycleState::Inconsistent {
+            reason: format!(
+                "expected negative short-put quantity for {}; got {:.4}",
+                put_symbol, short_put_quantity
+            ),
+        });
+    }
+
+    if stock_quantity.abs() > f64::EPSILON {
+        if stock_quantity < 0.0 {
+            return Ok(TradierWheelLifecycleState::Inconsistent {
+                reason: format!("wheel stock quantity is short {:.4}", stock_quantity),
+            });
+        }
+        if covered_call_quantity.abs() > f64::EPSILON {
+            let contracts = -covered_call_quantity;
+            if contracts > 0.0
+                && (contracts.round() - contracts).abs() <= f64::EPSILON
+                && (stock_quantity - contracts.round() * 100.0).abs() <= f64::EPSILON
+            {
+                return Ok(TradierWheelLifecycleState::CoveredCallOpen {
+                    quantity: contracts.round() as u32,
+                });
+            }
+            return Ok(TradierWheelLifecycleState::Inconsistent {
+                reason: format!(
+                    "expected covered-call quantity to match stock; got stock {:.4}, call {:.4}",
+                    stock_quantity, covered_call_quantity
+                ),
+            });
+        }
+        return Ok(TradierWheelLifecycleState::AssignedStock {
+            shares: stock_quantity,
+        });
+    }
+
+    if covered_call_quantity.abs() > f64::EPSILON {
+        return Ok(TradierWheelLifecycleState::Inconsistent {
+            reason: format!(
+                "covered-call quantity {:.4} exists without matching stock",
+                covered_call_quantity
+            ),
+        });
+    }
+
+    Ok(TradierWheelLifecycleState::Flat)
+}
+
+fn tradier_wheel_covered_call_positions<'a>(
+    positions: &'a [TradierPosition],
+    symbol: &str,
+) -> Vec<&'a TradierPosition> {
+    positions
+        .iter()
+        .filter(|position| {
+            position.quantity.abs() > f64::EPSILON
+                && position.quantity < 0.0
+                && tradier_occ_option_symbol_matches_underlying_right(
+                    position.symbol.as_str(),
+                    symbol,
+                    OptionRight::Call,
+                )
+        })
+        .collect()
+}
+
+fn tradier_vertical_spread_management_position_symbols(
+    actions: &[TradeSignal],
+) -> Result<BTreeSet<String>> {
+    let mut symbols = BTreeSet::new();
+    for action in actions {
+        let (long_key, short_key) = trade_signal_vertical_spread_keys(action)?;
+        symbols.insert(tradier_occ_option_symbol(&long_key)?.to_ascii_uppercase());
+        symbols.insert(tradier_occ_option_symbol(&short_key)?.to_ascii_uppercase());
+    }
+    Ok(symbols)
+}
+
+#[allow(dead_code)]
+fn tradier_debit_spread_management_position_symbols(
+    actions: &[TradeSignal],
+) -> Result<BTreeSet<String>> {
+    tradier_vertical_spread_management_position_symbols(actions)
+}
+
+fn tradier_position_quantity_for_security(positions: &[TradierPosition], security: &str) -> f64 {
+    positions
+        .iter()
+        .filter(|position| position.symbol.eq_ignore_ascii_case(security))
+        .map(|position| position.quantity)
+        .sum()
+}
+
+fn tradier_order_is_active(order: &TradierOrder) -> bool {
+    order.quantity.unwrap_or(0.0).abs() > f64::EPSILON
+        && order
+            .status
+            .as_deref()
+            .is_none_or(tradier_order_status_blocks_new_entry)
+}
+
+fn tradier_order_matches_debit_spread_security(
+    order: &TradierOrder,
+    underlying: &str,
+    long_occ: &str,
+    short_occ: &str,
+) -> bool {
+    order.option_symbol.as_deref().is_some_and(|security| {
+        security.eq_ignore_ascii_case(long_occ) || security.eq_ignore_ascii_case(short_occ)
+    }) || order
+        .symbol
+        .as_deref()
+        .is_some_and(|security| tradier_security_matches_underlying(security, underlying))
 }
 
 fn tradier_validate_current_debit_quote(
@@ -4061,6 +6836,306 @@ fn tradier_validate_current_debit_quote(
     Ok(quotes)
 }
 
+fn tradier_validate_current_credit_quote(
+    client: &TradierClient,
+    payload: &BTreeMap<String, String>,
+    action: &TradeSignal,
+    mode: ExecutionMode,
+) -> Result<TradierQuotesResponse> {
+    let short_symbol = payload
+        .get("option_symbol[0]")
+        .ok_or_else(|| anyhow::anyhow!("credit spread payload missing short option symbol"))?
+        .to_owned();
+    let long_symbol = payload
+        .get("option_symbol[1]")
+        .ok_or_else(|| anyhow::anyhow!("credit spread payload missing long option symbol"))?
+        .to_owned();
+    let limit_credit = payload
+        .get("price")
+        .ok_or_else(|| anyhow::anyhow!("credit spread payload missing price"))?
+        .parse::<f64>()
+        .context("parse Tradier credit spread limit price")?;
+    let quotes = client
+        .get_quotes(&[short_symbol.clone(), long_symbol.clone()])
+        .context("fetch Tradier current option quotes before credit-spread preview")?;
+    if !quotes.ok {
+        anyhow::bail!(
+            "{}",
+            quotes
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier quotes request failed".to_owned())
+        );
+    }
+    let short_quote = tradier_quote_for_symbol(&quotes.quotes, &short_symbol)?;
+    let long_quote = tradier_quote_for_symbol(&quotes.quotes, &long_symbol)?;
+    let short_bid = tradier_quote_positive_value(short_quote.bid, &short_symbol, "bid")?;
+    let long_ask = tradier_quote_positive_value(long_quote.ask, &long_symbol, "ask")?;
+    if mode == ExecutionMode::Live {
+        tradier_quote_positive_value(short_quote.bid_size, &short_symbol, "bid_size")?;
+        tradier_quote_positive_value(long_quote.ask_size, &long_symbol, "ask_size")?;
+        tradier_assert_fresh_quote_side(short_quote, &short_symbol, "bid")?;
+        tradier_assert_fresh_quote_side(long_quote, &long_symbol, "ask")?;
+    }
+    let current_credit = short_bid - long_ask;
+    if !current_credit.is_finite() || current_credit <= 0.0 {
+        anyhow::bail!(
+            "current conservative credit {:.2} is not a positive executable credit",
+            current_credit
+        );
+    }
+    let (short_key, long_key) = trade_signal_credit_spread_keys(action)?;
+    let width = decimal_to_f64((short_key.strike - long_key.strike).abs(), "width")?;
+    if current_credit >= width {
+        anyhow::bail!(
+            "current conservative credit {:.2} is not below strike width {:.2}",
+            current_credit,
+            width
+        );
+    }
+    if current_credit + 0.01 < limit_credit {
+        anyhow::bail!(
+            "current conservative credit {:.2} is below order limit {:.2}",
+            current_credit,
+            limit_credit
+        );
+    }
+    if let Some(max_loss) = action.max_loss {
+        let current_risk = (width - current_credit) * 100.0;
+        if current_risk > max_loss + 1.0 {
+            anyhow::bail!(
+                "current conservative credit-spread risk {:.2} exceeds signal max_loss {:.2}",
+                current_risk,
+                max_loss
+            );
+        }
+    }
+    Ok(quotes)
+}
+
+fn tradier_validate_current_wheel_entry_quote(
+    client: &TradierClient,
+    payload: &BTreeMap<String, String>,
+    mode: ExecutionMode,
+) -> Result<TradierQuotesResponse> {
+    let option_symbol = payload
+        .get("option_symbol")
+        .ok_or_else(|| anyhow::anyhow!("wheel payload missing option symbol"))?;
+    let limit_credit = payload
+        .get("price")
+        .ok_or_else(|| anyhow::anyhow!("wheel payload missing price"))?
+        .parse::<f64>()
+        .context("parse Tradier wheel limit price")?;
+    let (quotes, current_bid) =
+        tradier_validate_current_single_option_quote(client, option_symbol, "bid", mode)?;
+    if current_bid + 0.01 < limit_credit {
+        anyhow::bail!(
+            "current short-put bid {:.2} is below order limit credit {:.2}",
+            current_bid,
+            limit_credit
+        );
+    }
+    Ok(quotes)
+}
+
+#[allow(dead_code)]
+fn tradier_validate_current_debit_exit_quote(
+    client: &TradierClient,
+    action: &TradeSignal,
+    mode: ExecutionMode,
+) -> Result<(TradierQuotesResponse, f64)> {
+    let (long_key, short_key) = trade_signal_debit_spread_keys(action)?;
+    let long_symbol = tradier_occ_option_symbol(&long_key)?;
+    let short_symbol = tradier_occ_option_symbol(&short_key)?;
+    let quotes = client
+        .get_quotes(&[long_symbol.clone(), short_symbol.clone()])
+        .context("fetch Tradier current option quotes before debit-spread close")?;
+    if !quotes.ok {
+        anyhow::bail!(
+            "{}",
+            quotes
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier quotes request failed".to_owned())
+        );
+    }
+    let exit_credit =
+        tradier_current_debit_exit_credit(&quotes.quotes, &long_symbol, &short_symbol, mode)?;
+    let width = decimal_to_f64((long_key.strike - short_key.strike).abs(), "width")?;
+    if exit_credit > width + 0.01 {
+        anyhow::bail!(
+            "current conservative exit credit {:.2} exceeds strike width {:.2}",
+            exit_credit,
+            width
+        );
+    }
+    Ok((quotes, exit_credit))
+}
+
+fn tradier_validate_current_credit_exit_quote(
+    client: &TradierClient,
+    action: &TradeSignal,
+    mode: ExecutionMode,
+) -> Result<(TradierQuotesResponse, f64)> {
+    let (short_key, long_key) = trade_signal_credit_spread_keys(action)?;
+    let short_symbol = tradier_occ_option_symbol(&short_key)?;
+    let long_symbol = tradier_occ_option_symbol(&long_key)?;
+    let quotes = client
+        .get_quotes(&[short_symbol.clone(), long_symbol.clone()])
+        .context("fetch Tradier current option quotes before credit-spread close")?;
+    if !quotes.ok {
+        anyhow::bail!(
+            "{}",
+            quotes
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier quotes request failed".to_owned())
+        );
+    }
+    let width = decimal_to_f64((short_key.strike - long_key.strike).abs(), "width")?;
+    let exit_debit = tradier_current_credit_exit_debit(
+        &quotes.quotes,
+        &short_symbol,
+        &long_symbol,
+        width,
+        mode,
+    )?;
+    if exit_debit > width + 0.01 {
+        anyhow::bail!(
+            "current conservative exit debit {:.2} exceeds strike width {:.2}",
+            exit_debit,
+            width
+        );
+    }
+    Ok((quotes, exit_debit))
+}
+
+fn tradier_current_debit_exit_credit(
+    quotes: &[TradierQuote],
+    long_symbol: &str,
+    short_symbol: &str,
+    mode: ExecutionMode,
+) -> Result<f64> {
+    let long_quote = tradier_quote_for_symbol(quotes, long_symbol)?;
+    let short_quote = tradier_quote_for_symbol(quotes, short_symbol)?;
+    let long_bid = tradier_quote_nonnegative_value(long_quote.bid, long_symbol, "bid")?;
+    let short_ask = tradier_quote_nonnegative_value(short_quote.ask, short_symbol, "ask")?;
+    if mode == ExecutionMode::Live {
+        if long_bid > 0.0 {
+            tradier_quote_positive_value(long_quote.bid_size, long_symbol, "bid_size")?;
+        }
+        if short_ask > 0.0 {
+            tradier_quote_positive_value(short_quote.ask_size, short_symbol, "ask_size")?;
+        }
+        tradier_assert_fresh_quote_side(long_quote, long_symbol, "bid")?;
+        tradier_assert_fresh_quote_side(short_quote, short_symbol, "ask")?;
+    }
+    let exit_credit = long_bid - short_ask;
+    if !exit_credit.is_finite() {
+        anyhow::bail!("current conservative exit credit {exit_credit:.2} is not finite");
+    }
+    Ok(exit_credit)
+}
+
+fn tradier_current_credit_exit_debit(
+    quotes: &[TradierQuote],
+    short_symbol: &str,
+    long_symbol: &str,
+    width: f64,
+    mode: ExecutionMode,
+) -> Result<f64> {
+    if !width.is_finite() || width <= 0.0 {
+        anyhow::bail!("credit-spread width must be positive and finite");
+    }
+    let short_quote = tradier_quote_for_symbol(quotes, short_symbol)?;
+    let long_quote = tradier_quote_for_symbol(quotes, long_symbol)?;
+    let short_ask = tradier_quote_nonnegative_value(short_quote.ask, short_symbol, "ask")?;
+    let long_bid = tradier_quote_nonnegative_value(long_quote.bid, long_symbol, "bid")?;
+    if mode == ExecutionMode::Live {
+        if short_ask > 0.0 {
+            tradier_quote_positive_value(short_quote.ask_size, short_symbol, "ask_size")?;
+        }
+        if long_bid > 0.0 {
+            tradier_quote_positive_value(long_quote.bid_size, long_symbol, "bid_size")?;
+        }
+        tradier_assert_fresh_quote_side(short_quote, short_symbol, "ask")?;
+        tradier_assert_fresh_quote_side(long_quote, long_symbol, "bid")?;
+    }
+    let exit_debit = conservative_short_spread_exit_debit_f64(short_ask, long_bid, width);
+    if !exit_debit.is_finite() {
+        anyhow::bail!("current conservative exit debit {exit_debit:.2} is not finite");
+    }
+    Ok(exit_debit)
+}
+
+fn tradier_validate_current_single_option_quote(
+    client: &TradierClient,
+    option_symbol: &str,
+    side: &str,
+    mode: ExecutionMode,
+) -> Result<(TradierQuotesResponse, f64)> {
+    let quotes = client
+        .get_quotes(&[option_symbol.to_owned()])
+        .context("fetch Tradier current option quote before single-leg preview")?;
+    if !quotes.ok {
+        anyhow::bail!(
+            "{}",
+            quotes
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier quotes request failed".to_owned())
+        );
+    }
+    let quote = tradier_quote_for_symbol(&quotes.quotes, option_symbol)?;
+    let executable_price = match side {
+        "ask" => {
+            let ask = tradier_quote_positive_value(quote.ask, option_symbol, "ask")?;
+            if mode == ExecutionMode::Live {
+                tradier_quote_positive_value(quote.ask_size, option_symbol, "ask_size")?;
+                tradier_assert_fresh_quote_side(quote, option_symbol, "ask")?;
+            }
+            ask
+        }
+        "bid" => {
+            let bid = tradier_quote_positive_value(quote.bid, option_symbol, "bid")?;
+            if mode == ExecutionMode::Live {
+                tradier_quote_positive_value(quote.bid_size, option_symbol, "bid_size")?;
+                tradier_assert_fresh_quote_side(quote, option_symbol, "bid")?;
+            }
+            bid
+        }
+        other => anyhow::bail!("unsupported single-option quote side {other}"),
+    };
+    Ok((quotes, executable_price))
+}
+
+fn tradier_validate_current_equity_sell_quote(
+    client: &TradierClient,
+    symbol: &str,
+    mode: ExecutionMode,
+) -> Result<(TradierQuotesResponse, f64)> {
+    let symbol = require_action_field(symbol, "symbol")?.to_ascii_uppercase();
+    let quotes = client
+        .get_quotes(std::slice::from_ref(&symbol))
+        .context("fetch Tradier current equity quote before stock liquidation preview")?;
+    if !quotes.ok {
+        anyhow::bail!(
+            "{}",
+            quotes
+                .error
+                .clone()
+                .unwrap_or_else(|| "Tradier quotes request failed".to_owned())
+        );
+    }
+    let quote = tradier_quote_for_symbol(&quotes.quotes, &symbol)?;
+    let bid = tradier_quote_positive_value(quote.bid, &symbol, "bid")?;
+    if mode == ExecutionMode::Live {
+        tradier_quote_positive_value(quote.bid_size, &symbol, "bid_size")?;
+        tradier_assert_fresh_quote_side(quote, &symbol, "bid")?;
+    }
+    Ok((quotes, bid))
+}
+
 fn tradier_assert_fresh_quote_side(quote: &TradierQuote, symbol: &str, side: &str) -> Result<()> {
     let timestamp = match side {
         "ask" => quote.ask_date.or(quote.trade_date),
@@ -4070,10 +7145,11 @@ fn tradier_assert_fresh_quote_side(quote: &TradierQuote, symbol: &str, side: &st
     .ok_or_else(|| anyhow::anyhow!("Tradier quote {symbol} missing {side} timestamp"))?;
     let quote_time = tradier_quote_timestamp_utc(timestamp)
         .ok_or_else(|| anyhow::anyhow!("Tradier quote {symbol} has invalid {side} timestamp"))?;
-    let age_seconds = Utc::now()
-        .signed_duration_since(quote_time)
-        .num_seconds()
-        .abs();
+    let age = Utc::now().signed_duration_since(quote_time);
+    if age.num_seconds() < 0 {
+        anyhow::bail!("Tradier quote {symbol} {side} timestamp is in the future");
+    }
+    let age_seconds = age.num_seconds();
     let max_age_seconds = env_i64(
         "SPREAD_EXECUTION_MAX_QUOTE_AGE_SECONDS",
         DEFAULT_MAX_QUOTE_AGE_SECONDS,
@@ -4165,11 +7241,30 @@ fn tradier_security_matches_underlying(security: &str, symbol: &str) -> bool {
         .is_some_and(|ch| ch.is_ascii_digit())
 }
 
-fn tradier_order_status_blocks_new_entry(status: &str) -> bool {
-    !matches!(
-        status.to_ascii_lowercase().as_str(),
-        "filled" | "canceled" | "cancelled" | "rejected" | "expired" | "error"
-    )
+fn tradier_occ_option_symbol_matches_underlying_right(
+    security: &str,
+    symbol: &str,
+    right: OptionRight,
+) -> bool {
+    let security = security.trim().to_ascii_uppercase();
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if security.len() <= 15 {
+        return false;
+    }
+    let prefix_len = security.len() - 15;
+    if &security[..prefix_len] != symbol.as_str() {
+        return false;
+    }
+    let suffix = &security[prefix_len..];
+    let bytes = suffix.as_bytes();
+    let expected_right = match right {
+        OptionRight::Call => b'C',
+        OptionRight::Put => b'P',
+    };
+    bytes.len() == 15
+        && bytes[..6].iter().all(u8::is_ascii_digit)
+        && bytes[6] == expected_right
+        && bytes[7..].iter().all(u8::is_ascii_digit)
 }
 
 fn tradier_cash_secured_put_payload(action: &TradeSignal) -> Result<BTreeMap<String, String>> {
@@ -4273,6 +7368,231 @@ fn tradier_multileg_debit_payload(action: &TradeSignal) -> Result<BTreeMap<Strin
     Ok(payload)
 }
 
+fn tradier_multileg_credit_payload(action: &TradeSignal) -> Result<BTreeMap<String, String>> {
+    if !is_credit_spread_strategy(action.strategy.as_str()) {
+        anyhow::bail!(
+            "Tradier credit-spread payload only supports call_credit_spread and put_credit_spread"
+        );
+    }
+    let intent = trade_signal_order_intent(action)?;
+    if intent.order_effect != OptionOrderEffect::Credit {
+        anyhow::bail!("Tradier credit spread entry must be a credit order");
+    }
+    if intent.quantity() != 1 {
+        anyhow::bail!("Tradier V1 order quantity must be one spread");
+    }
+    let [short_leg, long_leg] = intent.legs.as_slice() else {
+        anyhow::bail!("Tradier V1 credit spread must have exactly two legs");
+    };
+    if short_leg.side != OptionOrderSide::Sell
+        || short_leg.position_effect != PositionEffect::Open
+        || long_leg.side != OptionOrderSide::Buy
+        || long_leg.position_effect != PositionEffect::Open
+    {
+        anyhow::bail!("Tradier credit spread legs must be sell_to_open then buy_to_open");
+    }
+    if short_leg.key.right != long_leg.key.right
+        || short_leg.key.expiration != long_leg.key.expiration
+        || short_leg.key.underlying != long_leg.key.underlying
+    {
+        anyhow::bail!("Tradier credit spread legs must share underlying, expiration, and right");
+    }
+
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "multileg".to_owned());
+    payload.insert("symbol".to_owned(), intent.symbol.to_ascii_uppercase());
+    payload.insert("type".to_owned(), "credit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&intent.time_in_force).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(intent.limit_price, "limit_price")?,
+    );
+    payload.insert(
+        "option_symbol[0]".to_owned(),
+        tradier_occ_option_symbol(&short_leg.key)?,
+    );
+    payload.insert("side[0]".to_owned(), "sell_to_open".to_owned());
+    payload.insert("quantity[0]".to_owned(), short_leg.quantity.to_string());
+    payload.insert(
+        "option_symbol[1]".to_owned(),
+        tradier_occ_option_symbol(&long_leg.key)?,
+    );
+    payload.insert("side[1]".to_owned(), "buy_to_open".to_owned());
+    payload.insert("quantity[1]".to_owned(), long_leg.quantity.to_string());
+    Ok(payload)
+}
+
+fn tradier_multileg_debit_close_payload(
+    action: &TradeSignal,
+    limit_credit: f64,
+    quantity: u32,
+) -> Result<BTreeMap<String, String>> {
+    let (long_key, short_key) = trade_signal_debit_spread_keys(action)?;
+    let intent = debit_spread_close_intent(
+        long_key,
+        short_key,
+        quantity,
+        decimal_from_f64(limit_credit, "limit_credit")?,
+        action.strategy.clone(),
+    )?;
+    if intent.order_effect != OptionOrderEffect::Credit {
+        anyhow::bail!("Tradier debit-spread close must be a credit order");
+    }
+    let [long_leg, short_leg] = intent.legs.as_slice() else {
+        anyhow::bail!("Tradier debit-spread close must have exactly two legs");
+    };
+    if long_leg.side != OptionOrderSide::Sell
+        || long_leg.position_effect != PositionEffect::Close
+        || short_leg.side != OptionOrderSide::Buy
+        || short_leg.position_effect != PositionEffect::Close
+    {
+        anyhow::bail!("Tradier debit-spread close legs must be sell_to_close then buy_to_close");
+    }
+
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "multileg".to_owned());
+    payload.insert("symbol".to_owned(), intent.symbol.to_ascii_uppercase());
+    payload.insert("type".to_owned(), "credit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&intent.time_in_force).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(intent.limit_price, "limit_credit")?,
+    );
+    payload.insert(
+        "option_symbol[0]".to_owned(),
+        tradier_occ_option_symbol(&long_leg.key)?,
+    );
+    payload.insert("side[0]".to_owned(), "sell_to_close".to_owned());
+    payload.insert("quantity[0]".to_owned(), long_leg.quantity.to_string());
+    payload.insert(
+        "option_symbol[1]".to_owned(),
+        tradier_occ_option_symbol(&short_leg.key)?,
+    );
+    payload.insert("side[1]".to_owned(), "buy_to_close".to_owned());
+    payload.insert("quantity[1]".to_owned(), short_leg.quantity.to_string());
+    Ok(payload)
+}
+
+fn tradier_multileg_credit_close_payload(
+    action: &TradeSignal,
+    limit_debit: f64,
+    quantity: u32,
+) -> Result<BTreeMap<String, String>> {
+    let (short_key, long_key) = trade_signal_credit_spread_keys(action)?;
+    let intent = credit_spread_close_intent(
+        short_key,
+        long_key,
+        quantity,
+        decimal_from_f64(limit_debit, "limit_debit")?,
+        action.strategy.clone(),
+    )?;
+    if intent.order_effect != OptionOrderEffect::Debit {
+        anyhow::bail!("Tradier credit-spread close must be a debit order");
+    }
+    let [short_leg, long_leg] = intent.legs.as_slice() else {
+        anyhow::bail!("Tradier credit-spread close must have exactly two legs");
+    };
+    if short_leg.side != OptionOrderSide::Buy
+        || short_leg.position_effect != PositionEffect::Close
+        || long_leg.side != OptionOrderSide::Sell
+        || long_leg.position_effect != PositionEffect::Close
+    {
+        anyhow::bail!("Tradier credit-spread close legs must be buy_to_close then sell_to_close");
+    }
+
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "multileg".to_owned());
+    payload.insert("symbol".to_owned(), intent.symbol.to_ascii_uppercase());
+    payload.insert("type".to_owned(), "debit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&intent.time_in_force).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(intent.limit_price, "limit_debit")?,
+    );
+    payload.insert(
+        "option_symbol[0]".to_owned(),
+        tradier_occ_option_symbol(&short_leg.key)?,
+    );
+    payload.insert("side[0]".to_owned(), "buy_to_close".to_owned());
+    payload.insert("quantity[0]".to_owned(), short_leg.quantity.to_string());
+    payload.insert(
+        "option_symbol[1]".to_owned(),
+        tradier_occ_option_symbol(&long_leg.key)?,
+    );
+    payload.insert("side[1]".to_owned(), "sell_to_close".to_owned());
+    payload.insert("quantity[1]".to_owned(), long_leg.quantity.to_string());
+    Ok(payload)
+}
+
+fn tradier_single_option_payload(
+    symbol: &str,
+    option_symbol: &str,
+    side: &str,
+    quantity: u32,
+    limit_price: f64,
+) -> Result<BTreeMap<String, String>> {
+    if quantity == 0 {
+        anyhow::bail!("Tradier single-option order quantity must be positive");
+    }
+    if !matches!(side, "buy_to_close" | "sell_to_open") {
+        anyhow::bail!("Tradier single-option side {side} is not supported");
+    }
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "option".to_owned());
+    payload.insert("symbol".to_owned(), symbol.to_ascii_uppercase());
+    payload.insert(
+        "option_symbol".to_owned(),
+        option_symbol.to_ascii_uppercase(),
+    );
+    payload.insert("side".to_owned(), side.to_owned());
+    payload.insert("quantity".to_owned(), quantity.to_string());
+    payload.insert("type".to_owned(), "limit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&TimeInForce::Day).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(decimal_from_f64(limit_price, "limit_price")?, "limit_price")?,
+    );
+    Ok(payload)
+}
+
+fn tradier_equity_sell_payload(
+    symbol: &str,
+    quantity: u32,
+    limit_price: f64,
+) -> Result<BTreeMap<String, String>> {
+    if quantity == 0 {
+        anyhow::bail!("Tradier equity sell quantity must be positive");
+    }
+    let symbol = require_action_field(symbol, "symbol")?.to_ascii_uppercase();
+    let mut payload = BTreeMap::new();
+    payload.insert("class".to_owned(), "equity".to_owned());
+    payload.insert("symbol".to_owned(), symbol);
+    payload.insert("side".to_owned(), "sell".to_owned());
+    payload.insert("quantity".to_owned(), quantity.to_string());
+    payload.insert("type".to_owned(), "limit".to_owned());
+    payload.insert(
+        "duration".to_owned(),
+        time_in_force_value(&TimeInForce::Day).to_owned(),
+    );
+    payload.insert(
+        "price".to_owned(),
+        format_tradier_price(decimal_from_f64(limit_price, "limit_price")?, "limit_price")?,
+    );
+    Ok(payload)
+}
+
 fn tradier_occ_option_symbol(key: &OptionKey) -> Result<String> {
     let right = match key.right {
         OptionRight::Call => "C",
@@ -4301,22 +7621,6 @@ fn format_tradier_price(value: Decimal, field: &str) -> Result<String> {
         anyhow::bail!("{field} must be positive and finite");
     }
     Ok(format!("{price:.2}"))
-}
-
-fn tradier_order_key(
-    config: &TradierConfig,
-    payload: &BTreeMap<String, String>,
-    action: &TradeSignal,
-) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "broker": "tradier",
-        "account_id": config.account_id,
-        "base_url": config.base_url,
-        "entry_date": action.entry_date,
-        "status": action.status,
-        "payload": payload,
-    }))
-    .expect("Tradier order key serialization should be infallible")
 }
 
 fn execution_order_ledger_blocking_entry(
@@ -4581,6 +7885,102 @@ fn process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+struct LiveSignalRefreshLock {
+    path: PathBuf,
+}
+
+impl Drop for LiveSignalRefreshLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_live_signal_refresh_lock(
+    state_file: &Path,
+    stale_after_seconds: u64,
+) -> Result<LiveSignalRefreshLock> {
+    if let Some(parent) = state_file.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create live signal refresh state directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let lock_path = state_file.with_extension("refresh.lock");
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(first_err) => {
+            if remove_stale_live_signal_refresh_lock(&lock_path, stale_after_seconds)? {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                    .with_context(|| {
+                        format!(
+                            "acquire live signal refresh lock {} after stale-lock cleanup",
+                            lock_path.display()
+                        )
+                    })?
+            } else {
+                return Err(first_err).with_context(|| {
+                    format!(
+                        "acquire live signal refresh lock {}; another refresh may be running",
+                        lock_path.display()
+                    )
+                });
+            }
+        }
+    };
+    writeln!(
+        file,
+        "pid={} acquired_at={}",
+        std::process::id(),
+        Utc::now().to_rfc3339()
+    )
+    .with_context(|| format!("write live signal refresh lock {}", lock_path.display()))?;
+    Ok(LiveSignalRefreshLock { path: lock_path })
+}
+
+fn remove_stale_live_signal_refresh_lock(
+    lock_path: &Path,
+    stale_after_seconds: u64,
+) -> Result<bool> {
+    let body = match fs::read_to_string(lock_path) {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+    let pid = body
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))
+        .and_then(|pid| pid.parse::<u32>().ok());
+    let acquired_at = body
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("acquired_at="))
+        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    let stale_by_pid = pid.is_some_and(|pid| !process_running(pid));
+    let stale_by_age = acquired_at.is_some_and(|timestamp| {
+        Utc::now().signed_duration_since(timestamp).num_seconds()
+            > stale_after_seconds.min(i64::MAX as u64) as i64
+    });
+    if stale_by_pid || stale_by_age {
+        fs::remove_file(lock_path).with_context(|| {
+            format!(
+                "remove stale live signal refresh lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn write_execution_order_ledger(
     path: &Path,
     ledger: &BTreeMap<String, ExecutionOrderLedgerEntry>,
@@ -4594,10 +7994,31 @@ fn write_execution_order_ledger(
         })?;
     }
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(ledger)?)
-        .with_context(|| format!("write execution order ledger temp {}", tmp_path.display()))?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open execution order ledger temp {}", tmp_path.display()))?;
+        file.write_all(serde_json::to_string_pretty(ledger)?.as_bytes())
+            .with_context(|| format!("write execution order ledger temp {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync execution order ledger temp {}", tmp_path.display()))?;
+    }
     fs::rename(&tmp_path, path)
-        .with_context(|| format!("replace execution order ledger {}", path.display()))
+        .with_context(|| format!("replace execution order ledger {}", path.display()))?;
+    sync_parent_directory_best_effort(path);
+    Ok(())
+}
+
+fn sync_parent_directory_best_effort(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+        let _ = directory.sync_all();
+    }
 }
 
 fn require_action_field<'a>(value: &'a str, field: &str) -> Result<&'a str> {
@@ -5696,7 +9117,9 @@ fn build_execution_worker_health(
     args: &ExecutionWorkerArgs,
     apply_broker_side_effects: bool,
 ) -> ExecutionWorkerHealth {
-    let as_of = args.as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let as_of = args
+        .as_of
+        .unwrap_or_else(|| execution_default_as_of(Utc::now()));
     let live_signal = args.live_signal.display().to_string();
     let signal_body = fs::read_to_string(&args.live_signal);
     let live_signal_readable = signal_body.is_ok();
@@ -5789,6 +9212,11 @@ fn execution_worker_aggregate_status(
             "live"
         }
         Some(decision) if matches!(decision.status.as_str(), "reviewed") => "review",
+        Some(decision) if decision.status == "holding" => match decision.mode {
+            ExecutionMode::Monitor => "monitor",
+            ExecutionMode::Review => "review",
+            ExecutionMode::Live => "live",
+        },
         Some(decision) if decision.status == "ready" => match decision.mode {
             ExecutionMode::Monitor => "monitor",
             ExecutionMode::Review => "review",
@@ -5835,7 +9263,7 @@ fn execution_broker(
             multi_leg_options: true,
             stock_option_combos: false,
             cash_secured_puts: true,
-            covered_calls: false,
+            covered_calls: true,
         },
     };
     ExecutionBrokerAdapter {
@@ -5952,6 +9380,9 @@ fn print_research_store_health(report: &ResearchStoreHealth) {
     println!("research_runs\t{}", report.research_runs);
     println!("profile_results\t{}", report.profile_results);
     println!("trade_summaries\t{}", report.trade_summaries);
+    println!("live_market_snapshots\t{}", report.live_market_snapshots);
+    println!("live_signal_candidates\t{}", report.live_signal_candidates);
+    println!("live_provider_health\t{}", report.live_provider_health);
     if !report.date_ranges.is_empty() {
         println!("\nDate ranges");
         println!("symbol\trows\tfirst_date\tlast_date");
@@ -7270,6 +10701,7 @@ fn next_run_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spreadfoundry::live_signal::{ProductionApproval, ProductionApprovalStatus};
 
     #[test]
     fn normalize_symbols_uppercases_deduplicates_and_drops_empty_values() {
@@ -7787,6 +11219,90 @@ mod tests {
     }
 
     #[test]
+    fn live_market_engine_accepts_production_loop_flags() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "live-market-engine",
+            "--approved-strategy",
+            "configs/test-approved.json",
+            "--source-live-signal",
+            "var/source-live-signal.json",
+            "--output",
+            "var/live-signal.json",
+            "--state-file",
+            "var/live-market-health.json",
+            "--store",
+            "tmp/spreadfoundry.duckdb",
+            "--as-of",
+            "2026-06-30",
+            "--interval-seconds",
+            "30",
+            "--max-source-age-seconds",
+            "45",
+            "--market-window-only",
+            "false",
+            "--once",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::LiveMarketEngine {
+                approved_strategy,
+                source_live_signal,
+                output,
+                state_file,
+                store,
+                as_of,
+                interval_seconds,
+                max_source_age_seconds,
+                market_window_only,
+                once,
+                json,
+            } => {
+                assert_eq!(
+                    approved_strategy,
+                    PathBuf::from("configs/test-approved.json")
+                );
+                assert_eq!(
+                    source_live_signal,
+                    PathBuf::from("var/source-live-signal.json")
+                );
+                assert_eq!(output, PathBuf::from("var/live-signal.json"));
+                assert_eq!(state_file, PathBuf::from("var/live-market-health.json"));
+                assert_eq!(store, PathBuf::from("tmp/spreadfoundry.duckdb"));
+                assert_eq!(as_of, Some(NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()));
+                assert_eq!(interval_seconds, 30);
+                assert_eq!(max_source_age_seconds, 45);
+                assert!(!market_window_only);
+                assert!(once);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_market_engine_defaults_to_split_source_and_output_artifacts() {
+        let cli = Cli::try_parse_from(["spreadfoundry", "live-market-engine"]).unwrap();
+
+        match cli.command {
+            Commands::LiveMarketEngine {
+                source_live_signal,
+                output,
+                ..
+            } => {
+                assert_eq!(
+                    source_live_signal,
+                    PathBuf::from("var/live_signal_refresh_source.json")
+                );
+                assert_eq!(output, PathBuf::from("var/live_signal.json"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn run_execution_decision_accepts_tiny_budget_flags() {
         let cli = Cli::try_parse_from([
             "spreadfoundry",
@@ -7954,7 +11470,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("no selected live signal"));
+        assert!(err.to_string().contains("no selected live"));
         fs::remove_file(path).unwrap();
     }
 
@@ -8013,12 +11529,12 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("no selected live signal"));
+        assert!(err.to_string().contains("no selected live"));
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn live_signal_status_require_action_rejects_already_open_without_new_entry() {
+    fn live_signal_status_require_action_accepts_already_open_management() {
         let path = unique_main_test_path("live-signal-open-action.json");
         let artifact = test_live_signal_artifact_as_of(
             Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
@@ -8028,19 +11544,23 @@ mod tests {
                 "strategy":"put_debit_spread",
                 "entry_date":"2026-06-26",
                 "exit_date":"2026-06-30",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.0,
+                "max_loss":100.0,
                 "pnl":0.0
             }]),
         );
         fs::write(&path, serde_json::to_string(&artifact).unwrap()).unwrap();
 
-        let err = live_signal_status(
+        live_signal_status(
             &path,
             Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             true,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("no selected live signal"));
         fs::remove_file(path).unwrap();
     }
 
@@ -8101,6 +11621,59 @@ mod tests {
         let err = artifact.validate_contract().unwrap_err();
 
         assert!(err.to_string().contains("not present in live signal list"));
+    }
+
+    #[test]
+    fn live_signal_contract_rejects_selected_signal_without_production_approval() {
+        let mut artifact = test_canary_artifact(serde_json::json!([{
+            "status":"new_entry",
+            "symbol":"TSLA",
+            "strategy":"put_debit_spread",
+            "entry_date":"2026-06-28",
+            "exit_date":"2026-06-28",
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-1.0,
+            "max_loss":100.0
+        }]));
+        artifact.approved_strategy.production_approval = None;
+
+        let err = artifact.validate_contract().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("requires explicit production approval")
+        );
+    }
+
+    #[test]
+    fn live_signal_contract_enforces_production_approval_max_loss() {
+        let mut artifact = test_canary_artifact(serde_json::json!([{
+            "status":"new_entry",
+            "symbol":"TSLA",
+            "strategy":"put_debit_spread",
+            "entry_date":"2026-06-28",
+            "exit_date":"2026-06-28",
+            "expiration":"2026-07-02",
+            "short_strike":350.0,
+            "long_strike":355.0,
+            "entry_credit":-2.0,
+            "max_loss":200.0
+        }]));
+        artifact
+            .approved_strategy
+            .production_approval
+            .as_mut()
+            .unwrap()
+            .max_order_max_loss = Some(100.0);
+
+        let err = artifact.validate_contract().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("exceeds production approval max_order_max_loss")
+        );
     }
 
     #[test]
@@ -8356,7 +11929,7 @@ mod tests {
 
     #[test]
     fn portfolio_canary_runner_requires_review_before_live_request() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -8397,10 +11970,8 @@ mod tests {
 
     #[test]
     fn portfolio_canary_runner_blocks_live_order_for_historical_as_of() {
-        let historical = Utc::now()
-            .date_naive()
-            .pred_opt()
-            .expect("test date has a predecessor");
+        let market_date = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let historical = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
         let historical_s = historical.to_string();
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -8425,17 +11996,18 @@ mod tests {
             live_orders_enabled: true,
         };
 
-        let decision = compute_execution_decision(
+        let decision = compute_execution_decision_at(
             &artifact,
             historical,
             &test_canary_risk(),
             &broker,
             ExecutionMode::Live,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
+            test_market_open_utc(market_date),
         );
 
         assert_eq!(decision.status, "blocked");
-        assert!(decision.reason.contains("today's UTC date"));
+        assert!(decision.reason.contains("U.S. options-market date"));
     }
 
     #[test]
@@ -8470,7 +12042,7 @@ mod tests {
 
     #[test]
     fn execution_decision_allows_valid_live_signal_after_static_gate() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let artifact = test_canary_artifact(serde_json::json!([{
                 "status":"new_entry",
                 "symbol":"TSLA",
@@ -8507,7 +12079,7 @@ mod tests {
 
     #[test]
     fn execution_decision_blocks_unapproved_signal_strategy() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let mut artifact = test_canary_artifact(serde_json::json!([{
                 "status":"new_entry",
                 "symbol":"TSLA",
@@ -8543,8 +12115,9 @@ mod tests {
 
     #[test]
     fn execution_decision_reports_no_signal_without_selected_entry() {
+        let today = execution_default_as_of(Utc::now());
         let artifact = test_live_signal_artifact_as_of(
-            Some(Utc::now().date_naive()),
+            Some(today),
             serde_json::json!([{
                 "status":"recent_closed",
                 "symbol":"TSLA",
@@ -8562,7 +12135,7 @@ mod tests {
 
         let decision = compute_execution_decision(
             &artifact,
-            Utc::now().date_naive(),
+            today,
             &test_canary_risk(),
             &broker,
             ExecutionMode::Live,
@@ -8575,7 +12148,7 @@ mod tests {
 
     #[test]
     fn portfolio_canary_runner_blocks_live_order_when_artifact_is_too_old() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
         let mut artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -8632,7 +12205,36 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_runner_monitors_already_open_without_catchup_order() {
+    fn approved_strategy_research_from_overrides_refresh_fallback() {
+        let mut artifact = test_canary_artifact(serde_json::json!([]));
+        let configured_from = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        let fallback = NaiveDate::from_ymd_opt(2016, 1, 1).unwrap();
+        artifact.approved_strategy.research_from = Some(configured_from);
+
+        assert_eq!(
+            approved_strategy_research_from(&artifact.approved_strategy, fallback),
+            configured_from
+        );
+    }
+
+    #[test]
+    fn approved_strategy_detector_window_overrides_refresh_research_span() {
+        let mut artifact = test_canary_artifact(serde_json::json!([]));
+        let fallback = NaiveDate::from_ymd_opt(2016, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        artifact.approved_strategy.research_from =
+            Some(NaiveDate::from_ymd_opt(2023, 1, 1).unwrap());
+        artifact.approved_strategy.live_detector_lookback_days = Some(90);
+
+        let (from, require_gate) =
+            approved_strategy_refresh_from_and_gate(&artifact.approved_strategy, fallback, to);
+
+        assert_eq!(from, NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+        assert!(!require_gate);
+    }
+
+    #[test]
+    fn portfolio_canary_runner_selects_already_open_management() {
         let artifact = test_live_signal_artifact_as_of(
             Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             serde_json::json!([{
@@ -8668,8 +12270,201 @@ mod tests {
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         );
 
-        assert_eq!(decision.status, "no_signal");
-        assert!(decision.selected_signal.is_none());
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert_eq!(decision.management_signals.len(), 1);
+        let selected = decision.selected_signal.as_ref().unwrap();
+        assert_eq!(selected.status, SignalStatus::AlreadyOpen);
+        assert_eq!(selected.symbol, "ORCL");
+    }
+
+    #[test]
+    fn portfolio_canary_runner_keeps_wheel_management_after_put_assignment() {
+        let artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"CRWV",
+                "strategy":"wheel",
+                "entry_date":"2026-06-26",
+                "exit_date":"2026-07-06",
+                "expiration":"2026-06-27",
+                "short_strike":80.0,
+                "short_put":80.0,
+                "long_strike":85.0,
+                "entry_credit":1.12,
+                "max_loss":7888.0
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+
+        let decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert_eq!(decision.management_signals.len(), 1);
+        let selected = decision.selected_signal.as_ref().unwrap();
+        assert_eq!(selected.status, SignalStatus::AlreadyOpen);
+        assert_eq!(selected.strategy, "wheel");
+    }
+
+    #[test]
+    fn portfolio_canary_runner_reconciles_recent_closed_wheel_broker_residuals() {
+        let artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
+            serde_json::json!([{
+                "status":"recent_closed",
+                "symbol":"CRWV",
+                "strategy":"wheel",
+                "entry_date":"2026-06-26",
+                "exit_date":"2026-06-30",
+                "expiration":"2026-06-27",
+                "short_strike":80.0,
+                "short_put":80.0,
+                "entry_credit":1.12,
+                "max_loss":7888.0,
+                "exit_reason":"called_away"
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+
+        let decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert_eq!(decision.management_signals.len(), 1);
+        let selected = decision.selected_signal.as_ref().unwrap();
+        assert_eq!(selected.status, SignalStatus::AlreadyOpen);
+        assert_eq!(selected.exit_reason.as_deref(), Some("called_away"));
+    }
+
+    #[test]
+    fn broker_bridge_blocks_management_for_non_tradier_broker() {
+        let artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-26",
+                "exit_date":"2026-06-30",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Robinhood, true, false, false, false);
+        let mut decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+
+        apply_broker_bridge(&mut decision, &broker, None, None).unwrap();
+
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("only implemented for Tradier strategies")
+        );
+    }
+
+    #[test]
+    fn portfolio_canary_runner_blocks_management_without_execution_rules() {
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-26",
+                "exit_date":"2026-06-30",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        artifact.signals[0].execution_rules = None;
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+
+        let decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("requires exported execution rules")
+        );
+    }
+
+    #[test]
+    fn portfolio_canary_runner_blocks_debit_entry_without_execution_rules() {
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-28",
+                "exit_date":"2026-06-28",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        artifact.signals[0].execution_rules = None;
+        artifact.selected_signal.as_mut().unwrap().execution_rules = None;
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+
+        let decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Monitor,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("requires exported execution rules")
+        );
     }
 
     #[test]
@@ -8724,6 +12519,7 @@ mod tests {
         let selected = decision.selected_signal.as_ref().unwrap();
         assert_eq!(selected.status, SignalStatus::NewEntry);
         assert_eq!(selected.symbol, "TSLA");
+        assert_eq!(decision.management_signals.len(), 1);
     }
 
     #[test]
@@ -9057,7 +12853,7 @@ mod tests {
 
     #[test]
     fn robinhood_mcp_bridge_keeps_wheel_review_only_even_when_place_requested() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -9115,7 +12911,7 @@ mod tests {
     #[test]
     fn robinhood_mcp_bridge_blocks_duplicate_live_submission() {
         let ledger = unique_main_test_path("canary-order-ledger-duplicate.json");
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
         let artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -9268,6 +13064,532 @@ mod tests {
         assert_eq!(
             payload.get("side[1]").map(String::as_str),
             Some("sell_to_open")
+        );
+    }
+
+    #[test]
+    fn tradier_call_debit_close_payload_matches_multileg_shape() {
+        let action = test_trade_signal_summary(
+            &serde_json::json!({
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }),
+            None,
+        );
+
+        let payload = tradier_multileg_debit_close_payload(&action, 3.25, 1).unwrap();
+
+        assert_eq!(payload.get("class").map(String::as_str), Some("multileg"));
+        assert_eq!(payload.get("symbol").map(String::as_str), Some("ORCL"));
+        assert_eq!(payload.get("type").map(String::as_str), Some("credit"));
+        assert_eq!(payload.get("duration").map(String::as_str), Some("day"));
+        assert_eq!(payload.get("price").map(String::as_str), Some("3.25"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("ORCL260702C00220000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("sell_to_close")
+        );
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("ORCL260702C00225000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("buy_to_close")
+        );
+    }
+
+    #[test]
+    fn tradier_put_credit_payload_matches_multileg_shape() {
+        let action = test_trade_signal_summary(
+            &serde_json::json!({
+                "status":"new_entry",
+                "symbol":"TSLA",
+                "strategy":"put_credit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":345.0,
+                "width":5.0,
+                "entry_credit":1.00,
+                "max_loss":400.0
+            }),
+            None,
+        );
+
+        let payload = tradier_multileg_credit_payload(&action).unwrap();
+
+        assert_eq!(payload.get("class").map(String::as_str), Some("multileg"));
+        assert_eq!(payload.get("symbol").map(String::as_str), Some("TSLA"));
+        assert_eq!(payload.get("type").map(String::as_str), Some("credit"));
+        assert_eq!(payload.get("duration").map(String::as_str), Some("day"));
+        assert_eq!(payload.get("price").map(String::as_str), Some("1.00"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("TSLA260702P00350000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("sell_to_open")
+        );
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("TSLA260702P00345000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("buy_to_open")
+        );
+    }
+
+    #[test]
+    fn tradier_call_credit_close_payload_matches_multileg_shape() {
+        let action = tradier_call_credit_action("already_open");
+
+        let payload = tradier_multileg_credit_close_payload(&action, 0.25, 1).unwrap();
+
+        assert_eq!(payload.get("class").map(String::as_str), Some("multileg"));
+        assert_eq!(payload.get("symbol").map(String::as_str), Some("ORCL"));
+        assert_eq!(payload.get("type").map(String::as_str), Some("debit"));
+        assert_eq!(payload.get("duration").map(String::as_str), Some("day"));
+        assert_eq!(payload.get("price").map(String::as_str), Some("0.25"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("ORCL260702C00225000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("buy_to_close")
+        );
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("ORCL260702C00230000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("sell_to_close")
+        );
+    }
+
+    #[test]
+    fn tradier_put_credit_close_payload_matches_multileg_shape() {
+        let action = tradier_put_credit_action("already_open");
+
+        let payload = tradier_multileg_credit_close_payload(&action, 0.25, 1).unwrap();
+
+        assert_eq!(payload.get("class").map(String::as_str), Some("multileg"));
+        assert_eq!(payload.get("symbol").map(String::as_str), Some("TSLA"));
+        assert_eq!(payload.get("type").map(String::as_str), Some("debit"));
+        assert_eq!(payload.get("duration").map(String::as_str), Some("day"));
+        assert_eq!(payload.get("price").map(String::as_str), Some("0.25"));
+        assert_eq!(
+            payload.get("option_symbol[0]").map(String::as_str),
+            Some("TSLA260702P00350000")
+        );
+        assert_eq!(
+            payload.get("side[0]").map(String::as_str),
+            Some("buy_to_close")
+        );
+        assert_eq!(
+            payload.get("option_symbol[1]").map(String::as_str),
+            Some("TSLA260702P00345000")
+        );
+        assert_eq!(
+            payload.get("side[1]").map(String::as_str),
+            Some("sell_to_close")
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_detects_open_spread() {
+        let action = tradier_call_debit_action("already_open");
+        let positions = vec![
+            tradier_test_position("ORCL260702C00220000", 1.0),
+            tradier_test_position("ORCL260702C00225000", -1.0),
+        ];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::Open { quantity: 1 }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_blocks_active_order() {
+        let action = tradier_call_debit_action("new_entry");
+        let orders = vec![tradier_test_order(
+            Some("abc123"),
+            Some("ORCL"),
+            None,
+            Some("open"),
+            Some(1.0),
+        )];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &[], &orders).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::ActiveOrder {
+                id: Some("abc123".to_owned()),
+                status: Some("open".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_detects_partial_exposure() {
+        let action = tradier_call_debit_action("already_open");
+        let positions = vec![tradier_test_position("ORCL260702C00220000", 1.0)];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert!(matches!(
+            state,
+            TradierDebitSpreadLifecycleState::Inconsistent { .. }
+        ));
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_detects_assigned_short_call() {
+        let action = tradier_call_debit_action("already_open");
+        let positions = vec![
+            tradier_test_position("ORCL260702C00220000", 1.0),
+            tradier_test_position("ORCL", -100.0),
+        ];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::AssignedShortLeg {
+                right: OptionRight::Call,
+                long_quantity: 1.0,
+                stock_quantity: -100.0
+            }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_detects_assigned_short_put() {
+        let action = tradier_put_debit_action("already_open");
+        let positions = vec![
+            tradier_test_position("TSLA260702P00355000", 1.0),
+            tradier_test_position("TSLA", 100.0),
+        ];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::AssignedShortLeg {
+                right: OptionRight::Put,
+                long_quantity: 1.0,
+                stock_quantity: 100.0
+            }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_rejects_wrong_direction_stock() {
+        let action = tradier_call_debit_action("already_open");
+        let positions = vec![
+            tradier_test_position("ORCL260702C00220000", 1.0),
+            tradier_test_position("ORCL", 100.0),
+        ];
+
+        let state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert!(matches!(
+            state,
+            TradierDebitSpreadLifecycleState::Inconsistent { .. }
+        ));
+    }
+
+    #[test]
+    fn tradier_credit_lifecycle_state_detects_open_spread() {
+        let action = tradier_call_credit_action("already_open");
+        let positions = vec![
+            tradier_test_position("ORCL260702C00230000", 1.0),
+            tradier_test_position("ORCL260702C00225000", -1.0),
+        ];
+
+        let state = tradier_vertical_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::Open { quantity: 1 }
+        );
+    }
+
+    #[test]
+    fn tradier_credit_lifecycle_state_detects_open_put_spread() {
+        let action = tradier_put_credit_action("already_open");
+        let positions = vec![
+            tradier_test_position("TSLA260702P00345000", 1.0),
+            tradier_test_position("TSLA260702P00350000", -1.0),
+        ];
+
+        let state = tradier_vertical_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::Open { quantity: 1 }
+        );
+    }
+
+    #[test]
+    fn tradier_credit_lifecycle_state_detects_assigned_short_call() {
+        let action = tradier_call_credit_action("already_open");
+        let positions = vec![
+            tradier_test_position("ORCL260702C00230000", 1.0),
+            tradier_test_position("ORCL", -100.0),
+        ];
+
+        let state = tradier_vertical_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::AssignedShortLeg {
+                right: OptionRight::Call,
+                long_quantity: 1.0,
+                stock_quantity: -100.0
+            }
+        );
+    }
+
+    #[test]
+    fn tradier_credit_lifecycle_state_detects_assigned_short_put() {
+        let action = tradier_put_credit_action("already_open");
+        let positions = vec![
+            tradier_test_position("TSLA260702P00345000", 1.0),
+            tradier_test_position("TSLA", 100.0),
+        ];
+
+        let state = tradier_vertical_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+
+        assert_eq!(
+            state,
+            TradierDebitSpreadLifecycleState::AssignedShortLeg {
+                right: OptionRight::Put,
+                long_quantity: 1.0,
+                stock_quantity: 100.0
+            }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_lifecycle_state_allows_other_exported_management_legs() {
+        let action = tradier_call_debit_action("already_open");
+        let other_action = test_trade_signal_summary(
+            &serde_json::json!({
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":235.0,
+                "long_strike":230.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }),
+            None,
+        );
+        let positions = vec![
+            tradier_test_position("ORCL260702C00220000", 1.0),
+            tradier_test_position("ORCL260702C00225000", -1.0),
+            tradier_test_position("ORCL260702C00230000", 1.0),
+            tradier_test_position("ORCL260702C00235000", -1.0),
+        ];
+        let allowed =
+            tradier_debit_spread_management_position_symbols(&[action.clone(), other_action])
+                .unwrap();
+
+        let strict_state = tradier_debit_spread_lifecycle_state(&action, &positions, &[]).unwrap();
+        let management_state = tradier_debit_spread_lifecycle_state_with_allowed_positions(
+            &action,
+            &positions,
+            &[],
+            Some(&allowed),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            strict_state,
+            TradierDebitSpreadLifecycleState::Inconsistent { .. }
+        ));
+        assert_eq!(
+            management_state,
+            TradierDebitSpreadLifecycleState::Open { quantity: 1 }
+        );
+    }
+
+    #[test]
+    fn tradier_debit_exit_credit_uses_long_bid_less_short_ask() {
+        let quotes = vec![
+            tradier_test_quote("ORCL260702C00220000", Some(3.60), Some(3.80)),
+            tradier_test_quote("ORCL260702C00225000", Some(0.30), Some(0.40)),
+        ];
+
+        let credit = tradier_current_debit_exit_credit(
+            &quotes,
+            "ORCL260702C00220000",
+            "ORCL260702C00225000",
+            ExecutionMode::Review,
+        )
+        .unwrap();
+
+        assert!((credit - 3.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tradier_debit_exit_credit_keeps_non_positive_values_for_rule_parity() {
+        let quotes = vec![
+            tradier_test_quote("ORCL260702C00220000", Some(0.00), Some(0.05)),
+            tradier_test_quote("ORCL260702C00225000", Some(0.01), Some(0.10)),
+        ];
+
+        let credit = tradier_current_debit_exit_credit(
+            &quotes,
+            "ORCL260702C00220000",
+            "ORCL260702C00225000",
+            ExecutionMode::Review,
+        )
+        .unwrap();
+
+        assert!((credit + 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tradier_credit_exit_debit_uses_short_ask_less_long_bid() {
+        let quotes = vec![
+            tradier_test_quote("ORCL260702C00225000", Some(1.00), Some(1.20)),
+            tradier_test_quote("ORCL260702C00230000", Some(0.15), Some(0.25)),
+        ];
+
+        let debit = tradier_current_credit_exit_debit(
+            &quotes,
+            "ORCL260702C00225000",
+            "ORCL260702C00230000",
+            5.0,
+            ExecutionMode::Review,
+        )
+        .unwrap();
+
+        assert!((debit - 1.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_debit_spread_exit_plan_triggers_take_profit() {
+        let action = tradier_call_debit_action("already_open");
+
+        let plan = live_debit_spread_exit_plan(
+            &action,
+            4.85,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            DebitSpreadExitPlan::Close {
+                reason: "take_profit".to_owned(),
+                limit_credit: 4.85
+            }
+        );
+    }
+
+    #[test]
+    fn live_debit_spread_exit_plan_triggers_stop_loss_at_negative_credit() {
+        let action = tradier_call_debit_action("already_open");
+
+        let plan = live_debit_spread_exit_plan(
+            &action,
+            -0.10,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            DebitSpreadExitPlan::Close {
+                reason: "stop_loss".to_owned(),
+                limit_credit: -0.10
+            }
+        );
+    }
+
+    #[test]
+    fn live_debit_spread_exit_plan_holds_when_no_rule_fires() {
+        let mut action = tradier_call_debit_action("already_open");
+        action.execution_rules = Some(LiveExecutionRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 0,
+            max_hold_days: None,
+        });
+
+        let plan = live_debit_spread_exit_plan(
+            &action,
+            4.00,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(plan, DebitSpreadExitPlan::Hold { .. }));
+    }
+
+    #[test]
+    fn live_credit_spread_exit_plan_triggers_take_profit() {
+        let action = tradier_call_credit_action("already_open");
+
+        let plan = live_credit_spread_exit_plan(
+            &action,
+            0.20,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            CreditSpreadExitPlan::Close {
+                reason: "take_profit".to_owned(),
+                limit_debit: 0.20
+            }
+        );
+    }
+
+    #[test]
+    fn live_credit_spread_exit_plan_triggers_stop_loss() {
+        let action = tradier_call_credit_action("already_open");
+
+        let plan = live_credit_spread_exit_plan(
+            &action,
+            2.50,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            CreditSpreadExitPlan::Close {
+                reason: "stop_loss".to_owned(),
+                limit_debit: 2.50
+            }
         );
     }
 
@@ -9492,15 +13814,22 @@ mod tests {
     }
 
     #[test]
-    fn live_broker_bridge_blocks_until_position_lifecycle_exists() {
+    fn live_broker_bridge_blocks_unsupported_position_lifecycle() {
         let ledger = unique_main_test_path("tradier-live-lifecycle-gate.json");
-        let broker = execution_broker(BrokerKind::Tradier, false, false, false, true);
-        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let broker = execution_broker(BrokerKind::Robinhood, false, false, false, true);
+        let mut decision = tradier_wheel_test_decision(ExecutionMode::Live);
+        decision.broker = BrokerKind::Robinhood;
+        decision.status = "ready".to_owned();
+        decision.reason = "test ready wheel decision".to_owned();
 
         apply_broker_bridge(&mut decision, &broker, None, Some(&ledger)).unwrap();
 
         assert_eq!(decision.status, "blocked");
-        assert!(decision.reason.contains("exit lifecycle"));
+        assert!(
+            decision
+                .reason
+                .contains("not enabled for this broker/strategy")
+        );
         assert!(!ledger.exists());
     }
 
@@ -9525,17 +13854,620 @@ mod tests {
     }
 
     #[test]
+    fn tradier_credit_review_sends_preview_without_place() {
+        let (base_url, requests, handle) = spawn_tradier_credit_mock(vec![(
+            200,
+            r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+        )]);
+        let as_of = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"ORCL",
+                "strategy":"call_credit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":230.0,
+                "width":5.0,
+                "entry_credit":1.20,
+                "max_loss":380.0
+            }]),
+        );
+        artifact
+            .approved_strategy
+            .allowed_live_strategies
+            .push("call_credit_spread".to_owned());
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 5);
+        assert!(bodies[4].contains("preview=true"));
+        assert!(bodies[4].contains("class=multileg"));
+        assert!(bodies[4].contains("type=credit"));
+        assert!(bodies[4].contains("sell_to_open"));
+        assert!(bodies[4].contains("buy_to_open"));
+    }
+
+    #[test]
+    fn tradier_management_review_previews_close_when_exit_rule_fires() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=multileg"));
+        assert!(bodies[3].contains("type=credit"));
+        assert!(bodies[3].contains("price=4.85"));
+        assert!(bodies[3].contains("sell_to_close"));
+        assert!(bodies[3].contains("buy_to_close"));
+    }
+
+    #[test]
+    fn tradier_credit_management_review_previews_close_when_exit_rule_fires() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_call_credit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_credit_exit_quote_response(0.30, 0.15)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_credit_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=multileg"));
+        assert!(bodies[3].contains("type=debit"));
+        assert!(bodies[3].contains("price=0.15"));
+        assert!(bodies[3].contains("buy_to_close"));
+        assert!(bodies[3].contains("sell_to_close"));
+    }
+
+    #[test]
+    fn tradier_put_credit_management_review_previews_close_when_exit_rule_fires() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_put_credit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_put_credit_exit_quote_response(0.30, 0.15)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_put_credit_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=multileg"));
+        assert!(bodies[3].contains("type=debit"));
+        assert!(bodies[3].contains("price=0.15"));
+        assert!(bodies[3].contains("buy_to_close"));
+        assert!(bodies[3].contains("sell_to_close"));
+        assert!(bodies[3].contains("TSLA260702P00350000"));
+        assert!(bodies[3].contains("TSLA260702P00345000"));
+    }
+
+    #[test]
+    fn tradier_management_holds_without_preview_when_no_exit_rule_fires() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.20, 0.30)),
+        ]);
+        let mut decision = tradier_management_test_decision(ExecutionMode::Review);
+        let rules = LiveExecutionRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 0,
+            max_hold_days: None,
+        };
+        decision.selected_signal.as_mut().unwrap().execution_rules = Some(rules.clone());
+        decision.management_signals[0].execution_rules = Some(rules);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "holding");
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 3);
+    }
+
+    #[test]
+    fn tradier_management_reports_due_time_exit_when_quote_validation_fails() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                400,
+                r#"{"errors":{"error":[{"message":"quote unavailable"}]}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_management_test_decision(ExecutionMode::Review);
+        let as_of = decision.as_of;
+        let entry_date = (as_of - chrono::Duration::days(3)).to_string();
+        let rules = LiveExecutionRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 0,
+            max_hold_days: Some(1),
+        };
+        decision.selected_signal.as_mut().unwrap().entry_date = Some(entry_date.clone());
+        decision.selected_signal.as_mut().unwrap().execution_rules = Some(rules.clone());
+        decision.management_signals[0].entry_date = Some(entry_date);
+        decision.management_signals[0].execution_rules = Some(rules);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("close triggered max_hold"));
+        assert!(decision.reason.contains("exit quote validation failed"));
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 3);
+    }
+
+    #[test]
+    fn tradier_management_blocks_assigned_short_call_with_specific_reason() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("short call appears assigned"));
+        assert!(
+            decision
+                .reason
+                .contains("manual broker assignment recovery")
+        );
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_credit_management_blocks_assigned_short_call_with_specific_reason() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_call_credit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_credit_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("short call appears assigned"));
+        assert!(
+            decision
+                .reason
+                .contains("manual broker assignment recovery")
+        );
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_credit_management_blocks_assigned_short_put_with_specific_reason() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_put_credit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_put_credit_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("short put appears assigned"));
+        assert!(
+            decision
+                .reason
+                .contains("manual broker assignment recovery")
+        );
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_entry_bridge_preflights_management_before_new_entry() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()),
+            serde_json::json!([
+                {
+                    "status":"new_entry",
+                    "symbol":"TSLA",
+                    "strategy":"put_debit_spread",
+                    "entry_date":"2026-06-29",
+                    "exit_date":"2026-06-29",
+                    "expiration":"2026-07-02",
+                    "short_strike":350.0,
+                    "long_strike":355.0,
+                    "entry_credit":-1.00,
+                    "max_loss":100.0
+                },
+                {
+                    "status":"already_open",
+                    "symbol":"ORCL",
+                    "strategy":"call_debit_spread",
+                    "entry_date":"2026-06-26",
+                    "exit_date":"2026-07-01",
+                    "expiration":"2026-07-02",
+                    "short_strike":225.0,
+                    "long_strike":220.0,
+                    "width":5.0,
+                    "entry_credit":-4.50,
+                    "max_loss":450.0
+                }
+            ]),
+        );
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+        let mut decision = compute_execution_decision(
+            &artifact,
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap(),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let config = test_tradier_config(base_url);
+
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::OpenEntry));
+        assert_eq!(decision.management_signals.len(), 1);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert_eq!(
+            decision
+                .selected_signal
+                .as_ref()
+                .map(|signal| signal.symbol.as_str()),
+            Some("ORCL")
+        );
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("type=credit"));
+        assert!(bodies[3].contains("sell_to_close"));
+        assert!(!bodies.iter().any(|body| body.contains("symbol=TSLA")));
+    }
+
+    #[test]
+    fn tradier_live_close_ledger_blocks_changed_price_retry() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-close-price-retry.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let action = decision.management_signals.first().unwrap().clone();
+        let prior_payload = tradier_multileg_debit_close_payload(&action, 4.75, 1).unwrap();
+        let prior_key = tradier_order_key(&config, &prior_payload, &action);
+        execution_order_ledger_record_status(
+            &ledger,
+            &prior_key,
+            "pending_unknown",
+            Some("close123"),
+            Some("prior close submit still unresolved"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submit_unknown");
+        assert_eq!(decision.reason, "prior close submit still unresolved");
+        assert_eq!(bodies.len(), 4);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_live_close_retries_after_terminal_unfilled_day_order() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"close123","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"expired","quantity":1}}}"#.to_owned(),
+            ),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"close456","status":"ok"}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"close456","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-close-terminal-retry.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let action = decision.management_signals.first().unwrap().clone();
+        let prior_payload = tradier_multileg_debit_close_payload(&action, 4.75, 1).unwrap();
+        let prior_key = tradier_order_key(&config, &prior_payload, &action);
+        execution_order_ledger_record_status(
+            &ledger,
+            &prior_key,
+            "submitted",
+            Some("close123"),
+            Some("prior close submit expired unfilled"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submitted");
+        assert_eq!(bodies.len(), 7);
+        assert!(bodies[4].contains("preview=true"));
+        assert!(bodies[5].contains("preview=false"));
+        assert!(
+            read_execution_order_ledger(&ledger)
+                .unwrap()
+                .values()
+                .any(|entry| {
+                    entry.status == "submitted"
+                        && entry.broker_order_id.as_deref() == Some("close456")
+                })
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_live_close_blocks_when_prior_close_filled_but_exposure_remains() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"close123","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"filled","quantity":1}}}"#.to_owned(),
+            ),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-close-filled-block.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let action = decision.management_signals.first().unwrap().clone();
+        let prior_payload = tradier_multileg_debit_close_payload(&action, 4.75, 1).unwrap();
+        let prior_key = tradier_order_key(&config, &prior_payload, &action);
+        execution_order_ledger_record_status(
+            &ledger,
+            &prior_key,
+            "submitted",
+            Some("close123"),
+            Some("prior close submit filled"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("close123"));
+        assert!(decision.reason.contains("filled"));
+        assert_eq!(bodies.len(), 4);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_management_blocks_non_positive_close_credit_after_exit_trigger() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(0.00, 0.05)),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-close-zero-credit.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("stop_loss"));
+        assert!(
+            decision
+                .reason
+                .contains("manual close/expiry/assignment-risk")
+        );
+        assert!(decision.tradier_quote.is_some());
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 4);
+        let _ = fs::remove_file(ledger);
+    }
+
+    #[test]
+    fn tradier_live_close_preview_rejection_does_not_block_retry() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"close123","status":"ok"}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"close123","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-close-preview-retry.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let action = decision.management_signals.first().unwrap().clone();
+        let prior_payload = tradier_multileg_debit_close_payload(&action, 4.75, 1).unwrap();
+        let prior_key = tradier_order_key(&config, &prior_payload, &action);
+        execution_order_ledger_record_status(
+            &ledger,
+            &prior_key,
+            "preview_rejected",
+            None,
+            Some("prior close preview was rejected"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submitted");
+        assert_eq!(bodies.len(), 7);
+        assert!(
+            read_execution_order_ledger(&ledger)
+                .unwrap()
+                .values()
+                .any(|entry| entry.status == "submitted")
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_management_live_previews_then_places_close() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"close123","status":"ok"}}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"close123","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-live-close.json");
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submitted");
+        assert_eq!(bodies.len(), 7);
+        assert!(bodies[4].contains("preview=true"));
+        assert!(bodies[5].contains("preview=false"));
+        assert!(
+            read_execution_order_ledger(&ledger)
+                .unwrap()
+                .values()
+                .any(|entry| entry.status == "submitted")
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
     fn tradier_current_quote_worse_than_limit_blocks_preview() {
         let (base_url, requests, handle) = spawn_tradier_mock(vec![
             (
                 200,
-                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#,
+                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned(),
             ),
-            (200, r#"{"positions":{"position":[]}}"#),
-            (200, r#"{"orders":{"order":[]}}"#),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
-                r#"{"quotes":{"quote":[{"symbol":"ORCL260702C00220000","bid":5.30,"ask":5.50},{"symbol":"ORCL260702C00225000","bid":0.40,"ask":0.50}]}}"#,
+                r#"{"quotes":{"quote":[{"symbol":"ORCL260702C00220000","bid":5.30,"ask":5.50},{"symbol":"ORCL260702C00225000","bid":0.40,"ask":0.50}]}}"#.to_owned(),
             ),
         ]);
         let mut decision = tradier_test_decision(ExecutionMode::Review);
@@ -9549,6 +14481,60 @@ mod tests {
             decision
                 .reason
                 .contains("current conservative debit 5.10 exceeds order limit 4.50")
+        );
+        assert_eq!(bodies.len(), 4);
+        assert!(decision.tradier_preview.is_none());
+    }
+
+    #[test]
+    fn tradier_credit_current_quote_below_limit_blocks_preview() {
+        let now_ms = Utc::now().timestamp_millis();
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_good_balances_response()),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_credit_quote_response(now_ms, 1.00, 0.30)),
+        ]);
+        let as_of = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"ORCL",
+                "strategy":"call_credit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":230.0,
+                "width":5.0,
+                "entry_credit":1.20,
+                "max_loss":380.0
+            }]),
+        );
+        artifact
+            .approved_strategy
+            .allowed_live_strategies
+            .push("call_credit_spread".to_owned());
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("current conservative credit 0.70 is below order limit 1.20")
         );
         assert_eq!(bodies.len(), 4);
         assert!(decision.tradier_preview.is_none());
@@ -9619,16 +14605,43 @@ mod tests {
     }
 
     #[test]
+    fn tradier_live_future_quote_blocks_preview() {
+        let future_ms = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_good_balances_response()),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_debit_quote_response(future_ms)),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-future-quote.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("quote validation failed"));
+        assert!(decision.reason.contains("timestamp is in the future"));
+        assert_eq!(bodies.len(), 5);
+        assert!(!ledger.exists());
+    }
+
+    #[test]
     fn tradier_live_previews_then_places_same_payload() {
         let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
             (
                 200,
-                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
-            (200, r#"{"order":{"id":"placed","status":"ok"}}"#),
+            (200, r#"{"order":{"id":"placed","status":"ok"}}"#.to_owned()),
             (
                 200,
-                r#"{"orders":{"order":{"id":"placed","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#,
+                r#"{"orders":{"order":{"id":"placed","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
             ),
         ]);
         let ledger = unique_main_test_path("tradier-order-ledger-live.json");
@@ -9742,6 +14755,47 @@ mod tests {
     }
 
     #[test]
+    fn tradier_close_order_key_ignores_mutable_limit_price() {
+        let config = test_tradier_config("http://127.0.0.1:1/v1".to_owned());
+        let action = tradier_call_debit_action("already_open");
+        let close_a = tradier_multileg_debit_close_payload(&action, 4.75, 1).unwrap();
+        let close_b = tradier_multileg_debit_close_payload(&action, 4.85, 1).unwrap();
+        let wheel_action = tradier_wheel_management_test_decision(ExecutionMode::Review)
+            .selected_signal
+            .unwrap();
+        let wheel_close_a =
+            tradier_single_option_payload("CRWV", "CRWV260702P00080000", "buy_to_close", 1, 0.20)
+                .unwrap();
+        let wheel_close_b =
+            tradier_single_option_payload("CRWV", "CRWV260702P00080000", "buy_to_close", 1, 0.25)
+                .unwrap();
+        let equity_close_a = tradier_equity_sell_payload("CRWV", 100, 79.50).unwrap();
+        let equity_close_b = tradier_equity_sell_payload("CRWV", 100, 79.75).unwrap();
+        let mut entry_b =
+            tradier_multileg_debit_payload(&tradier_call_debit_action("new_entry")).unwrap();
+        entry_b.insert("price".to_owned(), "4.85".to_owned());
+        let entry_a =
+            tradier_multileg_debit_payload(&tradier_call_debit_action("new_entry")).unwrap();
+
+        assert_eq!(
+            tradier_order_key(&config, &close_a, &action),
+            tradier_order_key(&config, &close_b, &action)
+        );
+        assert_eq!(
+            tradier_order_key(&config, &wheel_close_a, &wheel_action),
+            tradier_order_key(&config, &wheel_close_b, &wheel_action)
+        );
+        assert_eq!(
+            tradier_order_key(&config, &equity_close_a, &wheel_action),
+            tradier_order_key(&config, &equity_close_b, &wheel_action)
+        );
+        assert_ne!(
+            tradier_order_key(&config, &entry_a, &tradier_call_debit_action("new_entry")),
+            tradier_order_key(&config, &entry_b, &tradier_call_debit_action("new_entry"))
+        );
+    }
+
+    #[test]
     fn execution_order_ledger_reservation_is_atomic_for_duplicate_key() {
         let ledger = unique_main_test_path("canary-order-ledger-reserve.json");
         let key = "broker-order-key";
@@ -9774,6 +14828,22 @@ mod tests {
         assert_eq!(reservation, ExecutionOrderLedgerReservation::Reserved);
         assert!(!lock.exists());
         fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn live_signal_refresh_lock_blocks_concurrent_refresh() {
+        let state = unique_main_test_path("live-signal-refresh-lock.json");
+        let lock_path = state.with_extension("refresh.lock");
+
+        let first = acquire_live_signal_refresh_lock(&state, 900).unwrap();
+        let second = acquire_live_signal_refresh_lock(&state, 900);
+
+        assert!(second.is_err());
+        drop(first);
+        assert!(!lock_path.exists());
+        let third = acquire_live_signal_refresh_lock(&state, 900).unwrap();
+        drop(third);
+        assert!(!lock_path.exists());
     }
 
     #[test]
@@ -9830,15 +14900,47 @@ mod tests {
     }
 
     #[test]
+    fn tradier_post_submit_missing_status_is_unknown_not_submitted() {
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (200, r#"{"order":{"id":"placed","status":"ok"}}"#.to_owned()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"placed","symbol":"ORCL","option_symbol":"ORCL260702C00220000","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-missing-confirm-status.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submit_unknown");
+        assert!(decision.reason.contains("returned no order status"));
+        assert_eq!(bodies.len(), 8);
+        assert!(
+            read_execution_order_ledger(&ledger)
+                .unwrap()
+                .values()
+                .any(|entry| entry.status == "pending_unknown")
+        );
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
     fn tradier_place_error_status_is_rejected_not_submitted() {
         let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
             (
                 200,
-                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
             (
                 200,
-                r#"{"order":{"id":"placed","status":"error","reason_description":"broker rejected"}}"#,
+                r#"{"order":{"id":"placed","status":"error","reason_description":"broker rejected"}}"#.to_owned(),
             ),
         ]);
         let ledger = unique_main_test_path("tradier-order-ledger-place-error.json");
@@ -9859,13 +14961,17 @@ mod tests {
         let (base_url, requests, handle) = spawn_tradier_mock(vec![
             (
                 200,
-                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#,
+                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned(),
             ),
-            (200, r#"{"positions":{"position":[]}}"#),
-            (200, r#"{"orders":{"order":[]}}"#),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
-                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+                tradier_single_option_quote_response("CRWV260702P00080000", 1.20, 1.30),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
         ]);
         let config = test_tradier_config(base_url);
@@ -9875,11 +14981,12 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
 
         assert_eq!(decision.status, "reviewed");
-        assert_eq!(bodies.len(), 4);
-        assert!(bodies[3].contains("preview=true"));
-        assert!(bodies[3].contains("class=option"));
-        assert!(bodies[3].contains("side=sell_to_open"));
-        assert!(bodies[3].contains("type=limit"));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 5);
+        assert!(bodies[4].contains("preview=true"));
+        assert!(bodies[4].contains("class=option"));
+        assert!(bodies[4].contains("side=sell_to_open"));
+        assert!(bodies[4].contains("type=limit"));
     }
 
     #[test]
@@ -9947,20 +15054,54 @@ mod tests {
     }
 
     #[test]
+    fn tradier_wheel_current_bid_below_limit_blocks_preview() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned(),
+            ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                200,
+                tradier_single_option_quote_response("CRWV260702P00080000", 0.50, 0.60),
+            ),
+        ]);
+        let config = test_tradier_config(base_url);
+        let mut decision = tradier_wheel_test_decision(ExecutionMode::Review);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+        let bodies = collect_mock_requests(requests, handle);
+
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("current short-put bid 0.50 is below order limit credit 1.12")
+        );
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 4);
+    }
+
+    #[test]
     fn tradier_wheel_terminal_order_does_not_block_preview() {
         let (base_url, requests, handle) = spawn_tradier_mock(vec![
             (
                 200,
-                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#,
+                r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned(),
             ),
-            (200, r#"{"positions":{"position":[]}}"#),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
             (
                 200,
-                r#"{"orders":{"order":{"id":"123","symbol":"CRWV","option_symbol":"CRWV260702P00080000","status":"filled","quantity":1}}}"#,
+                r#"{"orders":{"order":{"id":"123","symbol":"CRWV","option_symbol":"CRWV260702P00080000","status":"filled","quantity":1}}}"#.to_owned(),
             ),
             (
                 200,
-                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+                tradier_single_option_quote_response("CRWV260702P00080000", 1.20, 1.30),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
         ]);
         let config = test_tradier_config(base_url);
@@ -9970,8 +15111,239 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
 
         assert_eq!(decision.status, "reviewed");
+        assert_eq!(bodies.len(), 5);
+        assert!(bodies[4].contains("preview=true"));
+    }
+
+    #[test]
+    fn tradier_wheel_management_closes_short_put_when_take_profit_fires() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_open_wheel_short_put_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                200,
+                tradier_single_option_quote_response("CRWV260702P00080000", 0.15, 0.20),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
         assert_eq!(bodies.len(), 4);
         assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=option"));
+        assert!(bodies[3].contains("option_symbol=CRWV260702P00080000"));
+        assert!(bodies[3].contains("side=buy_to_close"));
+        assert!(bodies[3].contains("price=0.20"));
+    }
+
+    #[test]
+    fn tradier_wheel_management_sells_covered_call_after_assignment() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_wheel_stock_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                200,
+                tradier_single_option_quote_response("CRWV260706C00085000", 0.65, 0.80),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=option"));
+        assert!(bodies[3].contains("option_symbol=CRWV260706C00085000"));
+        assert!(bodies[3].contains("side=sell_to_open"));
+        assert!(bodies[3].contains("price=0.65"));
+    }
+
+    #[test]
+    fn tradier_wheel_management_recognizes_existing_covered_call_from_broker() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                tradier_existing_wheel_covered_call_positions_response(),
+            ),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "holding");
+        assert!(
+            decision
+                .reason
+                .contains("already has Tradier covered-call quantity 1")
+        );
+        assert!(decision.tradier_quote.is_none());
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_wheel_management_liquidates_assigned_stock_when_stock_mark_due() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_wheel_stock_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                200,
+                tradier_single_option_quote_response("CRWV", 79.50, 79.75),
+            ),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        let as_of = decision.as_of.to_string();
+        if let Some(signal) = decision.selected_signal.as_mut() {
+            signal.exit_date = Some(as_of.clone());
+            signal.exit_reason = Some("stock_marked_after_calls".to_owned());
+        }
+        if let Some(signal) = decision.management_signals.first_mut() {
+            signal.exit_date = Some(as_of);
+            signal.exit_reason = Some("stock_marked_after_calls".to_owned());
+        }
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "reviewed");
+        assert_eq!(decision.action_kind, Some(ExecutionActionKind::ManageOpen));
+        assert!(decision.tradier_quote.is_some());
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains("preview=true"));
+        assert!(bodies[3].contains("class=equity"));
+        assert!(bodies[3].contains("symbol=CRWV"));
+        assert!(bodies[3].contains("side=sell"));
+        assert!(bodies[3].contains("quantity=100"));
+        assert!(bodies[3].contains("type=limit"));
+        assert!(bodies[3].contains("price=79.50"));
+    }
+
+    #[test]
+    fn tradier_wheel_management_blocks_multi_contract_covered_call() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (
+                200,
+                tradier_multi_contract_wheel_covered_call_positions_response(),
+            ),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("covered-call quantity 2"));
+        assert!(decision.reason.contains("manual management"));
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_wheel_management_holds_assigned_stock_without_call_target() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_wheel_stock_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let mut decision = tradier_wheel_management_test_decision(ExecutionMode::Review);
+        if let Some(signal) = decision.selected_signal.as_mut() {
+            signal.wheel_covered_call_expiration = None;
+            signal.wheel_covered_call_strike = None;
+        }
+        if let Some(signal) = decision.management_signals.first_mut() {
+            signal.wheel_covered_call_expiration = None;
+            signal.wheel_covered_call_strike = None;
+        }
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "holding");
+        assert!(
+            decision
+                .reason
+                .contains("no exported covered-call target yet")
+        );
+        assert!(decision.tradier_quote.is_none());
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
+    }
+
+    #[test]
+    fn tradier_wheel_management_blocks_residual_stock_after_covered_call_assigned() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, tradier_assigned_wheel_stock_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let as_of = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"recent_closed",
+                "symbol":"CRWV",
+                "strategy":"wheel",
+                "entry_date":"2026-06-20",
+                "exit_date":"2026-06-30",
+                "expiration":"2026-06-27",
+                "short_strike":80.0,
+                "short_put":80.0,
+                "entry_credit":1.12,
+                "max_loss":7888.0,
+                "exit_reason":"covered_call_assigned"
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, false);
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        let config = test_tradier_config(base_url);
+
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.management_signals.len(), 1);
+        apply_tradier_rest_bridge_with_config(&mut decision, None, config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("residual Tradier stock"));
+        assert!(decision.reason.contains("covered-call assignment"));
+        assert!(decision.reason.contains("manual broker reconciliation"));
+        assert!(decision.tradier_quote.is_none());
+        assert!(decision.tradier_preview.is_none());
+        assert_eq!(bodies.len(), 2);
     }
 
     #[test]
@@ -10027,7 +15399,7 @@ mod tests {
                 "live_signal": "var/live_signal.json",
                 "live_signal_readable": true,
                 "live_signal_parse_ok": true,
-                "as_of": Utc::now().date_naive(),
+                "as_of": execution_default_as_of(Utc::now()),
                 "risk": test_canary_risk(),
                 "broker_multi_leg_options": true,
                 "broker_cash_secured_puts": true,
@@ -10148,6 +15520,24 @@ mod tests {
             &health,
             &stale_refresh_snapshot
         ));
+    }
+
+    #[test]
+    fn execution_worker_aggregate_status_treats_management_holding_as_healthy() {
+        let mut decision = tradier_management_test_decision(ExecutionMode::Live);
+        decision.status = "holding".to_owned();
+        decision.reason = "no exit rule fired".to_owned();
+
+        assert_eq!(
+            execution_worker_aggregate_status(Some(&decision), None, None),
+            "live"
+        );
+
+        decision.mode = ExecutionMode::Review;
+        assert_eq!(
+            execution_worker_aggregate_status(Some(&decision), None, None),
+            "review"
+        );
     }
 
     #[test]
@@ -10381,7 +15771,7 @@ mod tests {
             report
                 .blockers
                 .iter()
-                .any(|blocker| blocker.contains("no selected live signal"))
+                .any(|blocker| blocker.contains("no selected live entry"))
         );
         assert!(
             report
@@ -10458,9 +15848,9 @@ mod tests {
 
     #[test]
     fn execution_readiness_blocks_fresh_debit_live_attempt_until_lifecycle_gate() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
-        let artifact = test_canary_artifact(serde_json::json!([
+        let mut artifact = test_canary_artifact(serde_json::json!([
             {
                 "status":"new_entry",
                 "symbol":"TSLA",
@@ -10484,6 +15874,7 @@ mod tests {
                 "max_loss":7888.0
             }
         ]));
+        artifact.generated_at = Utc::now() - chrono::Duration::minutes(1);
         let broker = RobinhoodBrokerAdapter {
             capabilities: BrokerCapabilities {
                 single_leg_options: true,
@@ -10537,10 +15928,10 @@ mod tests {
     }
 
     #[test]
-    fn execution_readiness_blocks_risk_controlled_live_artifact_until_lifecycle_gate() {
-        let today = Utc::now().date_naive();
+    fn execution_readiness_allows_risk_controlled_tradier_live_artifact_after_lifecycle_gate() {
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
-        let artifact = test_canary_artifact(serde_json::json!([{
+        let mut artifact = test_canary_artifact(serde_json::json!([{
                 "status":"new_entry",
                 "symbol":"TSLA",
                 "strategy":"put_debit_spread",
@@ -10552,6 +15943,7 @@ mod tests {
                 "entry_credit":-1.00,
                 "max_loss":100.0
         }]));
+        artifact.generated_at = Utc::now() - chrono::Duration::minutes(1);
         let broker = execution_broker(BrokerKind::Tradier, false, false, false, true);
 
         let report = build_execution_readiness_report(
@@ -10569,14 +15961,9 @@ mod tests {
         );
 
         if execution_market_window_open_at(Utc::now()) {
-            assert!(!report.ready_for_broker_review);
-            assert!(!report.live_worker_ready_to_attempt_order);
-            assert!(
-                report
-                    .blockers
-                    .iter()
-                    .any(|blocker| blocker.contains("position reconciliation"))
-            );
+            assert!(report.ready_for_broker_review);
+            assert!(report.live_worker_ready_to_attempt_order);
+            assert!(report.blockers.is_empty());
             assert_eq!(
                 report
                     .decision
@@ -10597,7 +15984,7 @@ mod tests {
 
     #[test]
     fn execution_readiness_blocks_future_exported_at() {
-        let today = Utc::now().date_naive();
+        let today = execution_default_as_of(Utc::now());
         let today_s = today.to_string();
         let mut artifact = test_canary_artifact(serde_json::json!([{
             "status":"new_entry",
@@ -10695,7 +16082,7 @@ mod tests {
         };
 
         let snapshot = tradier_market_session_snapshot_from_clock(
-            test_market_open_utc(Utc::now().date_naive()),
+            test_market_open_utc(execution_default_as_of(Utc::now())),
             &clock,
         )
         .unwrap();
@@ -10703,6 +16090,82 @@ mod tests {
         assert!(snapshot.open);
         assert_eq!(snapshot.source, "tradier_clock");
         assert_eq!(snapshot.reason, "Market is open");
+    }
+
+    #[test]
+    fn live_decision_uses_market_date_after_utc_rollover() {
+        let market_date = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let after_close_utc = NaiveDate::from_ymd_opt(2026, 6, 30)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap()
+            .and_utc();
+        let artifact = test_canary_artifact(serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":market_date.to_string(),
+                "exit_date":market_date.to_string(),
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+        }]));
+        let broker = execution_broker(BrokerKind::Tradier, true, false, false, true);
+
+        let decision = compute_execution_decision_at(
+            &artifact,
+            execution_default_as_of(after_close_utc),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Live,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            after_close_utc,
+        );
+
+        assert_eq!(execution_default_as_of(after_close_utc), market_date);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("regular options-market window"));
+        assert!(!decision.reason.contains("--as-of"));
+    }
+
+    #[test]
+    fn live_decision_reports_market_closed_before_stale_date_after_eastern_midnight() {
+        let artifact_date = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let next_market_date = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let after_eastern_midnight_utc = next_market_date.and_hms_opt(4, 30, 0).unwrap().and_utc();
+        let artifact = test_canary_artifact(serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":artifact_date.to_string(),
+                "exit_date":artifact_date.to_string(),
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+        }]));
+        let broker = execution_broker(BrokerKind::Tradier, true, false, false, true);
+
+        let decision = compute_execution_decision_at(
+            &artifact,
+            execution_default_as_of(after_eastern_midnight_utc),
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Live,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            after_eastern_midnight_utc,
+        );
+
+        assert_eq!(
+            execution_default_as_of(after_eastern_midnight_utc),
+            next_market_date
+        );
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("regular options-market window"));
+        assert!(!decision.reason.contains("does not match requested as_of"));
     }
 
     fn test_canary_risk() -> CanaryRiskPolicy {
@@ -10757,6 +16220,8 @@ mod tests {
         let approved_strategy = ApprovedStrategy {
             strategy_id: "test_strategy".to_owned(),
             profile_name: "test_profile".to_owned(),
+            research_from: None,
+            live_detector_lookback_days: None,
             symbols: vec![
                 "CRWV".to_owned(),
                 "ORCL".to_owned(),
@@ -10780,6 +16245,14 @@ mod tests {
                 "wheel".to_owned(),
             ],
             canary_risk_policy_id: "test_canary_risk".to_owned(),
+            production_approval: Some(ProductionApproval {
+                status: ProductionApprovalStatus::CanaryApproved,
+                approved_at: test_market_open_utc(as_of),
+                approved_by: "test_operator".to_owned(),
+                reason: "test fixture approval for execution contract coverage".to_owned(),
+                source_canary_status: Some("canary_only".to_owned()),
+                max_order_max_loss: Some(10_000.0),
+            }),
         };
         LiveSignalArtifact {
             schema_version: LIVE_SIGNAL_SCHEMA_VERSION,
@@ -10849,6 +16322,13 @@ mod tests {
                 .and_then(|value| value.as_f64())
                 .or(short_put),
             long_strike: action.get("long_strike").and_then(|value| value.as_f64()),
+            wheel_covered_call_expiration: action
+                .get("wheel_covered_call_expiration")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            wheel_covered_call_strike: action
+                .get("wheel_covered_call_strike")
+                .and_then(|value| value.as_f64()),
             width: action.get("width").and_then(|value| value.as_f64()),
             entry_credit: action.get("entry_credit").and_then(|value| value.as_f64()),
             max_loss: action.get("max_loss").and_then(|value| value.as_f64()),
@@ -10857,7 +16337,10 @@ mod tests {
             pnl: action.get("pnl").and_then(|value| value.as_f64()),
             dte_entry: None,
             days_held: None,
-            exit_reason: None,
+            exit_reason: action
+                .get("exit_reason")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
             short_delta: None,
             long_delta: None,
             short_oi: None,
@@ -10865,12 +16348,127 @@ mod tests {
             short_iv: None,
             long_iv: None,
             underlying_price: None,
+            execution_rules: Some(test_live_execution_rules()),
+        }
+    }
+
+    fn tradier_call_debit_action(status: &str) -> TradeSignal {
+        test_trade_signal_summary(
+            &serde_json::json!({
+                "status": status,
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }),
+            None,
+        )
+    }
+
+    fn tradier_put_debit_action(status: &str) -> TradeSignal {
+        test_trade_signal_summary(
+            &serde_json::json!({
+                "status": status,
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+            }),
+            None,
+        )
+    }
+
+    fn tradier_call_credit_action(status: &str) -> TradeSignal {
+        test_trade_signal_summary(
+            &serde_json::json!({
+                "status": status,
+                "symbol":"ORCL",
+                "strategy":"call_credit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":230.0,
+                "width":5.0,
+                "entry_credit":1.20,
+                "max_loss":380.0
+            }),
+            None,
+        )
+    }
+
+    fn tradier_put_credit_action(status: &str) -> TradeSignal {
+        test_trade_signal_summary(
+            &serde_json::json!({
+                "status": status,
+                "symbol":"TSLA",
+                "strategy":"put_credit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":345.0,
+                "width":5.0,
+                "entry_credit":1.00,
+                "max_loss":400.0
+            }),
+            None,
+        )
+    }
+
+    fn tradier_test_position(symbol: &str, quantity: f64) -> TradierPosition {
+        TradierPosition {
+            symbol: symbol.to_owned(),
+            quantity,
+            cost_basis: None,
+        }
+    }
+
+    fn tradier_test_order(
+        id: Option<&str>,
+        symbol: Option<&str>,
+        option_symbol: Option<&str>,
+        status: Option<&str>,
+        quantity: Option<f64>,
+    ) -> TradierOrder {
+        TradierOrder {
+            id: id.map(ToOwned::to_owned),
+            symbol: symbol.map(ToOwned::to_owned),
+            option_symbol: option_symbol.map(ToOwned::to_owned),
+            status: status.map(ToOwned::to_owned),
+            side: None,
+            quantity,
+        }
+    }
+
+    fn tradier_test_quote(symbol: &str, bid: Option<f64>, ask: Option<f64>) -> TradierQuote {
+        let now_ms = Utc::now().timestamp_millis();
+        TradierQuote {
+            symbol: symbol.to_owned(),
+            bid,
+            ask,
+            last: None,
+            bid_size: Some(10.0),
+            ask_size: Some(10.0),
+            bid_date: Some(now_ms),
+            ask_date: Some(now_ms),
+            trade_date: Some(now_ms),
         }
     }
 
     fn tradier_test_decision(mode: ExecutionMode) -> ExecutionDecision {
         let as_of = if mode == ExecutionMode::Live {
-            Utc::now().date_naive()
+            execution_default_as_of(Utc::now())
         } else {
             NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
         };
@@ -10911,9 +16509,158 @@ mod tests {
         decision
     }
 
+    fn tradier_management_test_decision(mode: ExecutionMode) -> ExecutionDecision {
+        let as_of = if mode == ExecutionMode::Live {
+            execution_default_as_of(Utc::now())
+        } else {
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
+        };
+        let as_of_s = as_of.to_string();
+        let artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":as_of_s,
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "width":5.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        let broker = execution_broker(
+            BrokerKind::Tradier,
+            false,
+            false,
+            false,
+            mode == ExecutionMode::Live,
+        );
+        let decision_mode = if mode == ExecutionMode::Live {
+            ExecutionMode::Review
+        } else {
+            mode
+        };
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            decision_mode,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        decision.mode = mode;
+        decision
+    }
+
+    fn tradier_credit_management_test_decision(mode: ExecutionMode) -> ExecutionDecision {
+        let as_of = if mode == ExecutionMode::Live {
+            execution_default_as_of(Utc::now())
+        } else {
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
+        };
+        let as_of_s = as_of.to_string();
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"ORCL",
+                "strategy":"call_credit_spread",
+                "entry_date":as_of_s,
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":230.0,
+                "width":5.0,
+                "entry_credit":1.20,
+                "max_loss":380.0
+            }]),
+        );
+        artifact
+            .approved_strategy
+            .allowed_live_strategies
+            .push("call_credit_spread".to_owned());
+        let broker = execution_broker(
+            BrokerKind::Tradier,
+            false,
+            false,
+            false,
+            mode == ExecutionMode::Live,
+        );
+        let decision_mode = if mode == ExecutionMode::Live {
+            ExecutionMode::Review
+        } else {
+            mode
+        };
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            decision_mode,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        decision.mode = mode;
+        decision
+    }
+
+    fn tradier_put_credit_management_test_decision(mode: ExecutionMode) -> ExecutionDecision {
+        let as_of = if mode == ExecutionMode::Live {
+            execution_default_as_of(Utc::now())
+        } else {
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
+        };
+        let as_of_s = as_of.to_string();
+        let mut artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"TSLA",
+                "strategy":"put_credit_spread",
+                "entry_date":as_of_s,
+                "exit_date":"2026-07-01",
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":345.0,
+                "width":5.0,
+                "entry_credit":1.00,
+                "max_loss":400.0
+            }]),
+        );
+        artifact
+            .approved_strategy
+            .allowed_live_strategies
+            .push("put_credit_spread".to_owned());
+        let broker = execution_broker(
+            BrokerKind::Tradier,
+            false,
+            false,
+            false,
+            mode == ExecutionMode::Live,
+        );
+        let decision_mode = if mode == ExecutionMode::Live {
+            ExecutionMode::Review
+        } else {
+            mode
+        };
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            decision_mode,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        decision.mode = mode;
+        decision
+    }
+
     fn tradier_wheel_test_decision(mode: ExecutionMode) -> ExecutionDecision {
         let as_of = if mode == ExecutionMode::Live {
-            Utc::now().date_naive()
+            execution_default_as_of(Utc::now())
         } else {
             NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
         };
@@ -10944,6 +16691,58 @@ mod tests {
             mode,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
         )
+    }
+
+    fn tradier_wheel_management_test_decision(mode: ExecutionMode) -> ExecutionDecision {
+        let as_of = if mode == ExecutionMode::Live {
+            execution_default_as_of(Utc::now())
+        } else {
+            NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()
+        };
+        let as_of_s = as_of.to_string();
+        let put_expiration = (as_of + chrono::Duration::days(3)).to_string();
+        let call_expiration = (as_of + chrono::Duration::days(7)).to_string();
+        let artifact = test_live_signal_artifact_as_of(
+            Some(as_of),
+            serde_json::json!([{
+                "status":"already_open",
+                "symbol":"CRWV",
+                "strategy":"wheel",
+                "entry_date":as_of_s,
+                "exit_date":call_expiration.clone(),
+                "expiration":put_expiration,
+                "short_strike":80.0,
+                "short_put":80.0,
+                "long_strike":85.0,
+                "wheel_covered_call_expiration":call_expiration,
+                "wheel_covered_call_strike":85.0,
+                "width":1.0,
+                "entry_credit":1.12,
+                "max_loss":7888.0
+            }]),
+        );
+        let broker = execution_broker(
+            BrokerKind::Tradier,
+            false,
+            false,
+            false,
+            mode == ExecutionMode::Live,
+        );
+        let decision_mode = if mode == ExecutionMode::Live {
+            ExecutionMode::Review
+        } else {
+            mode
+        };
+        let mut decision = compute_execution_decision(
+            &artifact,
+            as_of,
+            &test_canary_risk(),
+            &broker,
+            decision_mode,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+        decision.mode = mode;
+        decision
     }
 
     fn test_tradier_config(base_url: String) -> TradierConfig {
@@ -11004,6 +16803,25 @@ mod tests {
         spawn_tradier_mock(all)
     }
 
+    fn spawn_tradier_credit_mock<S>(
+        responses: Vec<(u16, S)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    )
+    where
+        S: Into<String>,
+    {
+        let mut all = tradier_credit_base_responses(false);
+        all.extend(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.into())),
+        );
+        spawn_tradier_mock(all)
+    }
+
     fn spawn_tradier_live_debit_mock<S>(
         responses: Vec<(u16, S)>,
     ) -> (
@@ -11038,6 +16856,21 @@ mod tests {
         responses
     }
 
+    fn tradier_credit_base_responses(live: bool) -> Vec<(u16, String)> {
+        let mut responses = Vec::new();
+        if live {
+            responses.push((
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ));
+        }
+        responses.push((200, tradier_good_balances_response()));
+        responses.push((200, r#"{"positions":{"position":[]}}"#.to_owned()));
+        responses.push((200, r#"{"orders":{"order":[]}}"#.to_owned()));
+        responses.push((200, tradier_good_credit_quote_response()));
+        responses
+    }
+
     fn tradier_good_balances_response() -> String {
         r#"{"balances":{"account_number":"TEST123","option_buying_power":45000,"total_cash":45000}}"#.to_owned()
     }
@@ -11047,9 +16880,89 @@ mod tests {
         tradier_debit_quote_response(now_ms)
     }
 
+    fn tradier_good_credit_quote_response() -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        tradier_credit_quote_response(now_ms, 1.50, 0.30)
+    }
+
+    fn tradier_open_call_debit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"ORCL260702C00220000","quantity":1,"cost_basis":450},{"symbol":"ORCL260702C00225000","quantity":-1,"cost_basis":-10}]}}"#.to_owned()
+    }
+
+    fn tradier_open_call_credit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"ORCL260702C00230000","quantity":1,"cost_basis":30},{"symbol":"ORCL260702C00225000","quantity":-1,"cost_basis":-120}]}}"#.to_owned()
+    }
+
+    fn tradier_open_put_credit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"TSLA260702P00345000","quantity":1,"cost_basis":30},{"symbol":"TSLA260702P00350000","quantity":-1,"cost_basis":-100}]}}"#.to_owned()
+    }
+
+    fn tradier_assigned_call_debit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"ORCL260702C00220000","quantity":1,"cost_basis":450},{"symbol":"ORCL","quantity":-100,"cost_basis":-22500}]}}"#.to_owned()
+    }
+
+    fn tradier_assigned_call_credit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"ORCL260702C00230000","quantity":1,"cost_basis":30},{"symbol":"ORCL","quantity":-100,"cost_basis":-22500}]}}"#.to_owned()
+    }
+
+    fn tradier_assigned_put_credit_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"TSLA260702P00345000","quantity":1,"cost_basis":30},{"symbol":"TSLA","quantity":100,"cost_basis":35000}]}}"#.to_owned()
+    }
+
+    fn tradier_debit_exit_quote_response(long_bid: f64, short_ask: f64) -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        format!(
+            r#"{{"quotes":{{"quote":[{{"symbol":"ORCL260702C00220000","bid":{long_bid},"ask":5.00,"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}},{{"symbol":"ORCL260702C00225000","bid":0.01,"ask":{short_ask},"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}}]}}}}"#
+        )
+    }
+
+    fn tradier_credit_exit_quote_response(short_ask: f64, long_bid: f64) -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        format!(
+            r#"{{"quotes":{{"quote":[{{"symbol":"ORCL260702C00225000","bid":0.20,"ask":{short_ask},"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}},{{"symbol":"ORCL260702C00230000","bid":{long_bid},"ask":0.30,"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}}]}}}}"#
+        )
+    }
+
+    fn tradier_put_credit_exit_quote_response(short_ask: f64, long_bid: f64) -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        format!(
+            r#"{{"quotes":{{"quote":[{{"symbol":"TSLA260702P00350000","bid":0.20,"ask":{short_ask},"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}},{{"symbol":"TSLA260702P00345000","bid":{long_bid},"ask":0.30,"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}}]}}}}"#
+        )
+    }
+
+    fn tradier_open_wheel_short_put_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"CRWV260702P00080000","quantity":-1,"cost_basis":-112}]}}"#.to_owned()
+    }
+
+    fn tradier_assigned_wheel_stock_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"CRWV","quantity":100,"cost_basis":8000}]}}"#
+            .to_owned()
+    }
+
+    fn tradier_existing_wheel_covered_call_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"CRWV","quantity":100,"cost_basis":8000},{"symbol":"CRWV260713C00090000","quantity":-1,"cost_basis":-75}]}}"#.to_owned()
+    }
+
+    fn tradier_multi_contract_wheel_covered_call_positions_response() -> String {
+        r#"{"positions":{"position":[{"symbol":"CRWV","quantity":200,"cost_basis":16000},{"symbol":"CRWV260706C00085000","quantity":-2,"cost_basis":-130}]}}"#.to_owned()
+    }
+
+    fn tradier_single_option_quote_response(symbol: &str, bid: f64, ask: f64) -> String {
+        let now_ms = Utc::now().timestamp_millis();
+        format!(
+            r#"{{"quotes":{{"quote":{{"symbol":"{symbol}","bid":{bid},"ask":{ask},"bidsize":10,"asksize":10,"bid_date":{now_ms},"ask_date":{now_ms}}}}}}}"#
+        )
+    }
+
     fn tradier_debit_quote_response(timestamp_ms: i64) -> String {
         format!(
             r#"{{"quotes":{{"quote":[{{"symbol":"ORCL260702C00220000","bid":4.90,"ask":5.00,"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}},{{"symbol":"ORCL260702C00225000","bid":0.55,"ask":0.65,"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}}]}}}}"#
+        )
+    }
+
+    fn tradier_credit_quote_response(timestamp_ms: i64, short_bid: f64, long_ask: f64) -> String {
+        format!(
+            r#"{{"quotes":{{"quote":[{{"symbol":"ORCL260702C00225000","bid":{short_bid},"ask":1.70,"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}},{{"symbol":"ORCL260702C00230000","bid":0.20,"ask":{long_ask},"bidsize":10,"asksize":10,"bid_date":{timestamp_ms},"ask_date":{timestamp_ms}}}]}}}}"#
         )
     }
 
@@ -11421,6 +17334,15 @@ mod tests {
             stop_loss_cooldown_days: 10,
             max_concurrent_positions: 1,
             min_entry_spacing_days: 1,
+        }
+    }
+
+    fn test_live_execution_rules() -> LiveExecutionRules {
+        LiveExecutionRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 21,
+            max_hold_days: None,
         }
     }
 

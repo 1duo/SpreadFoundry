@@ -1,6 +1,8 @@
 {
   "strategy_id": "weekly_selector_approved_20260629",
   "profile_name": "selector_crash_put_and_costaware_call_debits_only",
+  "research_from": "2023-01-01",
+  "live_detector_lookback_days": 30,
   "symbols": ["IREN", "PLTR", "ORCL", "TSLA", "CRWV", "AMD"],
   "portfolio_constraints": {
     "capital_budget": 7897.67,
@@ -14,5 +16,13 @@
     "symbol_drawdown_cooldown_days": 0
   },
   "allowed_live_strategies": ["put_debit_spread", "call_debit_spread"],
-  "canary_risk_policy_id": "tradier_canary_debit_v1"
+  "canary_risk_policy_id": "tradier_canary_debit_v1",
+  "production_approval": {
+    "status": "operator_risk_override",
+    "approved_at": "2026-06-30T01:30:00Z",
+    "approved_by": "operator",
+    "reason": "Operator accepts larger drawdown for an aggressive Tradier debit-spread canary; autonomous placement remains limited to broker-reconciled Tradier debit-spread entry and close lifecycle gates.",
+    "source_canary_status": "blocked",
+    "max_order_max_loss": 1000.0
+  }
 }
