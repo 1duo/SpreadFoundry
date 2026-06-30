@@ -59,6 +59,7 @@ use wait_timeout::ChildExt;
 
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
 const DEFAULT_MAX_QUOTE_AGE_SECONDS: i64 = 30;
+const DEFAULT_WARM_OPTION_CACHE_WINDOW_TIMEOUT_SECONDS: u64 = 300;
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses eight non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
 const UNIVERSE_SEED_SCORE_BASIS: &str = "Static pre-research seed score: 3x option liquidity + 2x premium + 2x spread quality + price-fit + diversification + event-risk discipline. Used only to choose the default live_signal symbols; actual suitability ranking is research-evidence driven.";
@@ -376,6 +377,8 @@ enum Commands {
         max_windows_per_symbol: usize,
         #[arg(long, default_value_t = 2)]
         fetch_concurrency: usize,
+        #[arg(long, default_value_t = DEFAULT_WARM_OPTION_CACHE_WINDOW_TIMEOUT_SECONDS)]
+        window_timeout_seconds: u64,
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
@@ -1175,6 +1178,7 @@ async fn main() -> Result<()> {
             max_expirations,
             max_windows_per_symbol,
             fetch_concurrency,
+            window_timeout_seconds,
             force_refresh,
             json,
         } => {
@@ -1194,6 +1198,7 @@ async fn main() -> Result<()> {
                 max_windows_per_symbol,
                 fetch_concurrency,
                 force_refresh,
+                window_timeout_seconds,
             })
             .await?;
             if json {
@@ -11048,6 +11053,8 @@ mod tests {
             "6",
             "--fetch-concurrency",
             "2",
+            "--window-timeout-seconds",
+            "45",
             "--json",
         ])
         .unwrap();
@@ -11060,6 +11067,7 @@ mod tests {
                 max_expirations,
                 max_windows_per_symbol,
                 fetch_concurrency,
+                window_timeout_seconds,
                 json,
                 ..
             } => {
@@ -11069,6 +11077,7 @@ mod tests {
                 assert_eq!(max_expirations, Some(80));
                 assert_eq!(max_windows_per_symbol, 6);
                 assert_eq!(fetch_concurrency, 2);
+                assert_eq!(window_timeout_seconds, 45);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 #[cfg(test)]
 use crate::execution::{
@@ -193,6 +193,7 @@ pub struct WarmOptionCacheCoverageRequest {
     pub max_windows_per_symbol: usize,
     pub fetch_concurrency: usize,
     pub force_refresh: bool,
+    pub window_timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2049,15 +2050,22 @@ async fn warm_symbol_option_cache_coverage(
 
     let mut windows = Vec::new();
     for chunk in candidates.chunks(request.fetch_concurrency.max(1)) {
-        let futures =
-            chunk.iter().cloned().map(|candidate| {
-                let symbol = symbol.to_owned();
-                let raw_dir = raw_dir.clone();
-                let force_refresh = request.force_refresh;
-                async move {
-                    warm_option_cache_window(&symbol, &raw_dir, candidate, force_refresh).await
-                }
-            });
+        let futures = chunk.iter().cloned().map(|candidate| {
+            let symbol = symbol.to_owned();
+            let raw_dir = raw_dir.clone();
+            let force_refresh = request.force_refresh;
+            let window_timeout_seconds = request.window_timeout_seconds;
+            async move {
+                warm_option_cache_window_with_timeout(
+                    &symbol,
+                    &raw_dir,
+                    candidate,
+                    force_refresh,
+                    window_timeout_seconds,
+                )
+                .await
+            }
+        });
         windows.extend(join_all(futures).await);
     }
 
@@ -2080,6 +2088,43 @@ async fn warm_symbol_option_cache_coverage(
         windows_failed,
         windows,
         error,
+    }
+}
+
+async fn warm_option_cache_window_with_timeout(
+    symbol: &str,
+    raw_dir: &Path,
+    candidate: WarmOptionCacheCandidate,
+    force_refresh: bool,
+    window_timeout_seconds: u64,
+) -> WarmOptionCacheCoverageWindow {
+    if window_timeout_seconds == 0 {
+        return warm_option_cache_window(symbol, raw_dir, candidate, force_refresh).await;
+    }
+
+    let expiration = candidate.expiration;
+    let start = candidate.start;
+    let end = candidate.end;
+    let put_complete_before = candidate.put_complete_before;
+    let call_complete_before = candidate.call_complete_before;
+    match timeout(
+        StdDuration::from_secs(window_timeout_seconds),
+        warm_option_cache_window(symbol, raw_dir, candidate, force_refresh),
+    )
+    .await
+    {
+        Ok(window) => window,
+        Err(_) => WarmOptionCacheCoverageWindow {
+            expiration,
+            start,
+            end,
+            put_complete_before,
+            call_complete_before,
+            put_complete_after: false,
+            call_complete_after: false,
+            both_complete_after: false,
+            error: Some(format!("window timed out after {window_timeout_seconds}s")),
+        },
     }
 }
 
