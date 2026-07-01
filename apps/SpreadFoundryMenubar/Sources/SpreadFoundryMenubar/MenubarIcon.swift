@@ -24,7 +24,7 @@ enum MenubarIcon {
         defer { image.unlockFocus() }
 
         let scale = min(size.width, size.height) / 28.0
-        let yOffset: CGFloat = -1.0
+        let yOffset: CGFloat = 0.35
         NSColor.black.setFill()
 
         roundedTile(x: 2.4, y: 2.4 + yOffset, width: 23.2, height: 23.2, radius: 6.0, scale: scale).fill()
