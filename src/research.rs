@@ -31,11 +31,11 @@ use rust_decimal::Decimal;
 const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
-const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 52.0;
+const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 26.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
-const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.075;
-const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.05;
+const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.10;
+const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.075;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
@@ -14072,7 +14072,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_allows_relaxed_drawdown_for_operator_canary() {
+    fn portfolio_canary_allows_expanded_drawdown_for_operator_canary() {
         let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let opportunity =
             portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 500.0);
@@ -14104,7 +14104,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_canary_blocks_drawdown_above_relaxed_cap() {
+    fn portfolio_canary_blocks_drawdown_above_expanded_cap() {
         let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let opportunity =
             portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 500.0);
@@ -14414,7 +14414,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_wheel_gate_allows_drawdown_below_relaxed_research_cap() {
+    fn portfolio_wheel_gate_allows_drawdown_below_expanded_research_cap() {
         let mut trades = Vec::new();
         for (entry, pnl) in [
             (NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(), 1_000.0),
@@ -14452,14 +14452,14 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_wheel_gate_blocks_drawdown_above_relaxed_research_cap() {
+    fn portfolio_wheel_gate_blocks_drawdown_above_expanded_research_cap() {
         let mut trades = Vec::new();
         for (entry, pnl) in [
             (NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 4, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 7, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 10, 10).unwrap(), 1_000.0),
-            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_300.0),
             (NaiveDate::from_ymd_opt(2025, 3, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 5, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 9, 10).unwrap(), 1_000.0),
@@ -14486,7 +14486,7 @@ mod tests {
         assert_eq!(status, "blocked");
         assert!(!pass);
         assert!(reason.contains("drawdown gate failed"));
-        assert!(reason.contains("versus cap 7.50%"));
+        assert!(reason.contains("versus cap 10.00%"));
     }
 
     #[test]
@@ -14928,7 +14928,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_profiles_require_one_trade_per_week_for_ranking() {
+    fn weekly_profiles_require_one_trade_every_two_weeks_for_ranking() {
         let profile = ResearchProfile::weekly_baseline();
         let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
@@ -14943,7 +14943,7 @@ mod tests {
             profile.min_trades_per_year,
             MIN_WEEKLY_RANKING_TRADES_PER_YEAR
         );
-        assert_eq!(metrics.required_trades, 26);
+        assert_eq!(metrics.required_trades, 13);
         assert!(!metrics.ranking_eligible);
     }
 

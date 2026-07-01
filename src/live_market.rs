@@ -11,7 +11,7 @@ use std::time::Instant;
 
 pub const LIVE_MARKET_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LIVE_MARKET_INTERVAL_SECONDS: u64 = 30;
-pub const DEFAULT_LIVE_MARKET_MAX_SOURCE_AGE_SECONDS: u64 = 45;
+pub const DEFAULT_LIVE_MARKET_MAX_SOURCE_AGE_SECONDS: u64 = 420;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

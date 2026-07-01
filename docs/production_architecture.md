@@ -108,7 +108,7 @@ market engine. It writes `var/live_market_engine_health.json`, appends live
 audit rows to `data/spreadfoundry.duckdb`, and writes the execution-compatible
 artifact at `var/live_signal.json`. The engine is a snapshot loop, not a
 history-scanning research job. Default cadence is `30` seconds and default
-source freshness is `45` seconds; stale or unavailable provider input produces
+source freshness is `420` seconds; stale or unavailable provider input produces
 no selected signal.
 When `SPREAD_LIVE_ENGINE_ENABLED=1`, `scripts/spreadfoundry-service.sh` keeps
 signal refresh running as the source feed but redirects it to

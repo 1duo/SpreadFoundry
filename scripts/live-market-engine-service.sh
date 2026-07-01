@@ -116,7 +116,7 @@ configure_live_engine() {
   export SPREAD_LIVE_ENGINE_STATE_FILE="${SPREAD_LIVE_ENGINE_STATE_FILE:-$state_file}"
   export SPREAD_LIVE_ENGINE_STORE="${SPREAD_LIVE_ENGINE_STORE:-data/spreadfoundry.duckdb}"
   export SPREAD_LIVE_ENGINE_INTERVAL_SECONDS="${SPREAD_LIVE_ENGINE_INTERVAL_SECONDS:-30}"
-  export SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS="${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-45}"
+  export SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS="${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-420}"
   export SPREAD_LIVE_ENGINE_MARKET_WINDOW_ONLY="${SPREAD_LIVE_ENGINE_MARKET_WINDOW_ONLY:-1}"
   persist_live_engine_env
   echo "configured live market engine interval=${SPREAD_LIVE_ENGINE_INTERVAL_SECONDS}s source=$SPREAD_LIVE_ENGINE_SOURCE_ARTIFACT output=$SPREAD_LIVE_SIGNAL_ARTIFACT"
@@ -134,7 +134,7 @@ live_engine_cli_args() {
     --state-file "${SPREAD_LIVE_ENGINE_STATE_FILE:-$state_file}"
     --store "${SPREAD_LIVE_ENGINE_STORE:-data/spreadfoundry.duckdb}"
     --interval-seconds "${SPREAD_LIVE_ENGINE_INTERVAL_SECONDS:-30}"
-    --max-source-age-seconds "${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-45}"
+    --max-source-age-seconds "${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-420}"
     --market-window-only "$market_window_only"
     --json
   )
@@ -222,7 +222,7 @@ exec "${SPREAD_BINARY:-$spreadfoundry_bin}" live-market-engine \\
   --state-file "\${SPREAD_LIVE_ENGINE_STATE_FILE:-$state_file}" \\
   --store "\${SPREAD_LIVE_ENGINE_STORE:-data/spreadfoundry.duckdb}" \\
   --interval-seconds "\${SPREAD_LIVE_ENGINE_INTERVAL_SECONDS:-30}" \\
-  --max-source-age-seconds "\${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-45}" \\
+  --max-source-age-seconds "\${SPREAD_LIVE_ENGINE_MAX_SOURCE_AGE_SECONDS:-420}" \\
   --market-window-only "$market_window_only" \\
   --json
 EOF

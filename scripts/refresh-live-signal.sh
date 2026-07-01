@@ -9,7 +9,7 @@ spreadfoundry_bin="${SPREAD_BINARY:-target/release/spreadfoundry}"
 args=(
   refresh-live-signal
   --approved-strategy "${SPREAD_APPROVED_STRATEGY:-configs/approved_strategy.json}"
-  --output "${SPREAD_LIVE_SIGNAL_ARTIFACT:-var/live_signal.json}"
+  --output "${SPREAD_LIVE_SIGNAL_ARTIFACT:-var/live_signal_refresh_source.json}"
   --state-file "${SPREAD_SIGNAL_REFRESH_DETAIL_STATE_FILE:-var/live_signal_refresh_last.json}"
   --from "${SPREAD_SELECTOR_FROM:-2016-01-01}"
   --to "${SPREAD_SIGNAL_REFRESH_TO:-$(date -u '+%Y-%m-%d')}"

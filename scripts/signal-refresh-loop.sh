@@ -33,7 +33,7 @@ write_detail_timeout_state() {
   local run_to approved_strategy artifact reason
   run_to="${SPREAD_SIGNAL_REFRESH_TO:-$(date -u '+%Y-%m-%d')}"
   approved_strategy="${SPREAD_APPROVED_STRATEGY:-configs/approved_strategy.json}"
-  artifact="${SPREAD_LIVE_SIGNAL_ARTIFACT:-var/live_signal.json}"
+  artifact="${SPREAD_LIVE_SIGNAL_ARTIFACT:-var/live_signal_refresh_source.json}"
   reason="approved strategy signal refresh exceeded ${timeout_seconds}s Rust timeout plus watchdog grace"
   mkdir -p "$(dirname "$detail_state_file")"
   printf '{\n  "started_at": "%s",\n  "finished_at": "%s",\n  "status": "selector_timeout",\n  "exit_code": 124,\n  "run_to": "%s",\n  "run_dir": "",\n  "approved_strategy": "%s",\n  "live_signal_artifact": "%s",\n  "reason": "%s"\n}\n' \
