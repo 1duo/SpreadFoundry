@@ -1925,10 +1925,7 @@ pub async fn run_portfolio_selector_research_for_profile(
     request: PortfolioWheelResearchRequest,
     profile_name: &str,
 ) -> Result<PortfolioWheelReport> {
-    let profile = portfolio_selector_profiles()
-        .into_iter()
-        .find(|profile| profile.summary_profile.name == profile_name)
-        .with_context(|| format!("approved selector profile {profile_name} was not found"))?;
+    let profile = portfolio_selector_profile_by_name(profile_name)?;
     run_portfolio_research(
         request,
         "portfolio-weekly-signal-refresh",
@@ -1936,6 +1933,28 @@ pub async fn run_portfolio_selector_research_for_profile(
         vec![profile],
     )
     .await
+}
+
+pub async fn run_portfolio_selector_research_for_approved_profile(
+    request: PortfolioWheelResearchRequest,
+    profile_name: &str,
+) -> Result<PortfolioWheelReport> {
+    let profile = portfolio_selector_profile_by_name(profile_name)?;
+    run_portfolio_research(
+        request,
+        "portfolio-weekly-selector-research",
+        "Portfolio Weekly Selector Research",
+        vec![profile],
+    )
+    .await
+}
+
+fn portfolio_selector_profile_by_name(profile_name: &str) -> Result<PortfolioSelectorProfile> {
+    let profile = portfolio_selector_profiles()
+        .into_iter()
+        .find(|profile| profile.summary_profile.name == profile_name)
+        .with_context(|| format!("approved selector profile {profile_name} was not found"))?;
+    Ok(profile)
 }
 
 pub async fn audit_option_cache_coverage(

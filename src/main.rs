@@ -36,8 +36,9 @@ use spreadfoundry::research::{
     ResearchProfileFamily, ResearchReport, ResearchRequest, WarmOptionCacheCoverageReport,
     WarmOptionCacheCoverageRequest, WarmOptionCacheSide, WeeklySignalGateAuditReport,
     WeeklySignalGateAuditRequest, audit_option_cache_coverage, audit_weekly_signal_gates,
-    run_portfolio_selector_research, run_portfolio_selector_research_for_profile,
-    run_portfolio_wheel_research, run_symbol_research, warm_option_cache_coverage,
+    run_portfolio_selector_research, run_portfolio_selector_research_for_approved_profile,
+    run_portfolio_selector_research_for_profile, run_portfolio_wheel_research, run_symbol_research,
+    warm_option_cache_coverage,
 };
 use spreadfoundry::research_store::{
     ResearchStore, ResearchStoreHealth, ResearchStoreImportReport, ResearchStorePerfReport,
@@ -586,6 +587,8 @@ enum Commands {
         symbols: Vec<String>,
         #[arg(long)]
         approved_strategy: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',')]
+        candidate_symbols: Vec<String>,
         #[arg(long, default_value = DEFAULT_RESEARCH_FROM)]
         from: NaiveDate,
         #[arg(long)]
@@ -1508,6 +1511,7 @@ async fn main() -> Result<()> {
         Commands::ResearchPortfolioSelector {
             symbols,
             approved_strategy,
+            candidate_symbols,
             from,
             to,
             max_expirations,
@@ -1536,11 +1540,14 @@ async fn main() -> Result<()> {
                 .transpose()?;
             let report = if let Some(approved_strategy_path) = approved_strategy {
                 let approved_strategy = read_approved_strategy(&approved_strategy_path)?;
-                let constraints = approved_strategy.portfolio_constraints.clone();
                 let from = approved_strategy_research_from(&approved_strategy, from);
-                run_portfolio_selector_research_for_profile(
+                let symbols = approved_strategy_research_symbols(
+                    &approved_strategy.symbols,
+                    candidate_symbols,
+                );
+                run_portfolio_selector_research_for_approved_profile(
                     PortfolioWheelResearchRequest {
-                        symbols: approved_strategy.symbols.clone(),
+                        symbols,
                         from,
                         to,
                         max_expirations,
@@ -1548,18 +1555,15 @@ async fn main() -> Result<()> {
                         symbol_concurrency,
                         force_refresh,
                         cache_only,
-                        capital_budget: constraints.capital_budget,
-                        max_symbol_allocation_pct: constraints.max_symbol_allocation_pct,
-                        max_open_positions: constraints.max_open_positions,
-                        max_positions_per_symbol: constraints.max_positions_per_symbol,
-                        max_total_trades_per_symbol: constraints.max_total_trades_per_symbol,
-                        portfolio_drawdown_cooldown_trigger_pct: constraints
-                            .portfolio_drawdown_cooldown_trigger_pct,
-                        portfolio_drawdown_cooldown_days: constraints
-                            .portfolio_drawdown_cooldown_days,
-                        symbol_drawdown_cooldown_trigger_pct: constraints
-                            .symbol_drawdown_cooldown_trigger_pct,
-                        symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
+                        capital_budget,
+                        max_symbol_allocation_pct,
+                        max_open_positions,
+                        max_positions_per_symbol,
+                        max_total_trades_per_symbol,
+                        portfolio_drawdown_cooldown_trigger_pct,
+                        portfolio_drawdown_cooldown_days,
+                        symbol_drawdown_cooldown_trigger_pct,
+                        symbol_drawdown_cooldown_days,
                         promotion_baseline_cost_25_pnl: promotion_reference
                             .as_ref()
                             .map(|reference| reference.cost_25_pnl),
@@ -1573,6 +1577,9 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
+                if !candidate_symbols.is_empty() {
+                    anyhow::bail!("--candidate-symbols requires --approved-strategy");
+                }
                 let symbols = if symbols.is_empty() {
                     DEFAULT_WEEKLY_RESEARCH_SYMBOLS
                         .iter()
@@ -2180,6 +2187,15 @@ fn approved_strategy_research_from(
     fallback: NaiveDate,
 ) -> NaiveDate {
     approved_strategy.research_from.unwrap_or(fallback)
+}
+
+fn approved_strategy_research_symbols(
+    approved_symbols: &[String],
+    candidate_symbols: Vec<String>,
+) -> Vec<String> {
+    let mut symbols = approved_symbols.to_vec();
+    symbols.extend(candidate_symbols);
+    normalize_symbols(symbols)
 }
 
 fn approved_strategy_refresh_from_and_gate(
@@ -11382,6 +11398,39 @@ mod tests {
     }
 
     #[test]
+    fn research_portfolio_selector_accepts_candidate_symbols() {
+        let cli = Cli::try_parse_from([
+            "spreadfoundry",
+            "research-portfolio-selector",
+            "--approved-strategy",
+            "configs/approved_strategy.json",
+            "--candidate-symbols",
+            "NVDA,smci",
+            "--to",
+            "2026-06-30",
+            "--cache-only",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResearchPortfolioSelector {
+                approved_strategy,
+                candidate_symbols,
+                cache_only,
+                ..
+            } => {
+                assert_eq!(
+                    approved_strategy,
+                    Some(PathBuf::from("configs/approved_strategy.json"))
+                );
+                assert_eq!(candidate_symbols, vec!["NVDA", "smci"]);
+                assert!(cache_only);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn export_live_signal_accepts_run_strategy_and_output() {
         let cli = Cli::try_parse_from([
             "spreadfoundry",
@@ -12435,6 +12484,26 @@ mod tests {
         assert_eq!(
             approved_strategy_research_from(&artifact.approved_strategy, fallback),
             configured_from
+        );
+    }
+
+    #[test]
+    fn approved_strategy_research_symbols_append_deduped_candidates() {
+        let approved = vec!["TSLA".to_owned(), "DDOG".to_owned()];
+
+        let symbols = approved_strategy_research_symbols(
+            &approved,
+            vec!["nvda".to_owned(), "DDOG".to_owned(), " smci ".to_owned()],
+        );
+
+        assert_eq!(
+            symbols,
+            vec![
+                "TSLA".to_owned(),
+                "DDOG".to_owned(),
+                "NVDA".to_owned(),
+                "SMCI".to_owned()
+            ]
         );
     }
 
