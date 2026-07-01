@@ -205,6 +205,8 @@ pub struct WarmOptionCacheCoverageRequest {
     pub fetch_concurrency: usize,
     pub force_refresh: bool,
     pub window_timeout_seconds: u64,
+    #[serde(default)]
+    pub progress: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1967,6 +1969,12 @@ pub async fn warm_option_cache_coverage(
 
     let mut out = Vec::new();
     for symbol in symbols {
+        if request.progress {
+            eprintln!(
+                "warm-option-cache symbol={symbol} status=start from={} to={} side={:?}",
+                request.from, request.to, request.option_side
+            );
+        }
         out.push(warm_symbol_option_cache_coverage(&symbol, &request, min_entry_dte, bounds).await);
     }
     Ok(WarmOptionCacheCoverageReport { symbols: out })
@@ -1994,6 +2002,12 @@ async fn warm_symbol_option_cache_coverage(
         {
             Ok(expirations) => expirations,
             Err(error) => {
+                if request.progress {
+                    eprintln!(
+                        "warm-option-cache symbol={symbol} status=error stage=discover reason={}",
+                        compact_error_message(&format!("{error:#}"))
+                    );
+                }
                 return WarmOptionCacheCoverageSymbol {
                     symbol: symbol.to_owned(),
                     from: request.from,
@@ -2070,7 +2084,32 @@ async fn warm_symbol_option_cache_coverage(
     drop(store);
 
     let mut windows = Vec::new();
-    for chunk in candidates.chunks(request.fetch_concurrency.max(1)) {
+    let total_candidates = candidates.len();
+    if request.progress {
+        eprintln!(
+            "warm-option-cache symbol={symbol} status=selected expirations_discovered={} expirations_audited={} windows_selected={} fetch_concurrency={} timeout_seconds={}",
+            expirations.len(),
+            candidate_expirations.len(),
+            total_candidates,
+            request.fetch_concurrency.max(1),
+            request.window_timeout_seconds
+        );
+    }
+    for (chunk_index, chunk) in candidates
+        .chunks(request.fetch_concurrency.max(1))
+        .enumerate()
+    {
+        if request.progress {
+            let first = chunk.first().map(|candidate| candidate.expiration);
+            let last = chunk.last().map(|candidate| candidate.expiration);
+            eprintln!(
+                "warm-option-cache symbol={symbol} status=chunk_start chunk={} chunk_size={} first_expiration={:?} last_expiration={:?}",
+                chunk_index + 1,
+                chunk.len(),
+                first,
+                last
+            );
+        }
         let futures = chunk.iter().cloned().map(|candidate| {
             let symbol = symbol.to_owned();
             let raw_dir = raw_dir.clone();
@@ -2089,7 +2128,47 @@ async fn warm_symbol_option_cache_coverage(
                 .await
             }
         });
-        windows.extend(join_all(futures).await);
+        let chunk_windows = join_all(futures).await;
+        if request.progress {
+            let completed = chunk_windows
+                .iter()
+                .filter(|window| {
+                    warm_side_complete(
+                        request.option_side,
+                        window.put_complete_after,
+                        window.call_complete_after,
+                    )
+                })
+                .count();
+            let failed = chunk_windows.len() - completed;
+            eprintln!(
+                "warm-option-cache symbol={symbol} status=chunk_done chunk={} completed={} failed={}",
+                chunk_index + 1,
+                completed,
+                failed
+            );
+            for window in &chunk_windows {
+                let status = if warm_side_complete(
+                    request.option_side,
+                    window.put_complete_after,
+                    window.call_complete_after,
+                ) {
+                    "complete"
+                } else {
+                    "incomplete"
+                };
+                eprintln!(
+                    "warm-option-cache symbol={symbol} status=window_{status} expiration={} range={}..{} after_put={} after_call={} error={}",
+                    window.expiration,
+                    window.start,
+                    window.end,
+                    window.put_complete_after,
+                    window.call_complete_after,
+                    window.error.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        windows.extend(chunk_windows);
     }
 
     let windows_completed = windows
@@ -2103,6 +2182,15 @@ async fn warm_symbol_option_cache_coverage(
         })
         .count();
     let windows_failed = windows.len() - windows_completed;
+    if request.progress {
+        eprintln!(
+            "warm-option-cache symbol={symbol} status=done attempted={} completed={} failed={} error={}",
+            windows.len(),
+            windows_completed,
+            windows_failed,
+            error.as_deref().unwrap_or("-")
+        );
+    }
     WarmOptionCacheCoverageSymbol {
         symbol: symbol.to_owned(),
         from: request.from,

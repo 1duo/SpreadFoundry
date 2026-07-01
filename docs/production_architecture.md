@@ -140,6 +140,9 @@ contains current cache-window metadata, add
 `SPREAD_RESEARCH_STORE_SKIP_CACHE_SYNC=1` so the research job queries the
 snapshot coverage tables without rescanning raw Theta cache directories. Missing
 coverage still fails normally.
+For long ThetaData hydration rounds, run `warm-option-cache-coverage` with
+`--progress` so symbol, chunk, timeout, and completed-window progress is emitted
+to stderr while JSON stdout remains parseable.
 
 Current implementation note: the live engine's first provider is a
 signal-artifact adapter. This moves production onto the always-on detector,

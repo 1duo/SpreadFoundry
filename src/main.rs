@@ -386,6 +386,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
+        progress: bool,
+        #[arg(long, default_value_t = false)]
         json: bool,
     },
     AuditWeeklySignalGates {
@@ -1203,6 +1205,7 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             window_timeout_seconds,
             force_refresh,
+            progress,
             json,
         } => {
             let symbols = if symbols.is_empty() {
@@ -1224,6 +1227,7 @@ async fn main() -> Result<()> {
                 fetch_concurrency,
                 force_refresh,
                 window_timeout_seconds,
+                progress,
             })
             .await?;
             if json {
@@ -11083,6 +11087,7 @@ mod tests {
             "2",
             "--window-timeout-seconds",
             "45",
+            "--progress",
             "--json",
         ])
         .unwrap();
@@ -11098,6 +11103,7 @@ mod tests {
                 option_side,
                 fetch_concurrency,
                 window_timeout_seconds,
+                progress,
                 json,
                 ..
             } => {
@@ -11110,6 +11116,7 @@ mod tests {
                 assert_eq!(option_side, WarmOptionSideArg::Call);
                 assert_eq!(fetch_concurrency, 2);
                 assert_eq!(window_timeout_seconds, 45);
+                assert!(progress);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
