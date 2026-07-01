@@ -54,6 +54,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 use wait_timeout::ChildExt;
@@ -61,6 +62,7 @@ use wait_timeout::ChildExt;
 const DEFAULT_MAX_ORDER_AGE_SECONDS: u64 = 30 * 60;
 const DEFAULT_MAX_QUOTE_AGE_SECONDS: i64 = 30;
 const DEFAULT_WARM_OPTION_CACHE_WINDOW_TIMEOUT_SECONDS: u64 = 300;
+static MAIN_RUN_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const UNIVERSE_SELECTION_BASIS: &str = "Plateau expansion uses eight non-NVDA single stocks chosen for liquid weekly option chains, usable put-spread premium, and enough business-model diversity to test whether the detector generalizes beyond NVDA.";
 const UNIVERSE_RESEARCH_METHOD: &str = "Each symbol independently runs the same Rust put-credit-spread profile grid. Detector rules and execution rules are reported separately; no NVDA profile is copied into another symbol without out-of-sample proof.";
 const UNIVERSE_SEED_SCORE_BASIS: &str = "Static pre-research seed score: 3x option liquidity + 2x premium + 2x spread quality + price-fit + diversification + event-risk discipline. Used only to choose the default live_signal symbols; actual suitability ranking is research-evidence driven.";
@@ -10853,7 +10855,14 @@ fn fixture_exit_quotes(name: Option<&str>) -> Result<Vec<SpreadExitQuote>> {
 }
 
 fn next_run_dir(prefix: &str) -> Result<PathBuf> {
-    let run_id = format!("{}-{}", prefix, Utc::now().format("%Y%m%dT%H%M%S%.9fZ"));
+    let sequence = MAIN_RUN_ID_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let run_id = format!(
+        "{}-{}-p{}-s{}",
+        prefix,
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        std::process::id(),
+        sequence
+    );
     Ok(PathBuf::from("runs").join(run_id))
 }
 
@@ -10873,6 +10882,20 @@ mod tests {
             ]),
             vec!["TSLA".to_owned(), "AAPL".to_owned()]
         );
+    }
+
+    #[test]
+    fn next_run_dir_is_unique_under_tight_loop() {
+        let dirs = (0..100)
+            .map(|_| next_run_dir("universe-research").unwrap())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(dirs.len(), 100);
+        assert!(dirs.iter().all(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("universe-research-"))
+        }));
     }
 
     #[test]

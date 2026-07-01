@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout};
@@ -52,6 +53,19 @@ pub const DEFAULT_PLATEAU_UNIVERSE_SYMBOLS: [&str; 8] = [
 pub const DEFAULT_PLATEAU_UNIVERSE_SYMBOLS_CSV: &str = "TSLA,AMD,META,AMZN,AAPL,MSFT,GOOGL,AVGO";
 pub const DEFAULT_WEEKLY_RESEARCH_SYMBOLS: [&str; 5] = ["IREN", "PLTR", "ORCL", "TSLA", "CRWV"];
 pub const DEFAULT_WEEKLY_RESEARCH_SYMBOLS_CSV: &str = "IREN,PLTR,ORCL,TSLA,CRWV";
+
+static RESEARCH_RUN_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn research_run_id(prefix: &str) -> String {
+    let sequence = RESEARCH_RUN_ID_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    format!(
+        "{}-{}-p{}-s{}",
+        prefix,
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        std::process::id(),
+        sequence
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1368,7 +1382,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
             format!("{}-weekly-wheel-research", symbol_slug(&request.symbol))
         }
     };
-    let run_id = format!("{}-{}", run_prefix, Utc::now().format("%Y%m%dT%H%M%S%.9fZ"));
+    let run_id = research_run_id(&run_prefix);
     let run_dir = PathBuf::from("runs").join(&run_id);
     fs::create_dir_all(&raw_dir)?;
     fs::create_dir_all(&run_dir)?;
@@ -2626,7 +2640,7 @@ async fn run_portfolio_research(
         anyhow::bail!("cache-only portfolio research cannot force refresh");
     }
 
-    let run_id = format!("{}-{}", run_prefix, Utc::now().format("%Y%m%dT%H%M%S%.9fZ"));
+    let run_id = research_run_id(run_prefix);
     let run_dir = PathBuf::from("runs").join(&run_id);
     fs::create_dir_all(&run_dir)?;
 
@@ -14917,6 +14931,19 @@ mod tests {
     fn symbol_slug_is_filesystem_safe() {
         assert_eq!(symbol_slug("NVDA"), "nvda");
         assert_eq!(symbol_slug("BRK.B"), "brk-b");
+    }
+
+    #[test]
+    fn research_run_ids_are_unique_under_tight_loop() {
+        let ids = (0..100)
+            .map(|_| research_run_id("portfolio-weekly-selector-research"))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 100);
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("portfolio-weekly-selector-research-"))
+        );
     }
 
     #[test]
