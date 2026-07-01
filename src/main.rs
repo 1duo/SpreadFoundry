@@ -42,8 +42,9 @@ use spreadfoundry::research::{
 };
 use spreadfoundry::research_store::{
     ResearchStore, ResearchStoreHealth, ResearchStoreImportReport, ResearchStorePerfReport,
-    default_research_store_path, import_research_store, research_store_perf_check,
-    set_research_store_cache_sync_enabled_override, set_research_store_path_override,
+    default_research_store_path, flush_default_store_connections, import_research_store,
+    research_store_perf_check, set_research_store_cache_sync_enabled_override,
+    set_research_store_path_override,
 };
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
@@ -950,7 +951,7 @@ fn configure_research_store_for_command(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let result: Result<()> = match cli.command {
         Commands::IngestTheta {
             symbol,
             from_date,
@@ -1630,7 +1631,11 @@ async fn main() -> Result<()> {
             println!("{}", PathBuf::from("runs").join(&report.run_id).display());
             Ok(())
         }
-    }
+    };
+    let flush_result = flush_default_store_connections();
+    result?;
+    flush_result?;
+    Ok(())
 }
 
 fn export_live_signal(

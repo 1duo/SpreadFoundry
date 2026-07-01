@@ -3,7 +3,6 @@ use chrono::{NaiveDate, Utc};
 use duckdb::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,10 +22,8 @@ static RESEARCH_STORE_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static RESEARCH_STORE_CACHE_SYNC_OVERRIDE: OnceLock<bool> = OnceLock::new();
 static CACHE_SYNCED_SYMBOL_DIRS: OnceLock<Mutex<HashSet<(PathBuf, String, PathBuf)>>> =
     OnceLock::new();
-thread_local! {
-    static DEFAULT_STORE_CONNECTIONS: RefCell<HashMap<PathBuf, ResearchStore>> =
-        RefCell::new(HashMap::new());
-}
+static DEFAULT_STORE_CONNECTIONS: OnceLock<Mutex<HashMap<PathBuf, ResearchStore>>> =
+    OnceLock::new();
 
 pub struct ResearchStore {
     conn: Connection,
@@ -1483,16 +1480,31 @@ fn with_default_store<T>(f: impl FnOnce(&mut ResearchStore) -> Result<T>) -> Res
         .lock()
         .map_err(|_| anyhow::anyhow!("research store write lock poisoned"))?;
     let path = default_research_store_path();
-    DEFAULT_STORE_CONNECTIONS.with(|stores| {
-        let mut stores = stores.borrow_mut();
-        if !stores.contains_key(&path) {
-            stores.insert(path.clone(), ResearchStore::open(&path)?);
-        }
-        let store = stores
-            .get_mut(&path)
-            .expect("default research store connection was inserted");
-        f(store)
-    })
+    let stores = DEFAULT_STORE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut stores = stores
+        .lock()
+        .map_err(|_| anyhow::anyhow!("research store connection cache lock poisoned"))?;
+    if !stores.contains_key(&path) {
+        stores.insert(path.clone(), ResearchStore::open(&path)?);
+    }
+    let store = stores
+        .get_mut(&path)
+        .expect("default research store connection was inserted");
+    f(store)
+}
+
+pub fn flush_default_store_connections() -> Result<()> {
+    let lock = STORE_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("research store write lock poisoned"))?;
+    if let Some(stores) = DEFAULT_STORE_CONNECTIONS.get() {
+        stores
+            .lock()
+            .map_err(|_| anyhow::anyhow!("research store connection cache lock poisoned"))?
+            .clear();
+    }
+    Ok(())
 }
 
 fn normalized_symbols(symbols: &[String], raw_root: &Path) -> Result<Vec<String>> {
