@@ -7006,6 +7006,13 @@ fn portfolio_selector_profiles() -> Vec<PortfolioSelectorProfile> {
             Some(call_trend),
         ),
         selector_profile_with_put_fallback(
+            "selector_crash_and_costaware_puts_and_call_debits_only",
+            None,
+            Some(put_crash),
+            Some(put_costaware),
+            Some(call_trend),
+        ),
+        selector_profile_with_put_fallback(
             "selector_economic_wheel_plus_crash_and_pullback_puts_and_call_debits",
             Some(wheel_economic),
             Some(put_crash),
@@ -13939,9 +13946,22 @@ mod tests {
             names
                 .contains(&"selector_economic_wheel_plus_crash_and_costaware_puts_and_call_debits")
         );
+        assert!(names.contains(&"selector_crash_and_costaware_puts_and_call_debits_only"));
         assert!(
             names.contains(&"selector_economic_wheel_plus_crash_and_pullback_puts_and_call_debits")
         );
+
+        let debit_costaware_puts = profiles
+            .iter()
+            .find(|profile| {
+                profile.summary_profile.name
+                    == "selector_crash_and_costaware_puts_and_call_debits_only"
+            })
+            .unwrap();
+        assert!(debit_costaware_puts.wheel_profile.is_none());
+        assert!(debit_costaware_puts.put_debit_profile.is_some());
+        assert!(debit_costaware_puts.put_debit_fallback_profile.is_some());
+        assert!(debit_costaware_puts.call_debit_profile.is_some());
 
         let no_tsla_puts = profiles
             .iter()

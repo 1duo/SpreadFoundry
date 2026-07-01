@@ -23,8 +23,8 @@ use spreadfoundry::live_market::{
     build_signal_artifact_live_market_snapshot,
 };
 use spreadfoundry::live_signal::{
-    ApprovedStrategy, LIVE_SIGNAL_SCHEMA_VERSION, LiveExecutionRules, LiveSignalArtifact,
-    SignalStatus, TradeSignal,
+    ApprovedPortfolioConstraints, ApprovedStrategy, LIVE_SIGNAL_SCHEMA_VERSION, LiveExecutionRules,
+    LiveSignalArtifact, SignalStatus, TradeSignal,
 };
 use spreadfoundry::opt::{OptimizationResult, rank_results, score_trades};
 use spreadfoundry::report::{read_report_markdown, write_run_report};
@@ -606,26 +606,26 @@ enum Commands {
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
         cache_only: bool,
-        #[arg(long, default_value_t = 100_000.0)]
-        capital_budget: f64,
+        #[arg(long)]
+        capital_budget: Option<f64>,
         #[arg(long)]
         research_gate_capital_budget: Option<f64>,
-        #[arg(long, default_value_t = 0.35)]
-        max_symbol_allocation_pct: f64,
-        #[arg(long, default_value_t = 5)]
-        max_open_positions: usize,
-        #[arg(long, default_value_t = 2)]
-        max_positions_per_symbol: usize,
+        #[arg(long)]
+        max_symbol_allocation_pct: Option<f64>,
+        #[arg(long)]
+        max_open_positions: Option<usize>,
+        #[arg(long)]
+        max_positions_per_symbol: Option<usize>,
         #[arg(long)]
         max_total_trades_per_symbol: Option<usize>,
         #[arg(long)]
         portfolio_drawdown_cooldown_trigger_pct: Option<f64>,
-        #[arg(long, default_value_t = 0)]
-        portfolio_drawdown_cooldown_days: i64,
+        #[arg(long)]
+        portfolio_drawdown_cooldown_days: Option<i64>,
         #[arg(long)]
         symbol_drawdown_cooldown_trigger_pct: Option<f64>,
-        #[arg(long, default_value_t = 0)]
-        symbol_drawdown_cooldown_days: i64,
+        #[arg(long)]
+        symbol_drawdown_cooldown_days: Option<i64>,
         #[arg(long)]
         promotion_baseline_run: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
@@ -1548,6 +1548,18 @@ async fn main() -> Result<()> {
                 .transpose()?;
             let report = if let Some(approved_strategy_path) = approved_strategy {
                 let approved_strategy = read_approved_strategy(&approved_strategy_path)?;
+                let constraints = approved_strategy_portfolio_constraints_with_overrides(
+                    &approved_strategy,
+                    capital_budget,
+                    max_symbol_allocation_pct,
+                    max_open_positions,
+                    max_positions_per_symbol,
+                    max_total_trades_per_symbol,
+                    portfolio_drawdown_cooldown_trigger_pct,
+                    portfolio_drawdown_cooldown_days,
+                    symbol_drawdown_cooldown_trigger_pct,
+                    symbol_drawdown_cooldown_days,
+                );
                 let from = approved_strategy_research_from(&approved_strategy, from);
                 let symbols = approved_strategy_research_symbols(
                     &approved_strategy.symbols,
@@ -1563,17 +1575,20 @@ async fn main() -> Result<()> {
                         symbol_concurrency,
                         force_refresh,
                         cache_only,
-                        capital_budget,
+                        capital_budget: constraints.capital_budget,
                         research_gate_capital_budget: research_gate_capital_budget
                             .or(approved_strategy.research_gate_capital_budget),
-                        max_symbol_allocation_pct,
-                        max_open_positions,
-                        max_positions_per_symbol,
-                        max_total_trades_per_symbol,
-                        portfolio_drawdown_cooldown_trigger_pct,
-                        portfolio_drawdown_cooldown_days,
-                        symbol_drawdown_cooldown_trigger_pct,
-                        symbol_drawdown_cooldown_days,
+                        max_symbol_allocation_pct: constraints.max_symbol_allocation_pct,
+                        max_open_positions: constraints.max_open_positions,
+                        max_positions_per_symbol: constraints.max_positions_per_symbol,
+                        max_total_trades_per_symbol: constraints.max_total_trades_per_symbol,
+                        portfolio_drawdown_cooldown_trigger_pct: constraints
+                            .portfolio_drawdown_cooldown_trigger_pct,
+                        portfolio_drawdown_cooldown_days: constraints
+                            .portfolio_drawdown_cooldown_days,
+                        symbol_drawdown_cooldown_trigger_pct: constraints
+                            .symbol_drawdown_cooldown_trigger_pct,
+                        symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
                         promotion_baseline_cost_25_pnl: promotion_reference
                             .as_ref()
                             .map(|reference| reference.cost_25_pnl),
@@ -1607,16 +1622,16 @@ async fn main() -> Result<()> {
                     symbol_concurrency,
                     force_refresh,
                     cache_only,
-                    capital_budget,
+                    capital_budget: capital_budget.unwrap_or(100_000.0),
                     research_gate_capital_budget,
-                    max_symbol_allocation_pct,
-                    max_open_positions,
-                    max_positions_per_symbol,
+                    max_symbol_allocation_pct: max_symbol_allocation_pct.unwrap_or(0.35),
+                    max_open_positions: max_open_positions.unwrap_or(5),
+                    max_positions_per_symbol: max_positions_per_symbol.unwrap_or(2),
                     max_total_trades_per_symbol,
                     portfolio_drawdown_cooldown_trigger_pct,
-                    portfolio_drawdown_cooldown_days,
+                    portfolio_drawdown_cooldown_days: portfolio_drawdown_cooldown_days.unwrap_or(0),
                     symbol_drawdown_cooldown_trigger_pct,
-                    symbol_drawdown_cooldown_days,
+                    symbol_drawdown_cooldown_days: symbol_drawdown_cooldown_days.unwrap_or(0),
                     promotion_baseline_cost_25_pnl: promotion_reference
                         .as_ref()
                         .map(|reference| reference.cost_25_pnl),
@@ -2212,6 +2227,40 @@ fn approved_strategy_research_symbols(
     let mut symbols = approved_symbols.to_vec();
     symbols.extend(candidate_symbols);
     normalize_symbols(symbols)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approved_strategy_portfolio_constraints_with_overrides(
+    approved_strategy: &ApprovedStrategy,
+    capital_budget: Option<f64>,
+    max_symbol_allocation_pct: Option<f64>,
+    max_open_positions: Option<usize>,
+    max_positions_per_symbol: Option<usize>,
+    max_total_trades_per_symbol: Option<usize>,
+    portfolio_drawdown_cooldown_trigger_pct: Option<f64>,
+    portfolio_drawdown_cooldown_days: Option<i64>,
+    symbol_drawdown_cooldown_trigger_pct: Option<f64>,
+    symbol_drawdown_cooldown_days: Option<i64>,
+) -> ApprovedPortfolioConstraints {
+    let constraints = &approved_strategy.portfolio_constraints;
+    ApprovedPortfolioConstraints {
+        capital_budget: capital_budget.unwrap_or(constraints.capital_budget),
+        max_symbol_allocation_pct: max_symbol_allocation_pct
+            .unwrap_or(constraints.max_symbol_allocation_pct),
+        max_open_positions: max_open_positions.unwrap_or(constraints.max_open_positions),
+        max_positions_per_symbol: max_positions_per_symbol
+            .unwrap_or(constraints.max_positions_per_symbol),
+        max_total_trades_per_symbol: max_total_trades_per_symbol
+            .or(constraints.max_total_trades_per_symbol),
+        portfolio_drawdown_cooldown_trigger_pct: portfolio_drawdown_cooldown_trigger_pct
+            .or(constraints.portfolio_drawdown_cooldown_trigger_pct),
+        portfolio_drawdown_cooldown_days: portfolio_drawdown_cooldown_days
+            .unwrap_or(constraints.portfolio_drawdown_cooldown_days),
+        symbol_drawdown_cooldown_trigger_pct: symbol_drawdown_cooldown_trigger_pct
+            .or(constraints.symbol_drawdown_cooldown_trigger_pct),
+        symbol_drawdown_cooldown_days: symbol_drawdown_cooldown_days
+            .unwrap_or(constraints.symbol_drawdown_cooldown_days),
+    }
 }
 
 fn approved_strategy_refresh_from_and_gate(
@@ -4601,7 +4650,7 @@ fn apply_tradier_rest_bridge_with_config(
     let Some(action) = decision.selected_signal.clone() else {
         return Ok(());
     };
-    let payload = match tradier_execution_order_payload(&action) {
+    let mut payload = match tradier_execution_order_payload(&action) {
         Ok(payload) => payload,
         Err(err) => {
             decision.status = "blocked".to_owned();
@@ -4639,6 +4688,7 @@ fn apply_tradier_rest_bridge_with_config(
         }
     };
     let order_key = tradier_order_key(&config, &payload, &action);
+    payload.insert("tag".to_owned(), tradier_order_tag(&order_key));
     if let Some(ledger_path) = review_ledger_path
         && let Some(entry) = execution_order_ledger_entry_with_statuses(
             ledger_path,
@@ -4652,8 +4702,22 @@ fn apply_tradier_rest_bridge_with_config(
     if let Some(ledger_path) = live_ledger_path
         && let Some(entry) = execution_order_ledger_blocking_entry(ledger_path, &order_key)?
     {
-        apply_tradier_ledger_entry_to_decision(decision, &entry);
-        return Ok(());
+        match reconcile_tradier_pending_unknown_ledger_entry(
+            decision,
+            ledger_path,
+            &order_key,
+            &entry,
+            &client,
+            &payload,
+            &action,
+        )? {
+            TradierPendingUnknownLedgerResolution::Retry => {}
+            TradierPendingUnknownLedgerResolution::Handled => return Ok(()),
+            TradierPendingUnknownLedgerResolution::NotPendingUnknown => {
+                apply_tradier_ledger_entry_to_decision(decision, &entry);
+                return Ok(());
+            }
+        }
     }
     if decision.mode == ExecutionMode::Live
         && let Err(err) = tradier_assert_market_open(&client)
@@ -4749,6 +4813,21 @@ fn apply_tradier_rest_bridge_with_config(
         }
         decision.status = "reviewed".to_owned();
         decision.reason = "Tradier preview succeeded; live placement was not requested".to_owned();
+        return Ok(());
+    }
+
+    if action.strategy == "wheel" {
+        if let Err(err) = tradier_assert_wheel_broker_state(&client, &action, &decision.risk) {
+            decision.status = "blocked".to_owned();
+            decision.reason = format!("Tradier wheel pre-place broker-state recheck failed: {err}");
+            return Ok(());
+        }
+    }
+    if is_vertical_spread_strategy(action.strategy.as_str())
+        && let Err(err) = tradier_assert_vertical_spread_lifecycle_flat(&client, &action)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier pre-place duplicate-exposure recheck failed: {err}");
         return Ok(());
     }
 
@@ -5636,6 +5715,8 @@ fn apply_tradier_payload_preview_and_maybe_place(
     order_description: &str,
 ) -> Result<()> {
     let order_key = tradier_order_key(config, payload, action);
+    let mut payload = payload.clone();
+    payload.insert("tag".to_owned(), tradier_order_tag(&order_key));
     if let Some(ledger_path) = review_ledger_path
         && let Some(entry) = execution_order_ledger_entry_with_statuses(
             ledger_path,
@@ -5649,34 +5730,52 @@ fn apply_tradier_payload_preview_and_maybe_place(
     if let Some(ledger_path) = live_ledger_path
         && let Some(entry) = execution_order_ledger_blocking_entry(ledger_path, &order_key)?
     {
-        if tradier_payload_is_close_order(payload) {
-            match tradier_submitted_close_ledger_decision(&entry, broker_orders, decision.as_of) {
-                Some(SubmittedCloseLedgerDecision::Retry(reason)) => {
-                    execution_order_ledger_record_status(
-                        ledger_path,
-                        &order_key,
-                        "terminal_unfilled",
-                        entry.broker_order_id.as_deref(),
-                        Some(reason.as_str()),
-                    )?;
-                }
-                Some(SubmittedCloseLedgerDecision::Block(reason)) => {
-                    decision.status = "blocked".to_owned();
-                    decision.reason = reason;
-                    return Ok(());
-                }
-                None => {
+        match reconcile_tradier_pending_unknown_ledger_entry(
+            decision,
+            ledger_path,
+            &order_key,
+            &entry,
+            client,
+            &payload,
+            action,
+        )? {
+            TradierPendingUnknownLedgerResolution::Retry => {}
+            TradierPendingUnknownLedgerResolution::Handled => return Ok(()),
+            TradierPendingUnknownLedgerResolution::NotPendingUnknown => {
+                if tradier_payload_is_close_order(&payload) {
+                    match tradier_submitted_close_ledger_decision(
+                        &entry,
+                        broker_orders,
+                        decision.as_of,
+                    ) {
+                        Some(SubmittedCloseLedgerDecision::Retry(reason)) => {
+                            execution_order_ledger_record_status(
+                                ledger_path,
+                                &order_key,
+                                "terminal_unfilled",
+                                entry.broker_order_id.as_deref(),
+                                Some(reason.as_str()),
+                            )?;
+                        }
+                        Some(SubmittedCloseLedgerDecision::Block(reason)) => {
+                            decision.status = "blocked".to_owned();
+                            decision.reason = reason;
+                            return Ok(());
+                        }
+                        None => {
+                            apply_tradier_ledger_entry_to_decision(decision, &entry);
+                            return Ok(());
+                        }
+                    }
+                } else {
                     apply_tradier_ledger_entry_to_decision(decision, &entry);
                     return Ok(());
                 }
             }
-        } else {
-            apply_tradier_ledger_entry_to_decision(decision, &entry);
-            return Ok(());
         }
     }
 
-    let preview = match client.preview_order(payload) {
+    let preview = match client.preview_order(&payload) {
         Ok(response) => response,
         Err(err) => {
             decision.status = "blocked".to_owned();
@@ -5691,7 +5790,7 @@ fn apply_tradier_payload_preview_and_maybe_place(
             execution_order_ledger_record_status(
                 ledger_path,
                 &order_key,
-                tradier_preview_rejection_ledger_status(payload),
+                tradier_preview_rejection_ledger_status(&payload),
                 None,
                 Some(reason.as_str()),
             )?;
@@ -5718,6 +5817,15 @@ fn apply_tradier_payload_preview_and_maybe_place(
         return Ok(());
     }
 
+    if is_vertical_spread_strategy(action.strategy.as_str())
+        && tradier_payload_is_close_order(&payload)
+        && let Err(err) = tradier_assert_vertical_spread_lifecycle_open(client, action)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier pre-place lifecycle recheck failed: {err}");
+        return Ok(());
+    }
+
     if let Some(ledger_path) = live_ledger_path
         && execution_order_ledger_reserve_pending(
             ledger_path,
@@ -5731,7 +5839,7 @@ fn apply_tradier_payload_preview_and_maybe_place(
                 .to_owned();
         return Ok(());
     }
-    let place = match client.place_order(payload) {
+    let place = match client.place_order(&payload) {
         Ok(response) => response,
         Err(err) => {
             decision.status = "submit_unknown".to_owned();
@@ -6213,10 +6321,234 @@ fn tradier_post_submit_status_confirms(status: &str) -> bool {
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TradierPendingUnknownLedgerResolution {
+    Retry,
+    Handled,
+    NotPendingUnknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SubmittedCloseLedgerDecision {
     Retry(String),
     Block(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_tradier_pending_unknown_ledger_entry(
+    decision: &mut ExecutionDecision,
+    ledger_path: &Path,
+    order_key: &str,
+    entry: &ExecutionOrderLedgerEntry,
+    client: &TradierClient,
+    payload: &BTreeMap<String, String>,
+    action: &TradeSignal,
+) -> Result<TradierPendingUnknownLedgerResolution> {
+    if entry.status != "pending_unknown" {
+        return Ok(TradierPendingUnknownLedgerResolution::NotPendingUnknown);
+    }
+
+    let positions = match client.get_positions() {
+        Ok(response) if response.ok => response.positions,
+        Ok(response) => {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = format!(
+                "pending_unknown ledger entry could not be reconciled because Tradier positions failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier positions request failed".to_owned())
+            );
+            return Ok(TradierPendingUnknownLedgerResolution::Handled);
+        }
+        Err(err) => {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = format!(
+                "pending_unknown ledger entry could not be reconciled because Tradier positions failed: {err}"
+            );
+            return Ok(TradierPendingUnknownLedgerResolution::Handled);
+        }
+    };
+    let orders = match client.get_orders() {
+        Ok(response) if response.ok => response.orders,
+        Ok(response) => {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = format!(
+                "pending_unknown ledger entry could not be reconciled because Tradier orders failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Tradier orders request failed".to_owned())
+            );
+            return Ok(TradierPendingUnknownLedgerResolution::Handled);
+        }
+        Err(err) => {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = format!(
+                "pending_unknown ledger entry could not be reconciled because Tradier orders failed: {err}"
+            );
+            return Ok(TradierPendingUnknownLedgerResolution::Handled);
+        }
+    };
+
+    let expected_tag = tradier_order_tag(order_key);
+    let matches =
+        tradier_pending_unknown_matching_orders(entry, expected_tag.as_str(), orders.as_slice());
+    let [matched_order] = matches.as_slice() else {
+        decision.status = "submit_unknown".to_owned();
+        decision.reason = if matches.is_empty() {
+            entry.reason.clone().unwrap_or_else(|| {
+                "pending_unknown ledger entry has no matching Tradier order by broker id or SpreadFoundry tag".to_owned()
+            })
+        } else {
+            format!(
+                "pending_unknown ledger entry matched {} Tradier orders by broker id or SpreadFoundry tag; manual reconciliation is required",
+                matches.len()
+            )
+        };
+        return Ok(TradierPendingUnknownLedgerResolution::Handled);
+    };
+
+    let order_id = matched_order
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let Some(status) = matched_order
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    else {
+        decision.status = "submit_unknown".to_owned();
+        decision.reason =
+            "pending_unknown ledger entry matched a Tradier order without a status".to_owned();
+        return Ok(TradierPendingUnknownLedgerResolution::Handled);
+    };
+
+    if tradier_post_submit_status_confirms(status) {
+        let reason =
+            format!("pending_unknown reconciled to Tradier order status {status} by id/tag");
+        execution_order_ledger_record_status(
+            ledger_path,
+            order_key,
+            "submitted",
+            order_id,
+            Some(reason.as_str()),
+        )?;
+        decision.status = "already_submitted".to_owned();
+        decision.reason = reason;
+        return Ok(TradierPendingUnknownLedgerResolution::Handled);
+    }
+
+    if !tradier_terminal_bad_status(status) {
+        decision.status = "submit_unknown".to_owned();
+        decision.reason = format!(
+            "pending_unknown ledger entry matched Tradier order with unrecognized status {status}; manual reconciliation is required"
+        );
+        return Ok(TradierPendingUnknownLedgerResolution::Handled);
+    }
+
+    if tradier_payload_is_close_order(payload) {
+        let submitted_entry = ExecutionOrderLedgerEntry {
+            status: "submitted".to_owned(),
+            recorded_at: entry.recorded_at,
+            broker_order_id: order_id
+                .map(ToOwned::to_owned)
+                .or_else(|| entry.broker_order_id.clone()),
+            reason: entry.reason.clone(),
+        };
+        match tradier_submitted_close_ledger_decision(&submitted_entry, &orders, decision.as_of) {
+            Some(SubmittedCloseLedgerDecision::Retry(reason)) => {
+                execution_order_ledger_record_status(
+                    ledger_path,
+                    order_key,
+                    "terminal_unfilled",
+                    submitted_entry.broker_order_id.as_deref(),
+                    Some(reason.as_str()),
+                )?;
+                return Ok(TradierPendingUnknownLedgerResolution::Retry);
+            }
+            Some(SubmittedCloseLedgerDecision::Block(reason)) => {
+                decision.status = "blocked".to_owned();
+                decision.reason = reason;
+                return Ok(TradierPendingUnknownLedgerResolution::Handled);
+            }
+            None => {
+                decision.status = "submit_unknown".to_owned();
+                decision.reason = format!(
+                    "pending_unknown close matched terminal Tradier order status {status}, but retry proof was inconclusive"
+                );
+                return Ok(TradierPendingUnknownLedgerResolution::Handled);
+            }
+        }
+    }
+
+    if tradier_entry_lifecycle_is_flat_for_retry(action, &positions, &orders, decision.as_of)? {
+        let reason = format!(
+            "pending_unknown entry matched terminal Tradier order status {status}; same-underlying broker state is flat, so retry is allowed"
+        );
+        execution_order_ledger_record_status(
+            ledger_path,
+            order_key,
+            "terminal_unfilled",
+            order_id,
+            Some(reason.as_str()),
+        )?;
+        Ok(TradierPendingUnknownLedgerResolution::Retry)
+    } else {
+        decision.status = "submit_unknown".to_owned();
+        decision.reason = format!(
+            "pending_unknown entry matched terminal Tradier order status {status}, but same-underlying broker state is not flat; manual reconciliation is required"
+        );
+        Ok(TradierPendingUnknownLedgerResolution::Handled)
+    }
+}
+
+fn tradier_pending_unknown_matching_orders<'a>(
+    entry: &ExecutionOrderLedgerEntry,
+    expected_tag: &str,
+    orders: &'a [TradierOrder],
+) -> Vec<&'a TradierOrder> {
+    if let Some(order_id) = entry
+        .broker_order_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|order_id| !order_id.is_empty())
+    {
+        return orders
+            .iter()
+            .filter(|order| order.id.as_deref().is_some_and(|id| id.trim() == order_id))
+            .collect();
+    }
+    orders
+        .iter()
+        .filter(|order| {
+            order
+                .tag
+                .as_deref()
+                .is_some_and(|tag| tag.trim() == expected_tag)
+        })
+        .collect()
+}
+
+fn tradier_entry_lifecycle_is_flat_for_retry(
+    action: &TradeSignal,
+    positions: &[TradierPosition],
+    orders: &[TradierOrder],
+    as_of: NaiveDate,
+) -> Result<bool> {
+    if is_vertical_spread_strategy(action.strategy.as_str()) {
+        return Ok(matches!(
+            tradier_vertical_spread_lifecycle_state(action, positions, orders)?,
+            TradierDebitSpreadLifecycleState::Flat
+        ));
+    }
+    if action.strategy == "wheel" {
+        return Ok(matches!(
+            tradier_wheel_lifecycle_state(action, positions, orders, as_of)?,
+            TradierWheelLifecycleState::Flat
+        ));
+    }
+    Ok(false)
 }
 
 fn tradier_submitted_close_ledger_decision(
@@ -6286,6 +6618,7 @@ fn tradier_preview_rejection_ledger_status(payload: &BTreeMap<String, String>) -
 
 fn tradier_order_key_payload(payload: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut keyed_payload = payload.clone();
+    keyed_payload.remove("tag");
     if tradier_payload_is_close_order(payload) {
         keyed_payload.remove("price");
     }
@@ -6307,6 +6640,15 @@ fn tradier_order_key(
         "payload": tradier_order_key_payload(payload),
     }))
     .expect("Tradier order key serialization should be infallible")
+}
+
+fn tradier_order_tag(order_key: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in order_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("sf-{hash:016x}")
 }
 
 fn tradier_response_base_ok(response: &TradierOrderResponse) -> std::result::Result<(), String> {
@@ -6955,11 +7297,74 @@ fn tradier_order_matches_debit_spread_security(
     short_occ: &str,
 ) -> bool {
     order.option_symbol.as_deref().is_some_and(|security| {
-        security.eq_ignore_ascii_case(long_occ) || security.eq_ignore_ascii_case(short_occ)
+        security.eq_ignore_ascii_case(long_occ)
+            || security.eq_ignore_ascii_case(short_occ)
+            || tradier_security_matches_underlying(security, underlying)
     }) || order
         .symbol
         .as_deref()
         .is_some_and(|security| tradier_security_matches_underlying(security, underlying))
+}
+
+fn tradier_assert_vertical_spread_lifecycle_open(
+    client: &TradierClient,
+    action: &TradeSignal,
+) -> Result<()> {
+    let positions = client
+        .get_positions()
+        .context("fetch Tradier positions before vertical-spread pre-place lifecycle recheck")?;
+    if !positions.ok {
+        anyhow::bail!(
+            "{}",
+            positions
+                .error
+                .unwrap_or_else(|| "Tradier positions request failed".to_owned())
+        );
+    }
+    let orders = client
+        .get_orders()
+        .context("fetch Tradier orders before vertical-spread pre-place lifecycle recheck")?;
+    if !orders.ok {
+        anyhow::bail!(
+            "{}",
+            orders
+                .error
+                .unwrap_or_else(|| "Tradier orders request failed".to_owned())
+        );
+    }
+    match tradier_vertical_spread_lifecycle_state(action, &positions.positions, &orders.orders)? {
+        TradierDebitSpreadLifecycleState::Open { quantity: 1 } => Ok(()),
+        TradierDebitSpreadLifecycleState::Open { quantity } => {
+            anyhow::bail!("Tradier vertical-spread quantity {quantity} changed before place")
+        }
+        TradierDebitSpreadLifecycleState::Flat => {
+            anyhow::bail!("Tradier vertical spread is no longer open before place")
+        }
+        TradierDebitSpreadLifecycleState::ActiveOrder { id, status } => {
+            anyhow::bail!(
+                "active Tradier vertical-spread order id {:?} status {:?} appeared before place",
+                id,
+                status
+            )
+        }
+        TradierDebitSpreadLifecycleState::AssignedShortLeg {
+            right,
+            long_quantity,
+            stock_quantity,
+        } => {
+            anyhow::bail!(
+                "Tradier vertical-spread short {} appears assigned before place: stock quantity {:.4} and long hedge quantity {:.4}",
+                option_right_value(&right),
+                stock_quantity,
+                long_quantity
+            )
+        }
+        TradierDebitSpreadLifecycleState::Inconsistent { reason } => {
+            anyhow::bail!(
+                "inconsistent Tradier vertical-spread lifecycle state before place: {reason}"
+            )
+        }
+    }
 }
 
 fn tradier_validate_current_debit_quote(
@@ -11438,7 +11843,10 @@ mod tests {
             Commands::ResearchPortfolioSelector {
                 approved_strategy,
                 candidate_symbols,
+                capital_budget,
                 research_gate_capital_budget,
+                max_symbol_allocation_pct,
+                max_open_positions,
                 cache_only,
                 ..
             } => {
@@ -11447,7 +11855,10 @@ mod tests {
                     Some(PathBuf::from("configs/approved_strategy.json"))
                 );
                 assert_eq!(candidate_symbols, vec!["NVDA", "smci"]);
+                assert_eq!(capital_budget, None);
                 assert_eq!(research_gate_capital_budget, Some(100_000.0));
+                assert_eq!(max_symbol_allocation_pct, None);
+                assert_eq!(max_open_positions, None);
                 assert!(cache_only);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -12542,6 +12953,99 @@ mod tests {
                 "SMCI".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn approved_strategy_portfolio_constraints_inherit_config_with_overrides() {
+        let mut artifact = test_canary_artifact(serde_json::json!([]));
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .capital_budget = 7_897.67;
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .max_symbol_allocation_pct = 0.15;
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .max_open_positions = 3;
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .max_positions_per_symbol = 2;
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .max_total_trades_per_symbol = Some(100);
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .portfolio_drawdown_cooldown_trigger_pct = Some(0.12);
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .portfolio_drawdown_cooldown_days = 10;
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .symbol_drawdown_cooldown_trigger_pct = Some(0.08);
+        artifact
+            .approved_strategy
+            .portfolio_constraints
+            .symbol_drawdown_cooldown_days = 5;
+
+        let inherited = approved_strategy_portfolio_constraints_with_overrides(
+            &artifact.approved_strategy,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(inherited.capital_budget, 7_897.67);
+        assert_eq!(inherited.max_symbol_allocation_pct, 0.15);
+        assert_eq!(inherited.max_open_positions, 3);
+        assert_eq!(inherited.max_positions_per_symbol, 2);
+        assert_eq!(inherited.max_total_trades_per_symbol, Some(100));
+        assert_eq!(
+            inherited.portfolio_drawdown_cooldown_trigger_pct,
+            Some(0.12)
+        );
+        assert_eq!(inherited.portfolio_drawdown_cooldown_days, 10);
+        assert_eq!(inherited.symbol_drawdown_cooldown_trigger_pct, Some(0.08));
+        assert_eq!(inherited.symbol_drawdown_cooldown_days, 5);
+
+        let overridden = approved_strategy_portfolio_constraints_with_overrides(
+            &artifact.approved_strategy,
+            Some(25_000.0),
+            Some(0.2),
+            Some(4),
+            Some(1),
+            Some(50),
+            Some(0.2),
+            Some(20),
+            Some(0.1),
+            Some(15),
+        );
+
+        assert_eq!(overridden.capital_budget, 25_000.0);
+        assert_eq!(overridden.max_symbol_allocation_pct, 0.2);
+        assert_eq!(overridden.max_open_positions, 4);
+        assert_eq!(overridden.max_positions_per_symbol, 1);
+        assert_eq!(overridden.max_total_trades_per_symbol, Some(50));
+        assert_eq!(
+            overridden.portfolio_drawdown_cooldown_trigger_pct,
+            Some(0.2)
+        );
+        assert_eq!(overridden.portfolio_drawdown_cooldown_days, 20);
+        assert_eq!(overridden.symbol_drawdown_cooldown_trigger_pct, Some(0.1));
+        assert_eq!(overridden.symbol_drawdown_cooldown_days, 15);
     }
 
     #[test]
@@ -14533,6 +15037,8 @@ mod tests {
             (200, tradier_open_call_debit_positions_response()),
             (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (200, tradier_debit_exit_quote_response(4.90, 0.05)),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
         ]);
         let ledger = unique_main_test_path("tradier-order-ledger-close-price-retry.json");
         let mut decision = tradier_management_test_decision(ExecutionMode::Live);
@@ -14554,7 +15060,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submit_unknown");
         assert_eq!(decision.reason, "prior close submit still unresolved");
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 6);
         fs::remove_file(ledger).unwrap();
     }
 
@@ -14575,6 +15081,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
                 r#"{"order":{"id":"close456","status":"ok"}}"#.to_owned(),
@@ -14603,9 +15111,9 @@ mod tests {
 
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submitted");
-        assert_eq!(bodies.len(), 7);
+        assert_eq!(bodies.len(), 9);
         assert!(bodies[4].contains("preview=true"));
-        assert!(bodies[5].contains("preview=false"));
+        assert!(bodies[7].contains("preview=false"));
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -14702,6 +15210,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
                 r#"{"order":{"id":"close123","status":"ok"}}"#.to_owned(),
@@ -14730,7 +15240,7 @@ mod tests {
 
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submitted");
-        assert_eq!(bodies.len(), 7);
+        assert_eq!(bodies.len(), 9);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -14754,6 +15264,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, tradier_open_call_debit_positions_response()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
                 r#"{"order":{"id":"close123","status":"ok"}}"#.to_owned(),
@@ -14771,9 +15283,9 @@ mod tests {
 
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submitted");
-        assert_eq!(bodies.len(), 7);
+        assert_eq!(bodies.len(), 9);
         assert!(bodies[4].contains("preview=true"));
-        assert!(bodies[5].contains("preview=false"));
+        assert!(bodies[7].contains("preview=false"));
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -14965,6 +15477,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (200, r#"{"order":{"id":"placed","status":"ok"}}"#.to_owned()),
             (
                 200,
@@ -14980,14 +15494,201 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submitted");
         assert!(decision.tradier_quote.is_some());
-        assert_eq!(bodies.len(), 8);
+        assert_eq!(bodies.len(), 10);
         assert!(bodies[5].contains("preview=true"));
-        assert!(bodies[6].contains("preview=false"));
+        assert!(bodies[8].contains("preview=false"));
         assert_eq!(
             bodies[5].replace("preview=true", "preview=false"),
-            bodies[6]
+            bodies[8]
         );
         fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_order_key_ignores_tag_and_parses_order_tag() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![(
+            200,
+            r#"{"orders":{"order":{"id":"abc123","symbol":"ORCL","status":"open","quantity":1,"tag":"sf-test"}}}"#,
+        )]);
+        let config = test_tradier_config(base_url);
+        let client = TradierClient::new(config.clone()).unwrap();
+        let action = tradier_call_debit_action("new_entry");
+        let mut payload = tradier_multileg_debit_payload(&action).unwrap();
+        let original_key = tradier_order_key(&config, &payload, &action);
+        let tag = tradier_order_tag(&original_key);
+        payload.insert("tag".to_owned(), tag.clone());
+
+        let orders = client.get_orders().unwrap();
+        let bodies = collect_mock_requests(requests, handle);
+
+        assert_eq!(tradier_order_key(&config, &payload, &action), original_key);
+        assert!(tag.starts_with("sf-"));
+        assert_eq!(orders.orders[0].tag.as_deref(), Some("sf-test"));
+        assert_eq!(bodies[0], "");
+    }
+
+    #[test]
+    fn tradier_pending_unknown_reconciles_by_broker_order_id() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"placed","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-pending-id.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_signal.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_signal.as_ref().unwrap(),
+        );
+        execution_order_ledger_record_status(
+            &ledger,
+            &order_key,
+            "pending_unknown",
+            Some("placed"),
+            Some("prior submit unknown"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        let ledger_entries = read_execution_order_ledger(&ledger).unwrap();
+        let entry = ledger_entries.get(&order_key).unwrap();
+        assert_eq!(decision.status, "already_submitted");
+        assert!(decision.reason.contains("reconciled"));
+        assert_eq!(entry.status, "submitted");
+        assert_eq!(entry.broker_order_id.as_deref(), Some("placed"));
+        assert_eq!(bodies.len(), 2);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_pending_unknown_reconciles_by_order_tag() {
+        let ledger = unique_main_test_path("tradier-order-ledger-pending-tag.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let (base_url, requests, handle) = spawn_tradier_mock_with_base(|base_url| {
+            let config = test_tradier_config(base_url.to_owned());
+            let payload =
+                tradier_multileg_debit_payload(decision.selected_signal.as_ref().unwrap()).unwrap();
+            let order_key = tradier_order_key(
+                &config,
+                &payload,
+                decision.selected_signal.as_ref().unwrap(),
+            );
+            let tag = tradier_order_tag(&order_key);
+            execution_order_ledger_record_status(
+                &ledger,
+                &order_key,
+                "pending_unknown",
+                None,
+                Some("prior tagged submit unknown"),
+            )
+            .unwrap();
+            vec![
+                (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+                (
+                    200,
+                    format!(
+                        r#"{{"orders":{{"order":{{"id":"tagged","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1,"tag":"{tag}"}}}}}}"#
+                    ),
+                ),
+            ]
+        });
+        let config = test_tradier_config(base_url);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_signal.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_signal.as_ref().unwrap(),
+        );
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        let ledger_entries = read_execution_order_ledger(&ledger).unwrap();
+        let entry = ledger_entries.get(&order_key).unwrap();
+        assert_eq!(decision.status, "already_submitted");
+        assert_eq!(entry.status, "submitted");
+        assert_eq!(entry.broker_order_id.as_deref(), Some("tagged"));
+        assert_eq!(bodies.len(), 2);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_pending_unknown_without_id_or_tag_stays_unknown() {
+        let (base_url, requests, handle) = spawn_tradier_mock(vec![
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-pending-no-match.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_signal.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_signal.as_ref().unwrap(),
+        );
+        execution_order_ledger_record_status(
+            &ledger,
+            &order_key,
+            "pending_unknown",
+            None,
+            Some("prior submit unknown"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "submit_unknown");
+        assert_eq!(decision.reason, "prior submit unknown");
+        assert_eq!(bodies.len(), 2);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn tradier_pre_place_recheck_blocks_new_same_underlying_order() {
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"external","symbol":"ORCL","option_symbol":"ORCL260703C00240000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]);
+        let ledger = unique_main_test_path("tradier-order-ledger-pre-place-active.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("pre-place duplicate-exposure recheck")
+        );
+        assert!(
+            decision
+                .reason
+                .contains("active Tradier vertical-spread order")
+        );
+        assert_eq!(bodies.len(), 8);
+        assert!(!bodies.iter().any(|body| body.contains("preview=false")));
+        assert!(!ledger.exists());
     }
 
     #[test]
@@ -15203,10 +15904,14 @@ mod tests {
 
     #[test]
     fn tradier_place_transport_failure_is_unknown_not_rejected() {
-        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![(
-            200,
-            r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
-        )]);
+        let (base_url, requests, handle) = spawn_tradier_live_debit_mock(vec![
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#,
+            ),
+            (200, r#"{"positions":{"position":[]}}"#),
+            (200, r#"{"orders":{"order":[]}}"#),
+        ]);
         let ledger = unique_main_test_path("tradier-order-ledger-place-unknown.json");
         let mut decision = tradier_test_decision(ExecutionMode::Live);
         let config = test_tradier_config(base_url);
@@ -15216,7 +15921,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submit_unknown");
         assert!(decision.reason.contains("check Tradier before retrying"));
-        assert_eq!(bodies.len(), 6);
+        assert_eq!(bodies.len(), 8);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -15233,6 +15938,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (200, r#"{"order":{"id":"placed","status":"ok"}}"#.to_owned()),
             (
                 200,
@@ -15248,7 +15955,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "submit_unknown");
         assert!(decision.reason.contains("returned no order status"));
-        assert_eq!(bodies.len(), 8);
+        assert_eq!(bodies.len(), 10);
         assert!(
             read_execution_order_ledger(&ledger)
                 .unwrap()
@@ -15265,6 +15972,8 @@ mod tests {
                 200,
                 r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
             ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
             (
                 200,
                 r#"{"order":{"id":"placed","status":"error","reason_description":"broker rejected"}}"#.to_owned(),
@@ -15279,7 +15988,7 @@ mod tests {
         let bodies = collect_mock_requests(requests, handle);
         assert_eq!(decision.status, "rejected");
         assert!(decision.reason.contains("broker rejected"));
-        assert_eq!(bodies.len(), 7);
+        assert_eq!(bodies.len(), 9);
         fs::remove_file(ledger).unwrap();
     }
 
@@ -16776,6 +17485,7 @@ mod tests {
             status: status.map(ToOwned::to_owned),
             side: None,
             quantity,
+            tag: None,
         }
     }
 
@@ -17097,6 +17807,34 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for (status, body) in responses {
                 let body = body.into();
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                tx.send(request).unwrap();
+                let status_text = if status == 200 { "OK" } else { "Bad Request" };
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, rx, handle)
+    }
+
+    fn spawn_tradier_mock_with_base(
+        build_responses: impl FnOnce(&str) -> Vec<(u16, String)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let responses = build_responses(base_url.as_str());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 tx.send(request).unwrap();

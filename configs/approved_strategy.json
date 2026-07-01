@@ -1,6 +1,6 @@
 {
-  "strategy_id": "weekly_selector_relaxed_trade5_ddog_dell_rblx_20260701",
-  "profile_name": "selector_crash_put_and_costaware_call_debits_only",
+  "strategy_id": "weekly_selector_costaware_puts_ddog_dell_rblx_20260701",
+  "profile_name": "selector_crash_and_costaware_puts_and_call_debits_only",
   "research_from": "2010-01-01",
   "research_gate_capital_budget": 100000.0,
   "live_detector_lookback_days": 30,
@@ -43,9 +43,9 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "canary_approved",
-    "approved_at": "2026-07-01T17:41:10Z",
+    "approved_at": "2026-07-01T21:41:00Z",
     "approved_by": "operator",
-    "reason": "Combined DELL/RBLX debit-spread selector from runs/portfolio-weekly-selector-research-20260701T173703.287741000Z-p26851-s0 is a full_promotion_candidate using the approved basket plus DELL and RBLX. The run produced 2354 trades, 140521 raw PnL, 81671 $25-cost PnL, 1.96 profit factor, 38.11% win rate, 5.02% capital DD on the 100k research budget, 10.39% $25-cost capital DD, 41.2% max symbol PnL share from TSLA, 22 symbol-ablation passes, and 1 strategy-ablation pass. Recent-regime validation passed with 959 trailing trades, 56042 $25-cost PnL, and 8.17% $25-cost capital DD. Promotion comparison passed versus runs/portfolio-weekly-selector-research-20260701T160109.973313000Z-p22793-s0: $25-cost PnL improved by 12500 over the 69171 baseline. DELL contributes 71 direct trades, 3362 raw PnL, and 1587 $25-cost PnL; RBLX contributes 82 direct trades, 7674 raw PnL, and 5624 $25-cost PnL. Both active sleeves remain profitable: put debit spreads contributed 52414 raw PnL and call debit spreads contributed 88107 raw PnL. Account-sized constraint refresh runs/portfolio-weekly-selector-research-20260701T212249.397953000Z-p61224-s0 lowered max symbol allocation to 15% while preserving full_promotion_candidate status, 1755 trades, 137363 raw PnL, 93488 $25-cost PnL, 2.32 profit factor, and 4.45% recent $25-cost capital DD on the 100k research gate denominator. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
+    "reason": "Targeted no-QCOM approved-config refresh runs/portfolio-weekly-selector-research-20260701T214649.247655000Z-p19047-s0 promoted selector_crash_and_costaware_puts_and_call_debits_only without broad universe expansion or wheel execution. The run used the 22-symbol approved basket, account-sized capital budget 7897.67, 100000 research gate denominator, 15% max symbol allocation, max 3 open positions, and max 2 positions per symbol. It produced 2152 trades, 157978 raw PnL, 104178 $25-cost PnL, 2.33 profit factor, 205.28 trades/year, 7.13% capital DD, 11.28% $25-cost capital DD, and full_promotion_candidate status. Promotion comparison passed versus runs/portfolio-weekly-selector-research-20260701T212249.397953000Z-p61224-s0 by 10690 $25-cost PnL. Recent-regime validation passed with 732 trailing trades, 77527 $25-cost PnL, 44.3% $25-cost win rate, 2.92 $25-cost profit factor, and 4.27% recent $25-cost capital DD. TSLA max PnL share fell to 38.3%. Failed symbol ablations were AMD removal and DDOG removal, so AMD/DDOG dependency must be monitored, but the strategy remains debit-spread-only: put debit spreads contributed 89863 raw PnL across 1500 trades and call debit spreads contributed 68115 raw PnL across 652 trades. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
     "source_canary_status": "full_promotion_candidate",
     "max_order_max_loss": 1000.0
   }

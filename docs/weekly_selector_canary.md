@@ -1102,6 +1102,23 @@ Selector diagnostics against the DDOG baseline did not produce a new promotion:
 
 Professional decision after this round: keep the DDOG-approved production basket. The next useful research should not be more generic add-the-symbol tests for SHOP/AMZN/GOOGL/semicap equipment under the current selector. Either build recent-plus-historical coverage for a new liquid candidate with a clear mechanism thesis, or test a symbol-specific entry family that changes the edge source before rerunning promotion gates.
 
+## 2026-07-01 Targeted Existing-Basket Refresh
+
+Broad universe expansion is paused. The approved selector already has enough research-denominator activity, and recent broad rounds mostly produced zero-trade, sparse, or cost-negative direct checks. QCOM remains excluded.
+
+The account-sized denominator refresh separated live allocation from the research gate: live constraints now use the Tradier-sized `7897.67` capital budget, while promotion and recent-regime gates continue to normalize drawdown against the `100000` research denominator. The current approved basket has `22` symbols, no QCOM, `15%` max symbol allocation, max `3` open positions, and max `2` positions per symbol.
+
+The targeted approved-config run `runs/portfolio-weekly-selector-research-20260701T214649.247655000Z-p19047-s0` stayed inside that same 22-symbol basket and promoted `selector_crash_and_costaware_puts_and_call_debits_only`. This profile is the production-safe version of the wheel-composite improvement: it keeps the improved cost-aware put fallback and call-debit schedule, but does not require wheel assignment or covered-call live execution.
+
+Promotion evidence versus the previous account-sized baseline `runs/portfolio-weekly-selector-research-20260701T212249.397953000Z-p61224-s0`:
+
+- `2152` trades, `205.28` trades/year, `157978` raw PnL, `104178` $25-cost PnL, and `2.33` profit factor.
+- Promotion comparison passed by `10690` $25-cost PnL over the `93488` baseline.
+- Recent-regime validation passed with `732` trailing trades, `77527` $25-cost PnL, `44.3%` $25-cost win rate, `2.92` $25-cost profit factor, and `4.27%` recent $25-cost capital DD.
+- TSLA max PnL share fell to `38.3%`, from `43.9%` in the prior account-sized baseline.
+- Production remains debit-spread-only: put debit spreads contributed `89863` raw PnL across `1500` trades; call debit spreads contributed `68115` raw PnL across `652` trades.
+- The residual robustness issue is symbol dependency: removing AMD blocks chronological robustness, and removing DDOG fails annual stability. Treat this as a monitoring and entry-quality problem, not a reason to resume broad universe expansion.
+
 Require an actionable signal before any canary action:
 
 ```sh

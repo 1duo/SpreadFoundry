@@ -172,6 +172,7 @@ pub struct TradierOrder {
     pub status: Option<String>,
     pub side: Option<String>,
     pub quantity: Option<f64>,
+    pub tag: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -316,7 +317,16 @@ impl TradierClient {
             self.config.base_url.trim_end_matches('/'),
             self.config.account_id
         );
-        let (status, body, raw) = self.get_json(url)?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.config.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .query(&[("includeTags", "true")])
+            .send()?;
+        let status = response.status();
+        let body = response.text()?;
+        let raw = parse_json_body(&body);
         if status.is_success() {
             Ok(TradierOrdersResponse {
                 ok: true,
@@ -511,6 +521,7 @@ fn parse_tradier_orders(value: &Value) -> Vec<TradierOrder> {
                 status: string_field(map, "status").map(|status| status.to_ascii_lowercase()),
                 side: string_field(map, "side").map(|side| side.to_ascii_lowercase()),
                 quantity: number_field(map, "quantity"),
+                tag: string_field(map, "tag"),
             })
         })
         .collect()
