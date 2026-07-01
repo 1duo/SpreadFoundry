@@ -34,9 +34,9 @@ const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 18.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
-const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.15;
-const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.10;
-const PROMOTION_MIN_NEW_SYMBOL_TRADES: usize = 10;
+const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.20;
+const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.12;
+const PROMOTION_MIN_NEW_SYMBOL_TRADES: usize = 5;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
@@ -189,6 +189,33 @@ pub struct PortfolioWheelResearchRequest {
 
 fn default_promotion_min_new_symbol_trades() -> usize {
     PROMOTION_MIN_NEW_SYMBOL_TRADES
+}
+
+fn symbol_research_from(symbol: &str, requested_from: NaiveDate) -> NaiveDate {
+    modern_symbol_start(symbol)
+        .map(|start| requested_from.max(start))
+        .unwrap_or(requested_from)
+}
+
+fn modern_symbol_start(symbol: &str) -> Option<NaiveDate> {
+    let date = |year, month, day| NaiveDate::from_ymd_opt(year, month, day).unwrap();
+    match symbol.to_ascii_uppercase().as_str() {
+        "APP" => Some(date(2021, 4, 15)),
+        "ARM" => Some(date(2023, 9, 14)),
+        "ASTS" => Some(date(2021, 4, 7)),
+        "COIN" => Some(date(2021, 4, 14)),
+        "CRWV" => Some(date(2025, 3, 28)),
+        "DDOG" => Some(date(2019, 9, 19)),
+        "HOOD" => Some(date(2021, 7, 29)),
+        "IREN" => Some(date(2021, 11, 17)),
+        "NET" => Some(date(2019, 9, 13)),
+        "PLTR" => Some(date(2020, 9, 30)),
+        "RIVN" => Some(date(2021, 11, 10)),
+        "SNOW" => Some(date(2020, 9, 16)),
+        "SOFI" => Some(date(2021, 6, 1)),
+        "VRT" => Some(date(2020, 2, 10)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1348,6 +1375,8 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
 
     let profiles = research_profiles_for(profile_family);
     let option_data_mode = option_data_mode_for_profile_family(profile_family);
+    let requested_from = request.from;
+    let effective_from = symbol_research_from(&request.symbol, requested_from);
     let max_entry_dte = profiles
         .iter()
         .map(|profile| profile.max_dte)
@@ -1389,7 +1418,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         .filter(|expiration| {
             let entry_start = *expiration - Duration::days(max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
-            entry_start <= request.to && entry_end >= request.from
+            entry_start <= request.to && entry_end >= effective_from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
@@ -1402,13 +1431,13 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         max_regime_lookback_days,
     );
     let requested_load_bounds = ExpirationLoadBounds {
-        from: request.from,
+        from: effective_from,
         to: request.to,
         max_entry_dte,
         min_force_close_dte,
         option_row_lookback_days,
     };
-    let mut research_from = request.from;
+    let mut research_from = effective_from;
     let expirations_skipped_before_data;
     if request.cache_only {
         expirations_skipped_before_data = 0;
@@ -1427,9 +1456,8 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
             if first_loadable_idx > 0 {
                 candidate_expirations = candidate_expirations.split_off(first_loadable_idx);
                 if let Some(first_expiration) = candidate_expirations.first() {
-                    research_from = request
-                        .from
-                        .max(*first_expiration - Duration::days(max_entry_dte));
+                    research_from =
+                        effective_from.max(*first_expiration - Duration::days(max_entry_dte));
                     println!(
                         "using effective research start {} after skipping {} leading empty/unavailable expirations",
                         research_from, expirations_skipped_before_data
@@ -1556,7 +1584,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
         run_id: run_id.clone(),
         symbol: request.symbol,
         profile_family,
-        requested_from: request.from,
+        requested_from,
         from: research_from,
         to: request.to,
         expirations_discovered: expirations.len(),
@@ -1593,6 +1621,8 @@ pub async fn audit_weekly_signal_gates(
 
     let profiles = research_profiles_for(request.profile_family);
     let option_data_mode = option_data_mode_for_profile_family(request.profile_family);
+    let requested_from = request.from;
+    let effective_from = symbol_research_from(&request.symbol, requested_from);
     let max_entry_dte = profiles
         .iter()
         .map(|profile| profile.max_dte)
@@ -1635,7 +1665,7 @@ pub async fn audit_weekly_signal_gates(
         .filter(|expiration| {
             let entry_start = *expiration - Duration::days(max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
-            entry_start <= request.to && entry_end >= request.from
+            entry_start <= request.to && entry_end >= effective_from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
@@ -1649,14 +1679,14 @@ pub async fn audit_weekly_signal_gates(
         max_regime_lookback_days,
     );
     let requested_load_bounds = ExpirationLoadBounds {
-        from: request.from,
+        from: effective_from,
         to: request.to,
         max_entry_dte,
         min_force_close_dte,
         option_row_lookback_days,
     };
 
-    let mut research_from = request.from;
+    let mut research_from = effective_from;
     if !request.cache_only {
         if let Some(first_loadable_idx) = first_expiration_with_rows(
             &request.symbol,
@@ -1671,9 +1701,8 @@ pub async fn audit_weekly_signal_gates(
             if first_loadable_idx > 0 {
                 candidate_expirations = candidate_expirations.split_off(first_loadable_idx);
                 if let Some(first_expiration) = candidate_expirations.first() {
-                    research_from = request
-                        .from
-                        .max(*first_expiration - Duration::days(max_entry_dte));
+                    research_from =
+                        effective_from.max(*first_expiration - Duration::days(max_entry_dte));
                 }
             }
         } else {
@@ -1795,7 +1824,7 @@ pub async fn audit_weekly_signal_gates(
     Ok(WeeklySignalGateAuditReport {
         symbol: request.symbol,
         profile_family: request.profile_family,
-        requested_from: request.from,
+        requested_from,
         from: research_from,
         to: request.to,
         cache_only: request.cache_only,
@@ -2005,10 +2034,11 @@ pub async fn warm_option_cache_coverage(
 
     let mut out = Vec::new();
     for symbol in symbols {
+        let effective_from = symbol_research_from(&symbol, request.from);
         if request.progress {
             eprintln!(
                 "warm-option-cache symbol={symbol} status=start from={} to={} side={:?}",
-                request.from, request.to, request.option_side
+                effective_from, request.to, request.option_side
             );
         }
         out.push(warm_symbol_option_cache_coverage(&symbol, &request, min_entry_dte, bounds).await);
@@ -2032,6 +2062,11 @@ async fn warm_symbol_option_cache_coverage(
     bounds: ExpirationLoadBounds,
 ) -> WarmOptionCacheCoverageSymbol {
     let raw_dir = PathBuf::from("data/raw/theta").join(symbol);
+    let effective_from = symbol_research_from(symbol, request.from);
+    let bounds = ExpirationLoadBounds {
+        from: effective_from,
+        ..bounds
+    };
     let expirations =
         match discover_expirations_with_cache_mode(symbol, &raw_dir, request.force_refresh, false)
             .await
@@ -2046,7 +2081,7 @@ async fn warm_symbol_option_cache_coverage(
                 }
                 return WarmOptionCacheCoverageSymbol {
                     symbol: symbol.to_owned(),
-                    from: request.from,
+                    from: effective_from,
                     to: request.to,
                     expirations_discovered: 0,
                     expirations_audited: 0,
@@ -2065,7 +2100,7 @@ async fn warm_symbol_option_cache_coverage(
         .filter(|expiration| {
             let entry_start = *expiration - Duration::days(bounds.max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
-            entry_start <= request.to && entry_end >= request.from
+            entry_start <= request.to && entry_end >= effective_from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
@@ -2230,7 +2265,7 @@ async fn warm_symbol_option_cache_coverage(
     }
     WarmOptionCacheCoverageSymbol {
         symbol: symbol.to_owned(),
-        from: request.from,
+        from: effective_from,
         to: request.to,
         expirations_discovered: expirations.len(),
         expirations_audited: candidate_expirations.len(),
@@ -2452,13 +2487,18 @@ async fn audit_symbol_option_cache_coverage(
     bounds: ExpirationLoadBounds,
 ) -> OptionCacheCoverageSymbol {
     let raw_dir = PathBuf::from("data/raw/theta").join(symbol);
+    let effective_from = symbol_research_from(symbol, request.from);
+    let bounds = ExpirationLoadBounds {
+        from: effective_from,
+        ..bounds
+    };
     let expirations =
         match discover_expirations_with_cache_mode(symbol, &raw_dir, false, true).await {
             Ok(expirations) => expirations,
             Err(error) => {
                 return OptionCacheCoverageSymbol {
                     symbol: symbol.to_owned(),
-                    from: request.from,
+                    from: effective_from,
                     to: request.to,
                     expirations_discovered: 0,
                     expirations_audited: 0,
@@ -2482,7 +2522,7 @@ async fn audit_symbol_option_cache_coverage(
         .filter(|expiration| {
             let entry_start = *expiration - Duration::days(bounds.max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
-            entry_start <= request.to && entry_end >= request.from
+            entry_start <= request.to && entry_end >= effective_from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
@@ -2543,7 +2583,7 @@ async fn audit_symbol_option_cache_coverage(
     let audited = candidate_expirations.len();
     OptionCacheCoverageSymbol {
         symbol: symbol.to_owned(),
-        from: request.from,
+        from: effective_from,
         to: request.to,
         expirations_discovered: expirations.len(),
         expirations_audited: audited,
@@ -2839,6 +2879,7 @@ async fn load_portfolio_wheel_symbol_data(
 ) -> Result<PortfolioWheelSymbolData> {
     let raw_dir = PathBuf::from("data/raw/theta").join(symbol);
     fs::create_dir_all(&raw_dir)?;
+    let effective_from = symbol_research_from(symbol, request.from);
 
     let max_entry_dte = profiles
         .iter()
@@ -2881,7 +2922,7 @@ async fn load_portfolio_wheel_symbol_data(
         .filter(|expiration| {
             let entry_start = *expiration - Duration::days(max_entry_dte);
             let entry_end = *expiration - Duration::days(min_entry_dte);
-            entry_start <= request.to && entry_end >= request.from
+            entry_start <= request.to && entry_end >= effective_from
         })
         .collect::<Vec<_>>();
     candidate_expirations.sort();
@@ -2890,7 +2931,7 @@ async fn load_portfolio_wheel_symbol_data(
     }
 
     let bounds = ExpirationLoadBounds {
-        from: request.from,
+        from: effective_from,
         to: request.to,
         max_entry_dte,
         min_force_close_dte,
@@ -2900,7 +2941,7 @@ async fn load_portfolio_wheel_symbol_data(
             max_regime_lookback_days,
         ),
     };
-    let mut research_from = request.from;
+    let mut research_from = effective_from;
     let expirations_skipped_before_data;
     if request.cache_only {
         expirations_skipped_before_data = 0;
@@ -2919,9 +2960,8 @@ async fn load_portfolio_wheel_symbol_data(
             if first_loadable_idx > 0 {
                 candidate_expirations = candidate_expirations.split_off(first_loadable_idx);
                 if let Some(first_expiration) = candidate_expirations.first() {
-                    research_from = request
-                        .from
-                        .max(*first_expiration - Duration::days(max_entry_dte));
+                    research_from =
+                        effective_from.max(*first_expiration - Duration::days(max_entry_dte));
                 }
             }
         } else {
@@ -14843,7 +14883,7 @@ mod tests {
             (NaiveDate::from_ymd_opt(2024, 4, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 7, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 10, 10).unwrap(), 1_000.0),
-            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_900.0),
+            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -2_500.0),
             (NaiveDate::from_ymd_opt(2025, 3, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 5, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 9, 10).unwrap(), 1_000.0),
@@ -14870,7 +14910,7 @@ mod tests {
         assert_eq!(status, "blocked");
         assert!(!pass);
         assert!(reason.contains("drawdown gate failed"));
-        assert!(reason.contains("versus cap 15.00%"));
+        assert!(reason.contains("versus cap 20.00%"));
     }
 
     #[test]
@@ -15329,6 +15369,21 @@ mod tests {
         );
         assert_eq!(metrics.required_trades, 10);
         assert!(!metrics.ranking_eligible);
+    }
+
+    #[test]
+    fn modern_symbol_research_start_blocks_reused_ticker_history() {
+        let requested = NaiveDate::from_ymd_opt(2016, 1, 1).unwrap();
+
+        assert_eq!(
+            symbol_research_from("SNOW", requested),
+            NaiveDate::from_ymd_opt(2020, 9, 16).unwrap()
+        );
+        assert_eq!(
+            symbol_research_from("ARM", requested),
+            NaiveDate::from_ymd_opt(2023, 9, 14).unwrap()
+        );
+        assert_eq!(symbol_research_from("AMAT", requested), requested);
     }
 
     #[test]

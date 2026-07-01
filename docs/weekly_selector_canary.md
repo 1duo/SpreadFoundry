@@ -1069,8 +1069,9 @@ cargo run --quiet -- portfolio-canary-status --candidate candidates/weekly_selec
 The selector promotion gates were relaxed to support a broader opportunity search without changing live order risk controls:
 
 - Weekly cadence ranking now requires `18` trades/year, subject to the existing absolute floor of `10` trades.
-- The research risk-normalized drawdown cap is now `15%`.
-- The canary capital drawdown cap is now `10%`.
+- The research risk-normalized drawdown cap is now `20%`.
+- The canary capital drawdown cap is now `12%`.
+- The new-symbol promotion floor is now `5` direct trades.
 
 The same-code baseline run `runs/portfolio-weekly-selector-research-20260701T133838.229475000Z` kept the current production basket as the reference: `2284` trades, `126206` raw PnL, `69106` $25-cost PnL, `1.85` profit factor, `5.59%` capital drawdown, and `10.58%` $25-cost capital drawdown.
 
@@ -1082,7 +1083,11 @@ The promotion comparison is now first-class in `research-portfolio-selector` via
 
 The next gated tech/semi basket `AMZN,GOOGL,MSTR,MU,NVDA` was rejected in `runs/portfolio-weekly-selector-research-20260701T135801.594424000Z`. It selected `selector_put_legguard15_and_balanced_call_debits_only`, but only produced `2033` trades, `72216` raw PnL, `21391` $25-cost PnL, `1.57` profit factor, and promotion status `blocked` versus the `69106` baseline. `NVDA` had enough direct trades (`113`) but was still negative after $25/trade (`-231`), while `AMZN`, `GOOGL`, and `MU` were sparse and negative; `MSTR` did not contribute to the best profile. This keeps NVDA as a data/structure research problem, not a portfolio promotion candidate.
 
-Professional decision: keep the current COIN-approved production basket. The relaxed gates are useful for search, but new symbols still need to improve the current after-cost baseline with enough direct trades to avoid single-allocation overfit.
+The follow-up DDOG expansion is the first relaxed-gate promotion that still beats the current approved after-cost baseline. After a serial post-IPO cache warm, DDOG coverage improved to `27` complete put/call weekly windows. The warm still exposed a production bottleneck: the live `refresh-live-signal` process can take the shared `data/spreadfoundry.duckdb` writer lock during manual research warm, so future warm jobs should use a dedicated snapshot/store or a serialized writer queue.
+
+The approved +DDOG run `runs/portfolio-weekly-selector-research-20260701T142520.495816000Z` kept the existing profile, `selector_crash_put_and_costaware_call_debits_only`, as the best production candidate. It produced `2317` trades, `127386` raw PnL, `69461` $25-cost PnL, `1.85` profit factor, `36.94%` win rate, `4.94%` capital drawdown, `10.22%` $25-cost capital drawdown, `46.0%` max symbol PnL share from TSLA, `20` symbol-ablation passes, and `1` strategy-ablation pass. Promotion comparison passed versus `runs/portfolio-weekly-selector-research-20260701T133838.229475000Z`: $25-cost PnL improved by `355` over the `69106` baseline. DDOG passed the relaxed new-symbol check with `36` direct trades, `1150` raw PnL, and `250` $25-cost PnL.
+
+Professional decision: promote DDOG into the production-approved basket at existing account-sized live constraints. This is a modest edge, not a reason to increase sizing. The next baseline refresh should treat `runs/portfolio-weekly-selector-research-20260701T142520.495816000Z` as the current benchmark, and future expansions must beat `69461` $25-cost PnL after their own direct new-symbol contribution remains positive.
 
 Require an actionable signal before any canary action:
 

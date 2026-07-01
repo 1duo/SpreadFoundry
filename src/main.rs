@@ -593,7 +593,7 @@ enum Commands {
         symbol_drawdown_cooldown_days: i64,
         #[arg(long)]
         promotion_baseline_run: Option<PathBuf>,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 5)]
         promotion_min_new_symbol_trades: usize,
     },
 }
@@ -1427,7 +1427,7 @@ async fn main() -> Result<()> {
                 symbol_drawdown_cooldown_days,
                 promotion_baseline_cost_25_pnl: None,
                 promotion_baseline_symbols: Vec::new(),
-                promotion_min_new_symbol_trades: 10,
+                promotion_min_new_symbol_trades: 5,
             })
             .await?;
             if let Some(best) = report.profiles.first() {
