@@ -38,6 +38,8 @@ const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
 const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.20;
 const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.12;
 const PORTFOLIO_RECENT_REGIME_LOOKBACK_DAYS: i64 = 365 * 3;
+const PORTFOLIO_HISTORY_SCORE_WEIGHT: f64 = 0.75;
+const PORTFOLIO_RECENT_SCORE_WEIGHT: f64 = 0.25;
 const PROMOTION_MIN_NEW_SYMBOL_TRADES: usize = 5;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
@@ -413,6 +415,10 @@ pub struct PortfolioWheelLoadedSymbol {
 pub struct PortfolioWheelProfileResult {
     pub profile: ResearchProfile,
     pub metrics: ResearchMetrics,
+    #[serde(default)]
+    pub recent_regime_score: f64,
+    #[serde(default)]
+    pub recency_adjusted_score: f64,
     pub trades: Vec<PortfolioWheelTrade>,
     pub candidates: usize,
     pub accepted: usize,
@@ -2749,6 +2755,10 @@ async fn run_portfolio_research(
                 request.to,
                 request.capital_budget,
             );
+            let recent_regime_score =
+                portfolio_recent_regime_score(&recent_regime, request.capital_budget);
+            let recency_adjusted_score =
+                portfolio_recency_adjusted_score(&metrics, recent_regime_score);
             let symbol_summaries = portfolio_wheel_symbol_summaries(&allocation.trades);
             let promotion_readiness = portfolio_promotion_readiness(
                 &metrics,
@@ -2778,6 +2788,8 @@ async fn run_portfolio_research(
             PortfolioWheelProfileResult {
                 profile: selector_profile.summary_profile,
                 metrics,
+                recent_regime_score,
+                recency_adjusted_score,
                 trades: allocation.trades.clone(),
                 candidates: allocation.candidates,
                 accepted: allocation.trades.len(),
@@ -3809,6 +3821,22 @@ fn positive_denominator_ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
+fn portfolio_recent_regime_score(
+    recent_regime: &PortfolioRecentRegimeMetrics,
+    capital_budget: f64,
+) -> f64 {
+    if !recent_regime.pass {
+        return -1_000_000.0;
+    }
+    positive_denominator_ratio(recent_regime.cost_25_pnl, capital_budget)
+        - 2.0 * recent_regime.cost_25_max_closed_equity_drawdown_pct_capital
+}
+
+fn portfolio_recency_adjusted_score(metrics: &ResearchMetrics, recent_regime_score: f64) -> f64 {
+    PORTFOLIO_HISTORY_SCORE_WEIGHT * metrics.score
+        + PORTFOLIO_RECENT_SCORE_WEIGHT * recent_regime_score
+}
+
 fn wheel_assignment_cycle(trade: &PortfolioWheelTrade) -> bool {
     trade.strategy == SpreadStructure::Wheel
         && trade.trade.exit_reason != "put_expired"
@@ -4349,7 +4377,24 @@ fn portfolio_wheel_profile_order(
     a: &PortfolioWheelProfileResult,
     b: &PortfolioWheelProfileResult,
 ) -> Ordering {
-    profile_rank_order(&a.metrics, &a.profile, &b.metrics, &b.profile)
+    let a_recency_eligible = a.gate_pass && a.recent_regime.pass;
+    let b_recency_eligible = b.gate_pass && b.recent_regime.pass;
+    b_recency_eligible.cmp(&a_recency_eligible).then_with(|| {
+        if a_recency_eligible && b_recency_eligible {
+            b.recency_adjusted_score
+                .total_cmp(&a.recency_adjusted_score)
+                .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
+                .then_with(|| b.metrics.robust_score.total_cmp(&a.metrics.robust_score))
+                .then_with(|| {
+                    risk_regime_cooldown_tiebreak_score(&b.profile)
+                        .cmp(&risk_regime_cooldown_tiebreak_score(&a.profile))
+                })
+                .then_with(|| profile_complexity(&a.profile).cmp(&profile_complexity(&b.profile)))
+                .then_with(|| a.profile.name.cmp(&b.profile.name))
+        } else {
+            profile_rank_order(&a.metrics, &a.profile, &b.metrics, &b.profile)
+        }
+    })
 }
 
 fn normalize_portfolio_symbols(symbols: &[String]) -> Vec<String> {
@@ -4452,9 +4497,9 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     out.push('\n');
 
     out.push_str("## Top Profiles\n\n");
-    out.push_str("| Rank | Profile | Gate | Recent | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Capital DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
+    out.push_str("| Rank | Profile | Gate | Recent | Adj Score | Hist Score | Recent Score | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Capital DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
     out.push_str(
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for (idx, result) in report.profiles.iter().take(10).enumerate() {
         let cost_10_pnl = result
@@ -4502,11 +4547,14 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             .filter(|trade| trade.strategy == SpreadStructure::CallDebitSpread)
             .count();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
             idx + 1,
             result.profile.name,
             result.gate_status,
             result.recent_regime.status,
+            result.recency_adjusted_score,
+            result.metrics.score,
+            result.recent_regime_score,
             result.metrics.trades,
             result.metrics.required_trades,
             result.metrics.trades_per_year,
@@ -16201,6 +16249,46 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_ranking_blends_recent_regime_for_gate_eligible_profiles() {
+        let history_leader =
+            portfolio_profile_result_for_order("history_leader", 0.20, 0.10, true, true);
+        let recent_leader =
+            portfolio_profile_result_for_order("recent_leader", 0.18, 0.40, true, true);
+
+        let mut results = [history_leader, recent_leader];
+        results.sort_by(portfolio_wheel_profile_order);
+
+        assert_eq!(results[0].profile.name, "recent_leader");
+        assert!(results[0].recency_adjusted_score > results[1].recency_adjusted_score);
+    }
+
+    #[test]
+    fn portfolio_ranking_does_not_let_recency_rescue_blocked_profile() {
+        let deployable = portfolio_profile_result_for_order("deployable", 0.12, 0.12, true, true);
+        let blocked = portfolio_profile_result_for_order("blocked", 0.30, 0.50, false, true);
+
+        let mut results = [blocked, deployable];
+        results.sort_by(portfolio_wheel_profile_order);
+
+        assert_eq!(results[0].profile.name, "deployable");
+    }
+
+    #[test]
+    fn portfolio_recent_regime_score_penalizes_cost_drawdown() {
+        let recent_regime = PortfolioRecentRegimeMetrics {
+            status: "pass".to_owned(),
+            pass: true,
+            cost_25_pnl: 50_000.0,
+            cost_25_max_closed_equity_drawdown_pct_capital: 0.10,
+            ..PortfolioRecentRegimeMetrics::default()
+        };
+
+        let score = portfolio_recent_regime_score(&recent_regime, 100_000.0);
+
+        assert!((score - 0.30).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn cost_stress_subtracts_cost_from_each_trade() {
         let win = trade_with_entry_exit(
             NaiveDate::from_ymd_opt(2020, 1, 2).unwrap(),
@@ -18457,6 +18545,82 @@ mod tests {
             candidates: trades.len(),
             trades,
             metrics,
+        }
+    }
+
+    fn portfolio_profile_result_for_order(
+        name: &str,
+        history_score: f64,
+        recent_regime_score: f64,
+        gate_pass: bool,
+        recent_regime_pass: bool,
+    ) -> PortfolioWheelProfileResult {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let trades = training_trades(50.0);
+        let mut profile = ResearchProfile::legacy_baseline();
+        profile.name = name.to_owned();
+        let mut metrics = metrics(&trades, from, to);
+        metrics.score = history_score;
+        metrics.robust_score = history_score;
+        metrics.ranking_eligible = true;
+        metrics.robust_ranking_eligible = true;
+        let recency_adjusted_score =
+            portfolio_recency_adjusted_score(&metrics, recent_regime_score);
+        PortfolioWheelProfileResult {
+            profile,
+            metrics,
+            recent_regime_score,
+            recency_adjusted_score,
+            trades: Vec::new(),
+            candidates: 0,
+            accepted: 0,
+            rejected_capital_budget: 0,
+            rejected_symbol_allocation: 0,
+            rejected_open_positions: 0,
+            rejected_symbol_positions: 0,
+            rejected_symbol_total_trades: 0,
+            rejected_portfolio_drawdown_cooldown: 0,
+            rejected_symbol_drawdown_cooldown: 0,
+            max_capital_used: 0.0,
+            avg_capital_used_on_entry: 0.0,
+            symbol_summaries: Vec::new(),
+            strategy_summaries: Vec::new(),
+            risk_summary: PortfolioWheelRiskSummary::default(),
+            decision_metrics: PortfolioDecisionMetrics::default(),
+            recent_regime: PortfolioRecentRegimeMetrics {
+                status: if recent_regime_pass {
+                    "pass"
+                } else {
+                    "blocked"
+                }
+                .to_owned(),
+                pass: recent_regime_pass,
+                ..PortfolioRecentRegimeMetrics::default()
+            },
+            ablations: Vec::new(),
+            canary_readiness: PortfolioCanaryReadiness {
+                status: "test".to_owned(),
+                canary_ready: gate_pass && recent_regime_pass,
+                full_promotion_ready: false,
+                reason: "test readiness".to_owned(),
+                recommended_capital_fraction: 0.0,
+                max_symbol_pnl_share: 0.0,
+                max_symbol: None,
+                symbol_ablation_passes: 0,
+                strategy_ablation_passes: 0,
+                cost_25_pnl: 0.0,
+            },
+            promotion_readiness: PortfolioPromotionReadiness::default(),
+            latest_actions: Vec::new(),
+            gate_status: if gate_pass {
+                "research_pass"
+            } else {
+                "blocked"
+            }
+            .to_owned(),
+            gate_pass,
+            gate_reason: "test gate".to_owned(),
         }
     }
 
