@@ -2753,6 +2753,7 @@ async fn run_portfolio_research(
             let promotion_readiness = portfolio_promotion_readiness(
                 &metrics,
                 &symbol_summaries,
+                &request.symbols,
                 request.promotion_baseline_cost_25_pnl,
                 &request.promotion_baseline_symbols,
                 request.promotion_min_new_symbol_trades,
@@ -4021,6 +4022,7 @@ fn portfolio_canary_readiness(
 fn portfolio_promotion_readiness(
     metrics: &ResearchMetrics,
     symbol_summaries: &[PortfolioWheelSymbolSummary],
+    portfolio_symbols: &[String],
     baseline_cost_25_pnl: Option<f64>,
     baseline_symbols: &[String],
     min_new_symbol_trades: usize,
@@ -4028,22 +4030,30 @@ fn portfolio_promotion_readiness(
     let cost_25_pnl = portfolio_cost_25_pnl(metrics);
     let baseline_symbols = normalize_portfolio_symbols(baseline_symbols);
     let baseline_symbol_set = baseline_symbols.iter().cloned().collect::<BTreeSet<_>>();
+    let portfolio_symbols = normalize_portfolio_symbols(portfolio_symbols);
+    let summary_by_symbol = symbol_summaries
+        .iter()
+        .map(|summary| (summary.symbol.to_ascii_uppercase(), summary))
+        .collect::<BTreeMap<_, _>>();
     let min_new_symbol_trades = min_new_symbol_trades.max(1);
     let configured = baseline_cost_25_pnl.is_some() || !baseline_symbols.is_empty();
     let new_symbol_checks = if baseline_symbols.is_empty() {
         Vec::new()
     } else {
-        symbol_summaries
+        portfolio_symbols
             .iter()
-            .filter(|summary| !baseline_symbol_set.contains(&summary.symbol.to_ascii_uppercase()))
-            .map(|summary| {
-                let cost_25_pnl = summary.pnl - 25.0 * summary.trades as f64;
-                let (pass, reason) = if summary.trades < min_new_symbol_trades {
+            .filter(|symbol| !baseline_symbol_set.contains(*symbol))
+            .map(|symbol| {
+                let summary = summary_by_symbol.get(symbol);
+                let trades = summary.map(|summary| summary.trades).unwrap_or(0);
+                let pnl = summary.map(|summary| summary.pnl).unwrap_or(0.0);
+                let cost_25_pnl = pnl - 25.0 * trades as f64;
+                let (pass, reason) = if trades < min_new_symbol_trades {
                     (
                         false,
                         format!(
                             "new symbol has {} trades versus required {}",
-                            summary.trades, min_new_symbol_trades
+                            trades, min_new_symbol_trades
                         ),
                     )
                 } else if cost_25_pnl <= 0.0 {
@@ -4056,14 +4066,14 @@ fn portfolio_promotion_readiness(
                         true,
                         format!(
                             "new symbol passed with {} trades and $25 cost PnL {:.2}",
-                            summary.trades, cost_25_pnl
+                            trades, cost_25_pnl
                         ),
                     )
                 };
                 PortfolioPromotionSymbolCheck {
-                    symbol: summary.symbol.clone(),
-                    trades: summary.trades,
-                    pnl: summary.pnl,
+                    symbol: symbol.clone(),
+                    trades,
+                    pnl,
                     cost_25_pnl,
                     pass,
                     reason,
@@ -14768,6 +14778,7 @@ mod tests {
         let readiness = portfolio_promotion_readiness(
             &metrics,
             &symbols,
+            &["TSLA".to_owned(), "SMCI".to_owned()],
             Some(700.0),
             &["TSLA".to_owned()],
             PROMOTION_MIN_NEW_SYMBOL_TRADES,
@@ -14784,6 +14795,48 @@ mod tests {
             .unwrap();
         assert_eq!(smci_check.trades, 1);
         assert!(smci_check.cost_25_pnl > 0.0);
+        assert!(!smci_check.pass);
+    }
+
+    #[test]
+    fn portfolio_promotion_blocks_zero_trade_new_symbol_artifact() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let tsla =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 800.0);
+        let trade = PortfolioWheelTrade {
+            symbol: tsla.symbol,
+            strategy: SpreadStructure::PutDebitSpread,
+            capital_at_risk: tsla.capital_at_risk,
+            trade: tsla.trade,
+        };
+        let metrics = metrics_with_min_trades_per_year(
+            std::slice::from_ref(&trade.trade),
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let symbols = portfolio_wheel_symbol_summaries(&[trade]);
+
+        let readiness = portfolio_promotion_readiness(
+            &metrics,
+            &symbols,
+            &["TSLA".to_owned(), "SMCI".to_owned()],
+            Some(700.0),
+            &["TSLA".to_owned()],
+            PROMOTION_MIN_NEW_SYMBOL_TRADES,
+        );
+
+        assert_eq!(readiness.status, "blocked");
+        assert!(!readiness.pass);
+        assert!(readiness.cost_25_pnl_improvement.unwrap() > 0.0);
+        assert!(readiness.reason.contains("SMCI failed promotion check"));
+        let smci_check = readiness
+            .new_symbol_checks
+            .iter()
+            .find(|check| check.symbol == "SMCI")
+            .unwrap();
+        assert_eq!(smci_check.trades, 0);
+        assert_eq!(smci_check.cost_25_pnl, 0.0);
         assert!(!smci_check.pass);
     }
 
