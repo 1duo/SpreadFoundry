@@ -2052,6 +2052,7 @@ async fn warm_symbol_option_cache_coverage(
         }
     }
     candidates.truncate(request.max_windows_per_symbol);
+    drop(store);
 
     let mut windows = Vec::new();
     for chunk in candidates.chunks(request.fetch_concurrency.max(1)) {
