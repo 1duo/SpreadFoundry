@@ -432,6 +432,10 @@ enum Commands {
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
         cache_only: bool,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
         #[arg(long, default_value_t = false, conflicts_with = "single_symbol_only")]
         expand_on_plateau: bool,
         #[arg(
@@ -458,6 +462,10 @@ enum Commands {
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
         cache_only: bool,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
         #[arg(long, default_value_t = false, conflicts_with = "single_symbol_only")]
         expand_on_plateau: bool,
         #[arg(
@@ -494,6 +502,10 @@ enum Commands {
         symbol_concurrency: usize,
         #[arg(long, value_enum, default_value_t = ProfileFamilyArg::Swing)]
         profile_family: ProfileFamilyArg,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
     },
     ResearchWeeklyUniverse {
         #[arg(
@@ -518,6 +530,10 @@ enum Commands {
         symbol_concurrency: usize,
         #[arg(long, value_enum, default_value_t = ProfileFamilyArg::WeeklyPutDebit)]
         profile_family: ProfileFamilyArg,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
     },
     ResearchPortfolioWheel {
         #[arg(
@@ -1309,9 +1325,12 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             force_refresh,
             cache_only,
+            research_store,
+            skip_cache_sync,
             expand_on_plateau,
             single_symbol_only,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: "NVDA".to_owned(),
                 profile_family: ResearchProfileFamily::Swing,
@@ -1334,9 +1353,12 @@ async fn main() -> Result<()> {
             fetch_concurrency,
             force_refresh,
             cache_only,
+            research_store,
+            skip_cache_sync,
             expand_on_plateau,
             single_symbol_only,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             research_symbol_and_optional_universe(ResearchCommandArgs {
                 symbol: symbol.to_uppercase(),
                 profile_family: profile_family.into(),
@@ -1362,7 +1384,10 @@ async fn main() -> Result<()> {
             allow_pre_plateau,
             symbol_concurrency,
             profile_family,
+            research_store,
+            skip_cache_sync,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             research_universe(UniverseResearchArgs {
                 symbols,
                 plateau_run,
@@ -1388,7 +1413,10 @@ async fn main() -> Result<()> {
             cache_only,
             symbol_concurrency,
             profile_family,
+            research_store,
+            skip_cache_sync,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             let symbols = if symbols.is_empty() {
                 DEFAULT_WEEKLY_RESEARCH_SYMBOLS
                     .iter()
@@ -11074,12 +11102,25 @@ mod tests {
             "2026-06-21",
             "--profile-family",
             "weekly-call-credit",
+            "--research-store",
+            "var/research/mechanism.duckdb",
+            "--skip-cache-sync",
         ])
         .unwrap();
 
         match cli.command {
-            Commands::ResearchWeeklyUniverse { profile_family, .. } => {
+            Commands::ResearchWeeklyUniverse {
+                profile_family,
+                research_store,
+                skip_cache_sync,
+                ..
+            } => {
                 assert_eq!(profile_family, ProfileFamilyArg::WeeklyCallCredit);
+                assert_eq!(
+                    research_store,
+                    Some(PathBuf::from("var/research/mechanism.duckdb"))
+                );
+                assert!(skip_cache_sync);
             }
             other => panic!("unexpected command: {other:?}"),
         }
