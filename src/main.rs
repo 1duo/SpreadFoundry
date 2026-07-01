@@ -34,10 +34,10 @@ use spreadfoundry::research::{
     ExecutionStrategySummary, OptionCacheCoverageReport, OptionCacheCoverageRequest,
     PortfolioWheelReport, PortfolioWheelResearchRequest, ResearchMetrics, ResearchProfile,
     ResearchProfileFamily, ResearchReport, ResearchRequest, WarmOptionCacheCoverageReport,
-    WarmOptionCacheCoverageRequest, WeeklySignalGateAuditReport, WeeklySignalGateAuditRequest,
-    audit_option_cache_coverage, audit_weekly_signal_gates, run_portfolio_selector_research,
-    run_portfolio_selector_research_for_profile, run_portfolio_wheel_research, run_symbol_research,
-    warm_option_cache_coverage,
+    WarmOptionCacheCoverageRequest, WarmOptionCacheSide, WeeklySignalGateAuditReport,
+    WeeklySignalGateAuditRequest, audit_option_cache_coverage, audit_weekly_signal_gates,
+    run_portfolio_selector_research, run_portfolio_selector_research_for_profile,
+    run_portfolio_wheel_research, run_symbol_research, warm_option_cache_coverage,
 };
 use spreadfoundry::research_store::{
     ResearchStore, ResearchStoreHealth, ResearchStoreImportReport, ResearchStorePerfReport,
@@ -377,6 +377,8 @@ enum Commands {
         max_windows_per_symbol: usize,
         #[arg(long, default_value_t = false)]
         recent_first: bool,
+        #[arg(long, value_enum, default_value = "put-and-call")]
+        option_side: WarmOptionSideArg,
         #[arg(long, default_value_t = 2)]
         fetch_concurrency: usize,
         #[arg(long, default_value_t = DEFAULT_WARM_OPTION_CACHE_WINDOW_TIMEOUT_SECONDS)]
@@ -702,6 +704,23 @@ enum ProfileFamilyArg {
     WeeklyCallCredit,
     WeeklyCallDebit,
     WeeklyWheel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WarmOptionSideArg {
+    Put,
+    Call,
+    PutAndCall,
+}
+
+impl From<WarmOptionSideArg> for WarmOptionCacheSide {
+    fn from(value: WarmOptionSideArg) -> Self {
+        match value {
+            WarmOptionSideArg::Put => Self::Put,
+            WarmOptionSideArg::Call => Self::Call,
+            WarmOptionSideArg::PutAndCall => Self::PutAndCall,
+        }
+    }
 }
 
 impl From<ProfileFamilyArg> for ResearchProfileFamily {
@@ -1180,6 +1199,7 @@ async fn main() -> Result<()> {
             max_expirations,
             max_windows_per_symbol,
             recent_first,
+            option_side,
             fetch_concurrency,
             window_timeout_seconds,
             force_refresh,
@@ -1200,6 +1220,7 @@ async fn main() -> Result<()> {
                 max_expirations,
                 max_windows_per_symbol,
                 recent_first,
+                option_side: option_side.into(),
                 fetch_concurrency,
                 force_refresh,
                 window_timeout_seconds,
@@ -11056,6 +11077,8 @@ mod tests {
             "--max-windows-per-symbol",
             "6",
             "--recent-first",
+            "--option-side",
+            "call",
             "--fetch-concurrency",
             "2",
             "--window-timeout-seconds",
@@ -11072,6 +11095,7 @@ mod tests {
                 max_expirations,
                 max_windows_per_symbol,
                 recent_first,
+                option_side,
                 fetch_concurrency,
                 window_timeout_seconds,
                 json,
@@ -11083,6 +11107,7 @@ mod tests {
                 assert_eq!(max_expirations, Some(80));
                 assert_eq!(max_windows_per_symbol, 6);
                 assert!(recent_first);
+                assert_eq!(option_side, WarmOptionSideArg::Call);
                 assert_eq!(fetch_concurrency, 2);
                 assert_eq!(window_timeout_seconds, 45);
                 assert!(json);

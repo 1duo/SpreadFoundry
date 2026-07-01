@@ -132,6 +132,13 @@ enum OptionDataMode {
     PutAndCall,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WarmOptionCacheSide {
+    Put,
+    Call,
+    PutAndCall,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResearchRequest {
     pub symbol: String,
@@ -192,6 +199,7 @@ pub struct WarmOptionCacheCoverageRequest {
     pub max_expirations: Option<usize>,
     pub max_windows_per_symbol: usize,
     pub recent_first: bool,
+    pub option_side: WarmOptionCacheSide,
     pub fetch_concurrency: usize,
     pub force_refresh: bool,
     pub window_timeout_seconds: u64,
@@ -2042,7 +2050,11 @@ async fn warm_symbol_option_cache_coverage(
             OptionRight::Call,
             &mut error,
         );
-        if !put_complete_before || !call_complete_before {
+        if !warm_side_complete(
+            request.option_side,
+            put_complete_before,
+            call_complete_before,
+        ) {
             candidates.push(WarmOptionCacheCandidate {
                 expiration: *expiration,
                 start,
@@ -2065,6 +2077,7 @@ async fn warm_symbol_option_cache_coverage(
             let raw_dir = raw_dir.clone();
             let force_refresh = request.force_refresh;
             let window_timeout_seconds = request.window_timeout_seconds;
+            let option_side = request.option_side;
             async move {
                 warm_option_cache_window_with_timeout(
                     &symbol,
@@ -2072,6 +2085,7 @@ async fn warm_symbol_option_cache_coverage(
                     candidate,
                     force_refresh,
                     window_timeout_seconds,
+                    option_side,
                 )
                 .await
             }
@@ -2081,12 +2095,15 @@ async fn warm_symbol_option_cache_coverage(
 
     let windows_completed = windows
         .iter()
-        .filter(|window| window.both_complete_after)
+        .filter(|window| {
+            warm_side_complete(
+                request.option_side,
+                window.put_complete_after,
+                window.call_complete_after,
+            )
+        })
         .count();
-    let windows_failed = windows
-        .iter()
-        .filter(|window| !window.both_complete_after)
-        .count();
+    let windows_failed = windows.len() - windows_completed;
     WarmOptionCacheCoverageSymbol {
         symbol: symbol.to_owned(),
         from: request.from,
@@ -2107,9 +2124,11 @@ async fn warm_option_cache_window_with_timeout(
     candidate: WarmOptionCacheCandidate,
     force_refresh: bool,
     window_timeout_seconds: u64,
+    option_side: WarmOptionCacheSide,
 ) -> WarmOptionCacheCoverageWindow {
     if window_timeout_seconds == 0 {
-        return warm_option_cache_window(symbol, raw_dir, candidate, force_refresh).await;
+        return warm_option_cache_window(symbol, raw_dir, candidate, force_refresh, option_side)
+            .await;
     }
 
     let expiration = candidate.expiration;
@@ -2119,7 +2138,7 @@ async fn warm_option_cache_window_with_timeout(
     let call_complete_before = candidate.call_complete_before;
     match timeout(
         StdDuration::from_secs(window_timeout_seconds),
-        warm_option_cache_window(symbol, raw_dir, candidate, force_refresh),
+        warm_option_cache_window(symbol, raw_dir, candidate, force_refresh, option_side),
     )
     .await
     {
@@ -2130,9 +2149,9 @@ async fn warm_option_cache_window_with_timeout(
             end,
             put_complete_before,
             call_complete_before,
-            put_complete_after: false,
-            call_complete_after: false,
-            both_complete_after: false,
+            put_complete_after: put_complete_before,
+            call_complete_after: call_complete_before,
+            both_complete_after: put_complete_before && call_complete_before,
             error: Some(format!("window timed out after {window_timeout_seconds}s")),
         },
     }
@@ -2143,6 +2162,7 @@ async fn warm_option_cache_window(
     raw_dir: &Path,
     candidate: WarmOptionCacheCandidate,
     force_refresh: bool,
+    option_side: WarmOptionCacheSide,
 ) -> WarmOptionCacheCoverageWindow {
     let load_error = load_expiration_rows_for_mode_with_cache_mode(
         symbol,
@@ -2152,7 +2172,7 @@ async fn warm_option_cache_window(
         raw_dir,
         force_refresh,
         false,
-        OptionDataMode::PutAndCall,
+        warm_option_data_mode(option_side),
     )
     .await
     .err()
@@ -2187,6 +2207,26 @@ async fn warm_option_cache_window(
         call_complete_after,
         both_complete_after: put_complete_after && call_complete_after,
         error: load_error.or(store_error),
+    }
+}
+
+fn warm_option_data_mode(option_side: WarmOptionCacheSide) -> OptionDataMode {
+    match option_side {
+        WarmOptionCacheSide::Put => OptionDataMode::Single(OptionRight::Put),
+        WarmOptionCacheSide::Call => OptionDataMode::Single(OptionRight::Call),
+        WarmOptionCacheSide::PutAndCall => OptionDataMode::PutAndCall,
+    }
+}
+
+fn warm_side_complete(
+    option_side: WarmOptionCacheSide,
+    put_complete: bool,
+    call_complete: bool,
+) -> bool {
+    match option_side {
+        WarmOptionCacheSide::Put => put_complete,
+        WarmOptionCacheSide::Call => call_complete,
+        WarmOptionCacheSide::PutAndCall => put_complete && call_complete,
     }
 }
 
@@ -12316,6 +12356,24 @@ fn parse_yyyymmdd(value: &str) -> Option<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_side_completion_matches_requested_side() {
+        assert!(warm_side_complete(WarmOptionCacheSide::Put, true, false));
+        assert!(!warm_side_complete(WarmOptionCacheSide::Put, false, true));
+        assert!(warm_side_complete(WarmOptionCacheSide::Call, false, true));
+        assert!(!warm_side_complete(WarmOptionCacheSide::Call, true, false));
+        assert!(warm_side_complete(
+            WarmOptionCacheSide::PutAndCall,
+            true,
+            true
+        ));
+        assert!(!warm_side_complete(
+            WarmOptionCacheSide::PutAndCall,
+            true,
+            false
+        ));
+    }
 
     #[test]
     fn option_cache_window_parser_matches_right_dataset_and_expiration() {
