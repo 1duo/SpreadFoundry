@@ -1,5 +1,5 @@
 {
-  "strategy_id": "weekly_selector_relaxed_dd26_anet_crwd_20260701",
+  "strategy_id": "weekly_selector_relaxed_dd26_coin_20260701",
   "profile_name": "selector_crash_put_and_costaware_call_debits_only",
   "research_from": "2010-01-01",
   "live_detector_lookback_days": 30,
@@ -12,6 +12,7 @@
     "META",
     "IREN",
     "HOOD",
+    "COIN",
     "AVGO",
     "AAPL",
     "SOFI",
@@ -38,9 +39,9 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "canary_approved",
-    "approved_at": "2026-07-01T11:58:37Z",
+    "approved_at": "2026-07-01T12:41:23Z",
     "approved_by": "operator",
-    "reason": "Fresh relaxed-gate ANET+CRWD debit-spread selector from runs/portfolio-weekly-selector-research-20260701T115534.762220000Z is a full_promotion_candidate under the 26 trades/year ranking cadence and 7.5% canary capital-DD cap: 2274 trades, 119081 PnL, 62231 $25-cost PnL, 1.80 profit factor, 5.59% capital DD on the 100k research budget, 47.5% max symbol PnL share from TSLA, 18 symbol-ablation passes, and 1 strategy-ablation pass. The expanded semis/AI-infra basket was rejected because deployable spread-only alternatives underperformed this baseline and higher-PnL variants failed annual stability, capital-DD, inventory, or live-equivalence checks. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
+    "reason": "Fresh relaxed-gate COIN debit-spread selector from runs/portfolio-weekly-selector-research-20260701T123830.159238000Z is a full_promotion_candidate under the 26 trades/year ranking cadence and 7.5% canary capital-DD cap: 2277 trades, 121255 PnL, 64330 $25-cost PnL, 1.81 profit factor, 5.59% capital DD on the 100k research budget, 46.8% max symbol PnL share from TSLA, 19 symbol-ablation passes, and 1 strategy-ablation pass. COIN adds 9 direct trades, 1107 raw PnL, and the remove_symbol:COIN ablation reverts to the prior approved baseline of 2274 trades, 119081 PnL, and 62231 $25-cost PnL. QCOM was rejected because expanded coverage reduced after-cost portfolio PnL, while AMZN/RIVN remain watchlist-only until deeper coverage proves their allocation-interaction edge. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
     "source_canary_status": "full_promotion_candidate",
     "max_order_max_loss": 1000.0
   }
