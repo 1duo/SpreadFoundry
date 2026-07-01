@@ -37,6 +37,7 @@ const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
 const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.20;
 const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.12;
+const PORTFOLIO_RECENT_REGIME_LOOKBACK_DAYS: i64 = 365 * 3;
 const PROMOTION_MIN_NEW_SYMBOL_TRADES: usize = 5;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
@@ -435,6 +436,8 @@ pub struct PortfolioWheelProfileResult {
     #[serde(default)]
     pub decision_metrics: PortfolioDecisionMetrics,
     #[serde(default)]
+    pub recent_regime: PortfolioRecentRegimeMetrics,
+    #[serde(default)]
     pub ablations: Vec<PortfolioAblationSummary>,
     pub canary_readiness: PortfolioCanaryReadiness,
     #[serde(default)]
@@ -556,6 +559,25 @@ pub struct PortfolioDecisionMetrics {
     pub marked_stock_loss_to_pnl: f64,
     pub assignment_rate: f64,
     pub professional_risk_flag: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PortfolioRecentRegimeMetrics {
+    pub lookback_days: i64,
+    pub from: Option<NaiveDate>,
+    pub to: Option<NaiveDate>,
+    pub status: String,
+    pub pass: bool,
+    pub reason: String,
+    pub trades: usize,
+    pub total_pnl: f64,
+    pub cost_25_pnl: f64,
+    pub cost_25_win_rate: f64,
+    pub cost_25_profit_factor: f64,
+    pub max_closed_equity_drawdown: f64,
+    pub max_closed_equity_drawdown_pct_capital: f64,
+    pub cost_25_max_closed_equity_drawdown: f64,
+    pub cost_25_max_closed_equity_drawdown_pct_capital: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2721,6 +2743,12 @@ async fn run_portfolio_research(
                 request.capital_budget,
                 &risk_summary,
             );
+            let recent_regime = portfolio_recent_regime_metrics(
+                &allocation.trades,
+                from,
+                request.to,
+                request.capital_budget,
+            );
             let symbol_summaries = portfolio_wheel_symbol_summaries(&allocation.trades);
             let promotion_readiness = portfolio_promotion_readiness(
                 &metrics,
@@ -2735,6 +2763,7 @@ async fn run_portfolio_research(
                 &ablations,
                 &strategy_summaries,
                 &decision_metrics,
+                &recent_regime,
                 gate_pass,
                 &promotion_readiness,
             );
@@ -2765,6 +2794,7 @@ async fn run_portfolio_research(
                 strategy_summaries,
                 risk_summary,
                 decision_metrics,
+                recent_regime,
                 ablations,
                 canary_readiness,
                 promotion_readiness,
@@ -3686,6 +3716,90 @@ fn portfolio_decision_metrics(
     }
 }
 
+fn portfolio_recent_regime_metrics(
+    trades: &[PortfolioWheelTrade],
+    from: NaiveDate,
+    to: NaiveDate,
+    capital_budget: f64,
+) -> PortfolioRecentRegimeMetrics {
+    let lookback_days = PORTFOLIO_RECENT_REGIME_LOOKBACK_DAYS;
+    let recent_from = from.max(to - Duration::days((lookback_days - 1).max(0)));
+    let recent_trades = trades
+        .iter()
+        .filter(|trade| trade.trade.entry_date >= recent_from && trade.trade.entry_date <= to)
+        .cloned()
+        .collect::<Vec<_>>();
+    let research_trades = recent_trades
+        .iter()
+        .map(|trade| trade.trade.clone())
+        .collect::<Vec<_>>();
+    let total_pnl = research_trades.iter().map(|trade| trade.pnl).sum::<f64>();
+    let cost_25 = cost_stress_metric(&research_trades, 25.0);
+    let max_closed_equity_drawdown = portfolio_closed_equity_drawdown(&recent_trades, 0.0);
+    let cost_25_max_closed_equity_drawdown = portfolio_closed_equity_drawdown(&recent_trades, 25.0);
+    let cost_25_max_closed_equity_drawdown_pct_capital =
+        positive_denominator_ratio(cost_25_max_closed_equity_drawdown, capital_budget);
+    let (status, pass, reason) = if recent_trades.is_empty() {
+        (
+            "stale",
+            false,
+            format!("no accepted trades in trailing {lookback_days} calendar days"),
+        )
+    } else if cost_25.total_pnl <= 0.0 {
+        (
+            "blocked",
+            false,
+            format!(
+                "trailing {lookback_days}D $25 cost PnL {:.2} is not positive",
+                cost_25.total_pnl
+            ),
+        )
+    } else if cost_25_max_closed_equity_drawdown_pct_capital
+        > PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
+    {
+        (
+            "blocked",
+            false,
+            format!(
+                "trailing {lookback_days}D $25 capital DD {:.2}% exceeds canary cap {:.2}%",
+                cost_25_max_closed_equity_drawdown_pct_capital * 100.0,
+                PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT * 100.0
+            ),
+        )
+    } else {
+        (
+            "pass",
+            true,
+            format!(
+                "trailing {lookback_days}D passed with {} trades and $25 cost PnL {:.2}",
+                recent_trades.len(),
+                cost_25.total_pnl
+            ),
+        )
+    };
+
+    PortfolioRecentRegimeMetrics {
+        lookback_days,
+        from: Some(recent_from),
+        to: Some(to),
+        status: status.to_owned(),
+        pass,
+        reason,
+        trades: recent_trades.len(),
+        total_pnl,
+        cost_25_pnl: cost_25.total_pnl,
+        cost_25_win_rate: cost_25.win_rate,
+        cost_25_profit_factor: cost_25.profit_factor,
+        max_closed_equity_drawdown,
+        max_closed_equity_drawdown_pct_capital: positive_denominator_ratio(
+            max_closed_equity_drawdown,
+            capital_budget,
+        ),
+        cost_25_max_closed_equity_drawdown,
+        cost_25_max_closed_equity_drawdown_pct_capital,
+    }
+}
+
 fn positive_denominator_ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator > 0.0 {
         numerator / denominator
@@ -3810,6 +3924,7 @@ fn portfolio_canary_readiness(
     ablations: &[PortfolioAblationSummary],
     strategy_summaries: &[PortfolioStrategySummary],
     decision_metrics: &PortfolioDecisionMetrics,
+    recent_regime: &PortfolioRecentRegimeMetrics,
     gate_pass: bool,
     promotion_readiness: &PortfolioPromotionReadiness,
 ) -> PortfolioCanaryReadiness {
@@ -3832,6 +3947,7 @@ fn portfolio_canary_readiness(
         && cost_25_pnl > 0.0
         && decision_metrics.max_capital_drawdown_pct <= PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
         && decision_metrics.professional_risk_flag != "inventory_risk_high"
+        && recent_regime.pass
         && negative_strategy.is_none();
     let full_promotion_ready = canary_ready
         && promotion_readiness.pass
@@ -3871,6 +3987,11 @@ fn portfolio_canary_readiness(
                     "canary blocked: inventory risk high, marked stock loss/PnL {:.1}%, assignment rate {:.1}%",
                     decision_metrics.marked_stock_loss_to_pnl * 100.0,
                     decision_metrics.assignment_rate * 100.0
+                )
+            } else if !recent_regime.pass {
+                format!(
+                    "canary blocked: recent regime failed: {}",
+                    recent_regime.reason
                 )
             } else {
                 format!(
@@ -4321,9 +4442,9 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     out.push('\n');
 
     out.push_str("## Top Profiles\n\n");
-    out.push_str("| Rank | Profile | Gate | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Capital DD | $10 Cost PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
+    out.push_str("| Rank | Profile | Gate | Recent | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Capital DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
     out.push_str(
-        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for (idx, result) in report.profiles.iter().take(10).enumerate() {
         let cost_10_pnl = result
@@ -4371,10 +4492,11 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             .filter(|trade| trade.strategy == SpreadStructure::CallDebitSpread)
             .count();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
             idx + 1,
             result.profile.name,
             result.gate_status,
+            result.recent_regime.status,
             result.metrics.trades,
             result.metrics.required_trades,
             result.metrics.trades_per_year,
@@ -4383,6 +4505,7 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             result.metrics.max_drawdown * 100.0,
             result.decision_metrics.max_capital_drawdown_pct * 100.0,
             cost_10_pnl,
+            result.recent_regime.cost_25_pnl,
             wheel_trades,
             put_debit_trades,
             call_debit_trades,
@@ -4439,6 +4562,29 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             best.rejected_symbol_total_trades,
             best.rejected_portfolio_drawdown_cooldown,
             best.rejected_symbol_drawdown_cooldown
+        ));
+        out.push_str(&format!(
+            "- Recent regime: `{}` ({})\n- Recent window: `{}` to `{}` (`{}` days)\n- Recent trades: `{}`\n- Recent raw PnL: `{:.2}`\n- Recent $25 cost PnL: `{:.2}`\n- Recent $25 win rate: `{:.1}%`\n- Recent $25 profit factor: `{:.2}`\n- Recent $25 capital drawdown: `${:.0}` (`{:.2}%`)\n\n",
+            best.recent_regime.status,
+            best.recent_regime.reason,
+            best.recent_regime
+                .from
+                .map(|date| date.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
+            best.recent_regime
+                .to
+                .map(|date| date.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
+            best.recent_regime.lookback_days,
+            best.recent_regime.trades,
+            best.recent_regime.total_pnl,
+            best.recent_regime.cost_25_pnl,
+            best.recent_regime.cost_25_win_rate * 100.0,
+            best.recent_regime.cost_25_profit_factor,
+            best.recent_regime.cost_25_max_closed_equity_drawdown,
+            best.recent_regime
+                .cost_25_max_closed_equity_drawdown_pct_capital
+                * 100.0
         ));
         out.push_str(&format!(
             "- Canary readiness: `{}` ({})\n- Recommended canary capital fraction: `{:.1}%`\n- Max symbol PnL share: `{:.1}%` from `{}`\n- Symbol ablation passes: `{}`\n- Strategy ablation passes: `{}`\n\n",
@@ -14402,6 +14548,7 @@ mod tests {
             &[],
             &strategies,
             &PortfolioDecisionMetrics::default(),
+            &portfolio_recent_regime_test_pass(),
             true,
             &portfolio_promotion_test_pass(),
         );
@@ -14445,6 +14592,7 @@ mod tests {
             &[],
             &[],
             &decision_metrics,
+            &portfolio_recent_regime_test_pass(),
             true,
             &portfolio_promotion_test_pass(),
         );
@@ -14483,6 +14631,7 @@ mod tests {
             &[],
             &[],
             &decision_metrics,
+            &portfolio_recent_regime_test_pass(),
             true,
             &portfolio_promotion_test_pass(),
         );
@@ -14522,6 +14671,7 @@ mod tests {
             &[],
             &[],
             &decision_metrics,
+            &portfolio_recent_regime_test_pass(),
             true,
             &portfolio_promotion_test_pass(),
         );
@@ -14530,6 +14680,51 @@ mod tests {
         assert!(!readiness.canary_ready);
         assert_eq!(readiness.recommended_capital_fraction, 0.0);
         assert!(readiness.reason.contains("capital DD"));
+    }
+
+    #[test]
+    fn portfolio_canary_blocks_negative_recent_regime_after_costs() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let opportunity =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 10.0);
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: SpreadStructure::PutDebitSpread,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let metrics = metrics_with_min_trades_per_year(
+            std::slice::from_ref(&trade.trade),
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let decision_metrics = PortfolioDecisionMetrics {
+            professional_risk_flag: "no_wheel_inventory".to_owned(),
+            ..PortfolioDecisionMetrics::default()
+        };
+        let recent_regime = portfolio_recent_regime_metrics(
+            std::slice::from_ref(&trade),
+            entry,
+            entry + Duration::days(30),
+            100_000.0,
+        );
+
+        let readiness = portfolio_canary_readiness(
+            &metrics,
+            &[trade],
+            &[],
+            &[],
+            &decision_metrics,
+            &recent_regime,
+            true,
+            &portfolio_promotion_test_pass(),
+        );
+
+        assert_eq!(recent_regime.status, "blocked");
+        assert_eq!(readiness.status, "blocked");
+        assert!(!readiness.canary_ready);
+        assert!(readiness.reason.contains("recent regime failed"));
     }
 
     #[test]
@@ -18442,6 +18637,17 @@ mod tests {
             reason: "test promotion baseline not configured".to_owned(),
             min_new_symbol_trades: PROMOTION_MIN_NEW_SYMBOL_TRADES,
             ..PortfolioPromotionReadiness::default()
+        }
+    }
+
+    fn portfolio_recent_regime_test_pass() -> PortfolioRecentRegimeMetrics {
+        PortfolioRecentRegimeMetrics {
+            status: "pass".to_owned(),
+            pass: true,
+            reason: "test recent regime passed".to_owned(),
+            trades: 1,
+            cost_25_pnl: 1.0,
+            ..PortfolioRecentRegimeMetrics::default()
         }
     }
 
