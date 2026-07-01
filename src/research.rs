@@ -5592,10 +5592,10 @@ fn fixed_profile_oos_score_order(
     a: &FixedProfileWalkForwardResult,
     b: &FixedProfileWalkForwardResult,
 ) -> Ordering {
-    if a.metrics.ranking_eligible && b.metrics.ranking_eligible {
+    if out_of_sample_gate_passes(&a.metrics) && out_of_sample_gate_passes(&b.metrics) {
         b.metrics.score.total_cmp(&a.metrics.score)
     } else {
-        Ordering::Equal
+        b.metrics.total_pnl.total_cmp(&a.metrics.total_pnl)
     }
 }
 
@@ -18083,6 +18083,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_profile_walk_forward_order_handles_mixed_eligibility_without_cycles() {
+        let gate_pass =
+            fixed_profile_walk_forward_result_for_order("gate_pass", true, 100.0, 0.10, 10);
+        let profitable_thin = fixed_profile_walk_forward_result_for_order(
+            "profitable_thin",
+            false,
+            200.0,
+            -999_999.0,
+            2,
+        );
+        let eligible_loss =
+            fixed_profile_walk_forward_result_for_order("eligible_loss", true, -50.0, 0.30, 10);
+
+        let mut fixed = vec![eligible_loss, profitable_thin, gate_pass];
+        fixed.sort_by(fixed_profile_walk_forward_result_order);
+
+        assert_eq!(fixed[0].profile.name, "gate_pass");
+        assert_eq!(fixed[1].profile.name, "profitable_thin");
+        assert_eq!(fixed[2].profile.name, "eligible_loss");
+    }
+
+    #[test]
     fn fixed_profile_walk_forward_requires_recent_closed_training_activity() {
         let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
@@ -18544,6 +18566,33 @@ mod tests {
             profile,
             candidates: trades.len(),
             trades,
+            metrics,
+        }
+    }
+
+    fn fixed_profile_walk_forward_result_for_order(
+        name: &str,
+        ranking_eligible: bool,
+        total_pnl: f64,
+        score: f64,
+        trades: usize,
+    ) -> FixedProfileWalkForwardResult {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut profile = ResearchProfile::legacy_baseline();
+        profile.name = name.to_owned();
+        let mut metrics = metrics(&[], from, to);
+        metrics.ranking_eligible = ranking_eligible;
+        metrics.trades = trades;
+        metrics.total_pnl = total_pnl;
+        metrics.score = score;
+        FixedProfileWalkForwardResult {
+            detector_strategy: detector_strategy_summary(&profile),
+            execution_strategy: execution_strategy_summary(&profile),
+            profile,
+            active_years: 0,
+            years: Vec::new(),
+            trades: Vec::new(),
             metrics,
         }
     }
