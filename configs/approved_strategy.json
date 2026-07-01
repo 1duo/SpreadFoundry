@@ -1,5 +1,5 @@
 {
-  "strategy_id": "weekly_selector_relaxed_trade5_ddog_20260701",
+  "strategy_id": "weekly_selector_relaxed_trade5_ddog_dell_rblx_20260701",
   "profile_name": "selector_crash_put_and_costaware_call_debits_only",
   "research_from": "2010-01-01",
   "live_detector_lookback_days": 30,
@@ -23,7 +23,9 @@
     "NET",
     "ANET",
     "CRWD",
-    "DDOG"
+    "DDOG",
+    "DELL",
+    "RBLX"
   ],
   "portfolio_constraints": {
     "capital_budget": 7897.67,
@@ -40,9 +42,9 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "canary_approved",
-    "approved_at": "2026-07-01T14:27:48Z",
+    "approved_at": "2026-07-01T17:41:10Z",
     "approved_by": "operator",
-    "reason": "Relaxed-gate DDOG debit-spread selector from runs/portfolio-weekly-selector-research-20260701T142520.495816000Z is a full_promotion_candidate after the production gate moved to a 5-trade new-symbol floor, 20% research DD cap, and 12% canary capital-DD cap. The run used the approved basket plus DDOG and produced 2317 trades, 127386 PnL, 69461 $25-cost PnL, 1.85 profit factor, 36.94% win rate, 4.94% capital DD on the 100k research budget, 10.22% $25-cost capital DD, 46.0% max symbol PnL share from TSLA, 20 symbol-ablation passes, and 1 strategy-ablation pass. Promotion comparison passed versus the current approved baseline runs/portfolio-weekly-selector-research-20260701T133838.229475000Z: $25-cost PnL improved by 355 over the 69106 baseline. DDOG contributes 36 direct trades, 1150 raw PnL, and 250 $25-cost PnL; remove_symbol:DDOG reverts to the prior approved baseline. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
+    "reason": "Combined DELL/RBLX debit-spread selector from runs/portfolio-weekly-selector-research-20260701T173703.287741000Z-p26851-s0 is a full_promotion_candidate using the approved basket plus DELL and RBLX. The run produced 2354 trades, 140521 raw PnL, 81671 $25-cost PnL, 1.96 profit factor, 38.11% win rate, 5.02% capital DD on the 100k research budget, 10.39% $25-cost capital DD, 41.2% max symbol PnL share from TSLA, 22 symbol-ablation passes, and 1 strategy-ablation pass. Recent-regime validation passed with 959 trailing trades, 56042 $25-cost PnL, and 8.17% $25-cost capital DD. Promotion comparison passed versus runs/portfolio-weekly-selector-research-20260701T160109.973313000Z-p22793-s0: $25-cost PnL improved by 12500 over the 69171 baseline. DELL contributes 71 direct trades, 3362 raw PnL, and 1587 $25-cost PnL; RBLX contributes 82 direct trades, 7674 raw PnL, and 5624 $25-cost PnL. Both active sleeves remain profitable: put debit spreads contributed 52414 raw PnL and call debit spreads contributed 88107 raw PnL. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
     "source_canary_status": "full_promotion_candidate",
     "max_order_max_loss": 1000.0
   }
