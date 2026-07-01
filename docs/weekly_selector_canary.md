@@ -1064,6 +1064,22 @@ Check current canary status:
 cargo run --quiet -- portfolio-canary-status --candidate candidates/weekly_selector_canary.json
 ```
 
+## 2026-07-01 Relaxed Gate Refresh
+
+The selector promotion gates were relaxed to support a broader opportunity search without changing live order risk controls:
+
+- Weekly cadence ranking now requires `18` trades/year, subject to the existing absolute floor of `10` trades.
+- The research risk-normalized drawdown cap is now `15%`.
+- The canary capital drawdown cap is now `10%`.
+
+The same-code baseline run `runs/portfolio-weekly-selector-research-20260701T133838.229475000Z` kept the current production basket as the reference: `2284` trades, `126206` raw PnL, `69106` $25-cost PnL, `1.85` profit factor, `5.59%` capital drawdown, and `10.58%` $25-cost capital drawdown.
+
+SMCI was rechecked after fixing warm-cache DuckDB lock contention and expanding coverage to `39` complete put/call windows. The +SMCI run `runs/portfolio-weekly-selector-research-20260701T134042.726689000Z` improved headline PnL to `126519` and $25-cost PnL to `69419`, but SMCI contributed only `1` direct trade and `257` raw PnL. Treat that as a one-trade artifact, not production promotion evidence.
+
+The broader relaxed candidate basket `QCOM,RIVN,RKLB,APP,VRT,UBER,SMCI` was rejected in `runs/portfolio-weekly-selector-research-20260701T134356.656707000Z`: it increased activity to `2339` trades but reduced raw PnL to `125063` and $25-cost PnL to `66588`. Direct contributions were not robust after friction: `QCOM` added `19` trades / `271` raw PnL, `RIVN` `24` / `146`, `APP` `11` / `-880`, `RKLB` `4` / `-232`, `SMCI` `1` / `257`, `UBER` `20` / `-174`, and `VRT` `2` / `-459`.
+
+Professional decision: keep the current COIN-approved production basket. The relaxed gates are useful for search, but new symbols still need to improve the current after-cost baseline with enough direct trades to avoid single-allocation overfit.
+
 Require an actionable signal before any canary action:
 
 ```sh

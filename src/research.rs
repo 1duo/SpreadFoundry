@@ -31,11 +31,11 @@ use rust_decimal::Decimal;
 const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
-const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 26.0;
+const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 18.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
-const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.10;
-const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.075;
+const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.15;
+const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.10;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
@@ -2117,7 +2117,7 @@ async fn warm_symbol_option_cache_coverage(
             let window_timeout_seconds = request.window_timeout_seconds;
             let option_side = request.option_side;
             async move {
-                warm_option_cache_window_with_timeout(
+                fetch_option_cache_window_with_timeout(
                     &symbol,
                     &raw_dir,
                     candidate,
@@ -2128,7 +2128,8 @@ async fn warm_symbol_option_cache_coverage(
                 .await
             }
         });
-        let chunk_windows = join_all(futures).await;
+        let chunk_fetches = join_all(futures).await;
+        let chunk_windows = warm_option_cache_windows_after_fetch(symbol, &raw_dir, chunk_fetches);
         if request.progress {
             let completed = chunk_windows
                 .iter()
@@ -2205,52 +2206,52 @@ async fn warm_symbol_option_cache_coverage(
     }
 }
 
-async fn warm_option_cache_window_with_timeout(
+#[derive(Clone, Debug)]
+struct WarmOptionCacheFetchResult {
+    candidate: WarmOptionCacheCandidate,
+    load_error: Option<String>,
+}
+
+async fn fetch_option_cache_window_with_timeout(
     symbol: &str,
     raw_dir: &Path,
     candidate: WarmOptionCacheCandidate,
     force_refresh: bool,
     window_timeout_seconds: u64,
     option_side: WarmOptionCacheSide,
-) -> WarmOptionCacheCoverageWindow {
+) -> WarmOptionCacheFetchResult {
     if window_timeout_seconds == 0 {
-        return warm_option_cache_window(symbol, raw_dir, candidate, force_refresh, option_side)
+        return fetch_option_cache_window(symbol, raw_dir, candidate, force_refresh, option_side)
             .await;
     }
 
-    let expiration = candidate.expiration;
-    let start = candidate.start;
-    let end = candidate.end;
-    let put_complete_before = candidate.put_complete_before;
-    let call_complete_before = candidate.call_complete_before;
     match timeout(
         StdDuration::from_secs(window_timeout_seconds),
-        warm_option_cache_window(symbol, raw_dir, candidate, force_refresh, option_side),
+        fetch_option_cache_window(
+            symbol,
+            raw_dir,
+            candidate.clone(),
+            force_refresh,
+            option_side,
+        ),
     )
     .await
     {
-        Ok(window) => window,
-        Err(_) => WarmOptionCacheCoverageWindow {
-            expiration,
-            start,
-            end,
-            put_complete_before,
-            call_complete_before,
-            put_complete_after: put_complete_before,
-            call_complete_after: call_complete_before,
-            both_complete_after: put_complete_before && call_complete_before,
-            error: Some(format!("window timed out after {window_timeout_seconds}s")),
+        Ok(result) => result,
+        Err(_) => WarmOptionCacheFetchResult {
+            candidate,
+            load_error: Some(format!("window timed out after {window_timeout_seconds}s")),
         },
     }
 }
 
-async fn warm_option_cache_window(
+async fn fetch_option_cache_window(
     symbol: &str,
     raw_dir: &Path,
     candidate: WarmOptionCacheCandidate,
     force_refresh: bool,
     option_side: WarmOptionCacheSide,
-) -> WarmOptionCacheCoverageWindow {
+) -> WarmOptionCacheFetchResult {
     let load_error = load_expiration_rows_for_mode_with_cache_mode(
         symbol,
         candidate.expiration,
@@ -2265,36 +2266,67 @@ async fn warm_option_cache_window(
     .err()
     .map(|error| compact_error_message(&format!("{error:#}")));
 
-    let mut store_error = None;
-    let _ = research_store::sync_cache_windows_for_symbol(symbol, raw_dir)
-        .map_err(|error| store_error = Some(compact_error_message(&format!("{error:#}"))));
-    let put_complete_after = duckdb_cache_complete(
-        symbol,
-        candidate.expiration,
-        candidate.start,
-        candidate.end,
-        OptionRight::Put,
-        &mut store_error,
-    );
-    let call_complete_after = duckdb_cache_complete(
-        symbol,
-        candidate.expiration,
-        candidate.start,
-        candidate.end,
-        OptionRight::Call,
-        &mut store_error,
-    );
-    WarmOptionCacheCoverageWindow {
-        expiration: candidate.expiration,
-        start: candidate.start,
-        end: candidate.end,
-        put_complete_before: candidate.put_complete_before,
-        call_complete_before: candidate.call_complete_before,
-        put_complete_after,
-        call_complete_after,
-        both_complete_after: put_complete_after && call_complete_after,
-        error: load_error.or(store_error),
+    WarmOptionCacheFetchResult {
+        candidate,
+        load_error,
     }
+}
+
+fn warm_option_cache_windows_after_fetch(
+    symbol: &str,
+    raw_dir: &Path,
+    fetches: Vec<WarmOptionCacheFetchResult>,
+) -> Vec<WarmOptionCacheCoverageWindow> {
+    let mut store_error = None;
+    let store = open_symbol_cache_store_for_coverage(symbol, raw_dir, &mut store_error);
+    fetches
+        .into_iter()
+        .map(|fetch| {
+            let candidate = fetch.candidate;
+            let mut coverage_error = None;
+            let (put_complete_after, call_complete_after) = if let Some(store) = store.as_ref() {
+                (
+                    duckdb_cache_complete_with_store(
+                        Some(store),
+                        symbol,
+                        candidate.expiration,
+                        candidate.start,
+                        candidate.end,
+                        OptionRight::Put,
+                        &mut coverage_error,
+                    ),
+                    duckdb_cache_complete_with_store(
+                        Some(store),
+                        symbol,
+                        candidate.expiration,
+                        candidate.start,
+                        candidate.end,
+                        OptionRight::Call,
+                        &mut coverage_error,
+                    ),
+                )
+            } else {
+                (
+                    candidate.put_complete_before,
+                    candidate.call_complete_before,
+                )
+            };
+            WarmOptionCacheCoverageWindow {
+                expiration: candidate.expiration,
+                start: candidate.start,
+                end: candidate.end,
+                put_complete_before: candidate.put_complete_before,
+                call_complete_before: candidate.call_complete_before,
+                put_complete_after,
+                call_complete_after,
+                both_complete_after: put_complete_after && call_complete_after,
+                error: fetch
+                    .load_error
+                    .or(coverage_error)
+                    .or_else(|| store_error.clone()),
+            }
+        })
+        .collect()
 }
 
 fn warm_option_data_mode(option_side: WarmOptionCacheSide) -> OptionDataMode {
@@ -2315,17 +2347,6 @@ fn warm_side_complete(
         WarmOptionCacheSide::Call => call_complete,
         WarmOptionCacheSide::PutAndCall => put_complete && call_complete,
     }
-}
-
-fn duckdb_cache_complete(
-    symbol: &str,
-    expiration: NaiveDate,
-    start: NaiveDate,
-    end: NaiveDate,
-    option_right: OptionRight,
-    error: &mut Option<String>,
-) -> bool {
-    duckdb_cache_complete_with_store(None, symbol, expiration, start, end, option_right, error)
 }
 
 fn duckdb_cache_complete_with_store(
@@ -14547,7 +14568,7 @@ mod tests {
             (NaiveDate::from_ymd_opt(2024, 4, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 7, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2024, 10, 10).unwrap(), 1_000.0),
-            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_300.0),
+            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_900.0),
             (NaiveDate::from_ymd_opt(2025, 3, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 5, 10).unwrap(), 1_000.0),
             (NaiveDate::from_ymd_opt(2025, 9, 10).unwrap(), 1_000.0),
@@ -14574,7 +14595,7 @@ mod tests {
         assert_eq!(status, "blocked");
         assert!(!pass);
         assert!(reason.contains("drawdown gate failed"));
-        assert!(reason.contains("versus cap 10.00%"));
+        assert!(reason.contains("versus cap 15.00%"));
     }
 
     #[test]
@@ -15016,7 +15037,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_profiles_require_one_trade_every_two_weeks_for_ranking() {
+    fn weekly_profiles_require_about_one_trade_every_three_weeks_for_ranking() {
         let profile = ResearchProfile::weekly_baseline();
         let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
@@ -15031,7 +15052,7 @@ mod tests {
             profile.min_trades_per_year,
             MIN_WEEKLY_RANKING_TRADES_PER_YEAR
         );
-        assert_eq!(metrics.required_trades, 13);
+        assert_eq!(metrics.required_trades, 10);
         assert!(!metrics.ranking_eligible);
     }
 
