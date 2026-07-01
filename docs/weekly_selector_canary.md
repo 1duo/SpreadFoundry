@@ -1080,6 +1080,8 @@ The broader relaxed candidate basket `QCOM,RIVN,RKLB,APP,VRT,UBER,SMCI` was reje
 
 The promotion comparison is now first-class in `research-portfolio-selector` via `--promotion-baseline-run`. Re-running the same basket in `runs/portfolio-weekly-selector-research-20260701T135425.822721000Z` with the approved baseline run blocked promotion automatically: canary readiness fell to `canary_only`, promotion status was `blocked`, and $25-cost PnL was `66588` versus the baseline `69106`. The new-symbol checks also exposed the exact failure modes: `QCOM`, `RIVN`, `APP`, and `UBER` were negative after $25/trade; `RKLB`, `SMCI`, and `VRT` did not meet the `10` direct-trade floor.
 
+The next gated tech/semi basket `AMZN,GOOGL,MSTR,MU,NVDA` was rejected in `runs/portfolio-weekly-selector-research-20260701T135801.594424000Z`. It selected `selector_put_legguard15_and_balanced_call_debits_only`, but only produced `2033` trades, `72216` raw PnL, `21391` $25-cost PnL, `1.57` profit factor, and promotion status `blocked` versus the `69106` baseline. `NVDA` had enough direct trades (`113`) but was still negative after $25/trade (`-231`), while `AMZN`, `GOOGL`, and `MU` were sparse and negative; `MSTR` did not contribute to the best profile. This keeps NVDA as a data/structure research problem, not a portfolio promotion candidate.
+
 Professional decision: keep the current COIN-approved production basket. The relaxed gates are useful for search, but new symbols still need to improve the current after-cost baseline with enough direct trades to avoid single-allocation overfit.
 
 Require an actionable signal before any canary action:
