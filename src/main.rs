@@ -375,6 +375,8 @@ enum Commands {
         max_expirations: Option<usize>,
         #[arg(long, default_value_t = 8)]
         max_windows_per_symbol: usize,
+        #[arg(long, default_value_t = false)]
+        recent_first: bool,
         #[arg(long, default_value_t = 2)]
         fetch_concurrency: usize,
         #[arg(long, default_value_t = DEFAULT_WARM_OPTION_CACHE_WINDOW_TIMEOUT_SECONDS)]
@@ -1177,6 +1179,7 @@ async fn main() -> Result<()> {
             to,
             max_expirations,
             max_windows_per_symbol,
+            recent_first,
             fetch_concurrency,
             window_timeout_seconds,
             force_refresh,
@@ -1196,6 +1199,7 @@ async fn main() -> Result<()> {
                 to,
                 max_expirations,
                 max_windows_per_symbol,
+                recent_first,
                 fetch_concurrency,
                 force_refresh,
                 window_timeout_seconds,
@@ -11051,6 +11055,7 @@ mod tests {
             "80",
             "--max-windows-per-symbol",
             "6",
+            "--recent-first",
             "--fetch-concurrency",
             "2",
             "--window-timeout-seconds",
@@ -11066,6 +11071,7 @@ mod tests {
                 to,
                 max_expirations,
                 max_windows_per_symbol,
+                recent_first,
                 fetch_concurrency,
                 window_timeout_seconds,
                 json,
@@ -11076,6 +11082,7 @@ mod tests {
                 assert_eq!(to.to_string(), "2026-06-28");
                 assert_eq!(max_expirations, Some(80));
                 assert_eq!(max_windows_per_symbol, 6);
+                assert!(recent_first);
                 assert_eq!(fetch_concurrency, 2);
                 assert_eq!(window_timeout_seconds, 45);
                 assert!(json);

@@ -191,6 +191,7 @@ pub struct WarmOptionCacheCoverageRequest {
     pub to: NaiveDate,
     pub max_expirations: Option<usize>,
     pub max_windows_per_symbol: usize,
+    pub recent_first: bool,
     pub fetch_concurrency: usize,
     pub force_refresh: bool,
     pub window_timeout_seconds: u64,
@@ -2050,6 +2051,9 @@ async fn warm_symbol_option_cache_coverage(
                 call_complete_before,
             });
         }
+    }
+    if request.recent_first {
+        candidates.reverse();
     }
     candidates.truncate(request.max_windows_per_symbol);
     drop(store);
