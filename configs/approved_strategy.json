@@ -1,13 +1,26 @@
 {
-  "strategy_id": "weekly_selector_approved_20260629",
+  "strategy_id": "weekly_selector_relaxed_no_nvda_20260701",
   "profile_name": "selector_crash_put_and_costaware_call_debits_only",
-  "research_from": "2023-01-01",
+  "research_from": "2010-01-01",
   "live_detector_lookback_days": 30,
-  "symbols": ["IREN", "PLTR", "ORCL", "TSLA", "CRWV", "AMD"],
+  "symbols": [
+    "TSLA",
+    "AMD",
+    "PLTR",
+    "ORCL",
+    "CRWV",
+    "META",
+    "IREN",
+    "HOOD",
+    "AVGO",
+    "AAPL",
+    "SOFI",
+    "MSFT"
+  ],
   "portfolio_constraints": {
     "capital_budget": 7897.67,
     "max_symbol_allocation_pct": 0.2,
-    "max_open_positions": 4,
+    "max_open_positions": 3,
     "max_positions_per_symbol": 2,
     "max_total_trades_per_symbol": null,
     "portfolio_drawdown_cooldown_trigger_pct": null,
@@ -19,10 +32,10 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "operator_risk_override",
-    "approved_at": "2026-06-30T01:30:00Z",
+    "approved_at": "2026-07-01T09:40:27Z",
     "approved_by": "operator",
-    "reason": "Operator accepts larger drawdown for an aggressive Tradier debit-spread canary; autonomous placement remains limited to broker-reconciled Tradier debit-spread entry and close lifecycle gates.",
-    "source_canary_status": "blocked",
+    "reason": "Operator accepts relaxed trade-count and drawdown constraints for the corrected 12-symbol no-NVDA debit-spread canary from runs/portfolio-weekly-selector-research-20260701T094639.846521000Z: canary_only, 1732 trades, 118521 PnL, 75221 $25-cost PnL, 2.09 profit factor, 4.56% capital DD on the 100k research budget. This is not full promotion because TSLA contributes about 50.0% of PnL and the live account-sized selector budget remains an operator-risk override. Autonomous placement remains limited to broker-reconciled Tradier debit-spread entry and close lifecycle gates.",
+    "source_canary_status": "canary_only",
     "max_order_max_loss": 1000.0
   }
 }

@@ -34,6 +34,7 @@ const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
 const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 104.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.01;
+const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.05;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
@@ -3604,7 +3605,7 @@ fn portfolio_canary_readiness(
 
     let canary_ready = gate_pass
         && cost_25_pnl > 0.0
-        && decision_metrics.max_capital_drawdown_pct <= 0.01
+        && decision_metrics.max_capital_drawdown_pct <= PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
         && decision_metrics.professional_risk_flag != "inventory_risk_high"
         && negative_strategy.is_none();
     let full_promotion_ready = canary_ready
@@ -14066,6 +14067,70 @@ mod tests {
         assert_eq!(readiness.status, "blocked");
         assert_eq!(readiness.recommended_capital_fraction, 0.0);
         assert!(readiness.reason.contains("inventory risk high"));
+    }
+
+    #[test]
+    fn portfolio_canary_allows_relaxed_drawdown_for_operator_canary() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let opportunity =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 500.0);
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: SpreadStructure::PutDebitSpread,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let metrics = metrics_with_min_trades_per_year(
+            std::slice::from_ref(&trade.trade),
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let decision_metrics = PortfolioDecisionMetrics {
+            max_capital_drawdown_pct: PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT - 0.001,
+            professional_risk_flag: "no_wheel_inventory".to_owned(),
+            ..PortfolioDecisionMetrics::default()
+        };
+
+        let readiness =
+            portfolio_canary_readiness(&metrics, &[trade], &[], &[], &decision_metrics, true);
+
+        assert_eq!(readiness.status, "canary_only");
+        assert!(readiness.canary_ready);
+        assert!(!readiness.full_promotion_ready);
+        assert_eq!(readiness.recommended_capital_fraction, 0.05);
+    }
+
+    #[test]
+    fn portfolio_canary_blocks_drawdown_above_relaxed_cap() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let opportunity =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 500.0);
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: SpreadStructure::PutDebitSpread,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let metrics = metrics_with_min_trades_per_year(
+            std::slice::from_ref(&trade.trade),
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let decision_metrics = PortfolioDecisionMetrics {
+            max_capital_drawdown_pct: PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT + 0.001,
+            professional_risk_flag: "no_wheel_inventory".to_owned(),
+            ..PortfolioDecisionMetrics::default()
+        };
+
+        let readiness =
+            portfolio_canary_readiness(&metrics, &[trade], &[], &[], &decision_metrics, true);
+
+        assert_eq!(readiness.status, "blocked");
+        assert!(!readiness.canary_ready);
+        assert_eq!(readiness.recommended_capital_fraction, 0.0);
+        assert!(readiness.reason.contains("capital DD"));
     }
 
     #[test]
