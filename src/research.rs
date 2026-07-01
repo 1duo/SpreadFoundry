@@ -3932,7 +3932,16 @@ fn portfolio_signal_quality_metrics(
         .find(|stress| (stress.per_trade_cost - 25.0).abs() < f64::EPSILON)
         .cloned()
         .unwrap_or_else(|| cost_stress_metric(&portfolio_research_trades(trades), 25.0));
-    let (gate_status, gate_pass, gate_reason) = portfolio_wheel_gate(metrics, capital_budget);
+    let (mut gate_status, mut gate_pass, mut gate_reason) =
+        portfolio_wheel_gate(metrics, capital_budget);
+    if gate_pass && cost_25.total_pnl <= 0.0 {
+        gate_status = "blocked".to_owned();
+        gate_pass = false;
+        gate_reason = format!(
+            "uncapped signal $25 cost PnL {:.2} is not positive",
+            cost_25.total_pnl
+        );
+    }
     PortfolioSignalQualityMetrics {
         trades: metrics.trades,
         required_trades: metrics.required_trades,
@@ -4561,6 +4570,19 @@ fn portfolio_wheel_profile_order(
             }
         })
         .then_with(|| b.signal_quality.gate_pass.cmp(&a.signal_quality.gate_pass))
+        .then_with(|| {
+            (b.signal_quality.cost_25_pnl > 0.0).cmp(&(a.signal_quality.cost_25_pnl > 0.0))
+        })
+        .then_with(|| {
+            b.signal_recent_regime
+                .pass
+                .cmp(&a.signal_recent_regime.pass)
+        })
+        .then_with(|| {
+            b.signal_quality
+                .cost_25_pnl
+                .total_cmp(&a.signal_quality.cost_25_pnl)
+        })
         .then_with(|| {
             b.signal_quality
                 .robust_ranking_eligible
@@ -14725,6 +14747,45 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_signal_quality_blocks_negative_cost_25_signal_pnl() {
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let mut research_trades = Vec::new();
+        for year in 2020..=2024 {
+            for month in 1..=10 {
+                research_trades.push(trade_with_entry_exit(
+                    NaiveDate::from_ymd_opt(year, month, 1).unwrap(),
+                    NaiveDate::from_ymd_opt(year, month, 8).unwrap(),
+                    20.0,
+                ));
+            }
+        }
+        let metrics = metrics_with_min_trades_per_year(&research_trades, from, to, 4.0);
+        let signal_trades = research_trades
+            .iter()
+            .map(|trade| PortfolioWheelTrade {
+                symbol: "TSLA".to_owned(),
+                strategy: SpreadStructure::PutDebitSpread,
+                capital_at_risk: trade.max_loss,
+                trade: trade.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let base_gate = portfolio_wheel_gate(&metrics, 100_000.0);
+        let signal_quality = portfolio_signal_quality_metrics(&signal_trades, &metrics, 100_000.0);
+
+        assert!(base_gate.1, "base gate failed: {}", base_gate.2);
+        assert_eq!(signal_quality.cost_25_pnl, -250.0);
+        assert!(!signal_quality.gate_pass);
+        assert_eq!(signal_quality.gate_status, "blocked");
+        assert!(
+            signal_quality
+                .gate_reason
+                .contains("uncapped signal $25 cost PnL -250.00 is not positive")
+        );
+    }
+
+    #[test]
     fn portfolio_risk_summary_attributes_wheel_inventory_losses() {
         let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let to_trade = |opportunity: PortfolioWheelOpportunity| PortfolioWheelTrade {
@@ -16611,6 +16672,27 @@ mod tests {
 
         assert_eq!(results[0].profile.name, "signal_leader");
         assert!(results[0].metrics.score < results[1].metrics.score);
+    }
+
+    #[test]
+    fn portfolio_ranking_prefers_cost_positive_signal_when_gate_is_blocked() {
+        let mut raw_score_leader =
+            portfolio_profile_result_for_order("raw_score_leader", 0.40, 0.40, false, false);
+        raw_score_leader.signal_quality.score = 0.40;
+        raw_score_leader.signal_quality.robust_score = 0.40;
+        raw_score_leader.signal_quality.cost_25_pnl = -100.0;
+
+        let mut cost_positive =
+            portfolio_profile_result_for_order("cost_positive", 0.10, 0.10, false, false);
+        cost_positive.signal_quality.score = 0.10;
+        cost_positive.signal_quality.robust_score = 0.10;
+        cost_positive.signal_quality.cost_25_pnl = 100.0;
+        cost_positive.signal_recent_regime.pass = true;
+
+        let mut results = [raw_score_leader, cost_positive];
+        results.sort_by(portfolio_wheel_profile_order);
+
+        assert_eq!(results[0].profile.name, "cost_positive");
     }
 
     #[test]
