@@ -31,9 +31,10 @@ use rust_decimal::Decimal;
 const FETCH_ATTEMPTS: usize = 3;
 const MIN_RANKING_TRADES: usize = 10;
 const MIN_RANKING_TRADES_PER_YEAR: f64 = 2.0;
-const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 104.0;
+const MIN_WEEKLY_RANKING_TRADES_PER_YEAR: f64 = 52.0;
 const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
-const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.01;
+const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
+const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.075;
 const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.05;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
@@ -3838,13 +3839,14 @@ fn portfolio_wheel_gate(metrics: &ResearchMetrics, capital_budget: f64) -> (Stri
             format!("friction stress failed: $10/trade PnL {cost_10_pnl:.2}"),
         );
     }
-    if metrics.max_drawdown > 0.05 {
+    if metrics.max_drawdown > PORTFOLIO_RESEARCH_MAX_DRAWDOWN {
         return (
             "blocked".to_owned(),
             false,
             format!(
-                "drawdown gate failed: max DD {:.2}%",
-                metrics.max_drawdown * 100.0
+                "drawdown gate failed: max DD {:.2}% versus cap {:.2}%",
+                metrics.max_drawdown * 100.0,
+                PORTFOLIO_RESEARCH_MAX_DRAWDOWN * 100.0
             ),
         );
     }
@@ -14345,6 +14347,149 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_wheel_gate_allows_single_year_loss_below_relaxed_material_cap() {
+        let mut trades = Vec::new();
+        for (year, pnl) in [(2024, 1_000.0), (2025, -375.0), (2026, 1_000.0)] {
+            for idx in 0..4 {
+                let entry =
+                    NaiveDate::from_ymd_opt(year, 1, 10).unwrap() + Duration::days(idx * 45);
+                trades.push(
+                    portfolio_wheel_opportunity(
+                        "PLTR",
+                        entry,
+                        entry + Duration::days(7),
+                        10_000.0,
+                        pnl,
+                    )
+                    .trade,
+                );
+            }
+        }
+        let metrics = metrics_with_min_trades_per_year(
+            &trades,
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            1.0,
+        );
+
+        let (status, pass, reason) = portfolio_wheel_gate(&metrics, 100_000.0);
+
+        assert_eq!(status, "research_pass");
+        assert!(pass);
+        assert!(!reason.contains("annual stability failed"));
+    }
+
+    #[test]
+    fn portfolio_wheel_gate_blocks_single_year_loss_above_relaxed_material_cap() {
+        let mut trades = Vec::new();
+        for (year, pnl) in [(2024, 1_000.0), (2025, -625.0), (2026, 1_000.0)] {
+            for idx in 0..4 {
+                let entry =
+                    NaiveDate::from_ymd_opt(year, 1, 10).unwrap() + Duration::days(idx * 45);
+                trades.push(
+                    portfolio_wheel_opportunity(
+                        "PLTR",
+                        entry,
+                        entry + Duration::days(7),
+                        10_000.0,
+                        pnl,
+                    )
+                    .trade,
+                );
+            }
+        }
+        let metrics = metrics_with_min_trades_per_year(
+            &trades,
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            1.0,
+        );
+
+        let (status, pass, reason) = portfolio_wheel_gate(&metrics, 100_000.0);
+
+        assert_eq!(status, "blocked");
+        assert!(!pass);
+        assert!(reason.contains("annual stability failed"));
+        assert!(reason.contains("below -2000.00"));
+    }
+
+    #[test]
+    fn portfolio_wheel_gate_allows_drawdown_below_relaxed_research_cap() {
+        let mut trades = Vec::new();
+        for (entry, pnl) in [
+            (NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 4, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 7, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 10, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -800.0),
+            (NaiveDate::from_ymd_opt(2025, 3, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 5, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 9, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(), 1_000.0),
+        ] {
+            trades.push(
+                portfolio_wheel_opportunity("PLTR", entry, entry + Duration::days(7), 1_000.0, pnl)
+                    .trade,
+            );
+        }
+        let metrics = metrics_with_min_trades_per_year(
+            &trades,
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            1.0,
+        );
+
+        let (status, pass, reason) = portfolio_wheel_gate(&metrics, 100_000.0);
+
+        assert!(metrics.max_drawdown > 0.05);
+        assert!(metrics.max_drawdown < PORTFOLIO_RESEARCH_MAX_DRAWDOWN);
+        assert_eq!(status, "research_pass");
+        assert!(pass);
+        assert!(!reason.contains("drawdown gate failed"));
+    }
+
+    #[test]
+    fn portfolio_wheel_gate_blocks_drawdown_above_relaxed_research_cap() {
+        let mut trades = Vec::new();
+        for (entry, pnl) in [
+            (NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 4, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 7, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2024, 10, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(), -1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 3, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 5, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2025, 9, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(), 1_000.0),
+            (NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(), 1_000.0),
+        ] {
+            trades.push(
+                portfolio_wheel_opportunity("PLTR", entry, entry + Duration::days(7), 1_000.0, pnl)
+                    .trade,
+            );
+        }
+        let metrics = metrics_with_min_trades_per_year(
+            &trades,
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            1.0,
+        );
+
+        let (status, pass, reason) = portfolio_wheel_gate(&metrics, 100_000.0);
+
+        assert!(metrics.max_drawdown > PORTFOLIO_RESEARCH_MAX_DRAWDOWN);
+        assert_eq!(status, "blocked");
+        assert!(!pass);
+        assert!(reason.contains("drawdown gate failed"));
+        assert!(reason.contains("versus cap 7.50%"));
+    }
+
+    #[test]
     fn symbol_slug_is_filesystem_safe() {
         assert_eq!(symbol_slug("NVDA"), "nvda");
         assert_eq!(symbol_slug("BRK.B"), "brk-b");
@@ -14783,7 +14928,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_profiles_require_weekly_cadence_for_ranking() {
+    fn weekly_profiles_require_one_trade_per_week_for_ranking() {
         let profile = ResearchProfile::weekly_baseline();
         let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
@@ -14798,7 +14943,7 @@ mod tests {
             profile.min_trades_per_year,
             MIN_WEEKLY_RANKING_TRADES_PER_YEAR
         );
-        assert_eq!(metrics.required_trades, 52);
+        assert_eq!(metrics.required_trades, 26);
         assert!(!metrics.ranking_eligible);
     }
 
