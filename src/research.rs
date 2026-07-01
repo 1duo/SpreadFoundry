@@ -2990,8 +2990,13 @@ fn portfolio_wheel_opportunities_for_symbol(
     }
 
     let mut opportunities = Vec::new();
-    for (_date, mut day_candidates) in by_date {
+    let mut next_entry_date = NaiveDate::MIN;
+    for (date, mut day_candidates) in by_date {
+        if date < next_entry_date {
+            continue;
+        }
         if risk_regime_cooldown_triggered(&day_candidates, profile) {
+            next_entry_date = next_entry_date_after_risk_regime(date, profile);
             continue;
         }
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
@@ -3045,8 +3050,13 @@ fn portfolio_spread_opportunities_for_symbol(
     }
 
     let mut opportunities = Vec::new();
-    for (_date, mut day_candidates) in by_date {
+    let mut next_entry_date = NaiveDate::MIN;
+    for (date, mut day_candidates) in by_date {
+        if date < next_entry_date {
+            continue;
+        }
         if risk_regime_cooldown_triggered(&day_candidates, profile) {
+            next_entry_date = next_entry_date_after_risk_regime(date, profile);
             continue;
         }
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
@@ -6314,6 +6324,12 @@ fn portfolio_selector_profiles() -> Vec<PortfolioSelectorProfile> {
     let call_costaware_micro60 = profile_with_max_trade_loss(call_costaware, "maxloss60", 60.0);
     let put_crash_micro40 = profile_with_max_trade_loss(put_crash, "maxloss40", 40.0);
     let call_costaware_micro40 = profile_with_max_trade_loss(call_costaware, "maxloss40", 40.0);
+    let call_balanced_trendbreak_guard =
+        profile_with_trend_drawdown_guard(call_balanced_costaware, "trendguard05dd04", 0.05, 0.04);
+    let put_legguard_15_maxloss200 =
+        profile_with_max_trade_loss(put_legguard_15, "maxloss200", 200.0);
+    let call_balanced_trendbreak_guard_maxloss200 =
+        profile_with_max_trade_loss(&call_balanced_trendbreak_guard, "maxloss200", 200.0);
 
     vec![
         selector_profile_with_credit(
@@ -6523,6 +6539,18 @@ fn portfolio_selector_profiles() -> Vec<PortfolioSelectorProfile> {
             None,
             Some(put_legguard_15),
             Some(call_balanced_costaware),
+        ),
+        selector_profile(
+            "selector_put_legguard15_and_trendguard_balanced_call_debits_only",
+            None,
+            Some(put_legguard_15),
+            Some(&call_balanced_trendbreak_guard),
+        ),
+        selector_profile(
+            "selector_maxloss200_put_legguard15_and_trendguard_balanced_call_debits_only",
+            None,
+            Some(&put_legguard_15_maxloss200),
+            Some(&call_balanced_trendbreak_guard_maxloss200),
         ),
         selector_profile(
             "selector_disciplined_put_and_call_legguard15_debits_only",
@@ -6878,6 +6906,21 @@ fn profile_with_max_trade_loss(
     let mut profile = profile.clone();
     profile.name = format!("{}_{}", profile.name, suffix);
     profile.max_trade_max_loss = Some(max_loss);
+    profile
+}
+
+fn profile_with_trend_drawdown_guard(
+    profile: &ResearchProfile,
+    suffix: &str,
+    min_return: f64,
+    max_drawdown: f64,
+) -> ResearchProfile {
+    let mut profile = profile.clone();
+    profile.name = format!("{}_{}", profile.name, suffix);
+    profile.trend_drawdown_guard = Some(TrendDrawdownGuard {
+        min_underlying_return: min_return,
+        max_underlying_drawdown: max_drawdown,
+    });
     profile
 }
 
@@ -13267,6 +13310,12 @@ mod tests {
         assert!(names.contains(&"selector_legguard15_debits_only"));
         assert!(names.contains(&"selector_legguard18_debits_only"));
         assert!(names.contains(&"selector_put_legguard15_and_balanced_call_debits_only"));
+        assert!(
+            names.contains(&"selector_put_legguard15_and_trendguard_balanced_call_debits_only")
+        );
+        assert!(names.contains(
+            &"selector_maxloss200_put_legguard15_and_trendguard_balanced_call_debits_only"
+        ));
         assert!(names.contains(&"selector_disciplined_put_and_call_legguard15_debits_only"));
         assert!(names.contains(&"selector_no_tsla_put_disciplined_call_legguard15_debits_only"));
         assert!(names.contains(&"selector_disciplined_debits_only"));
@@ -13357,6 +13406,49 @@ mod tests {
             &no_tsla_puts.call_debit_symbols,
             "TSLA"
         ));
+
+        let trendguard_balanced = profiles
+            .iter()
+            .find(|profile| {
+                profile.summary_profile.name
+                    == "selector_put_legguard15_and_trendguard_balanced_call_debits_only"
+            })
+            .unwrap();
+        assert_eq!(
+            trendguard_balanced
+                .call_debit_profile
+                .as_ref()
+                .unwrap()
+                .trend_drawdown_guard,
+            Some(TrendDrawdownGuard {
+                min_underlying_return: 0.05,
+                max_underlying_drawdown: 0.04,
+            })
+        );
+
+        let maxloss_trendguard = profiles
+            .iter()
+            .find(|profile| {
+                profile.summary_profile.name
+                    == "selector_maxloss200_put_legguard15_and_trendguard_balanced_call_debits_only"
+            })
+            .unwrap();
+        assert_eq!(
+            maxloss_trendguard
+                .put_debit_profile
+                .as_ref()
+                .unwrap()
+                .max_trade_max_loss,
+            Some(200.0)
+        );
+        assert_eq!(
+            maxloss_trendguard
+                .call_debit_profile
+                .as_ref()
+                .unwrap()
+                .max_trade_max_loss,
+            Some(200.0)
+        );
 
         let side_selective = profiles
             .iter()
@@ -13556,6 +13648,95 @@ mod tests {
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].strategy, SpreadStructure::PutCreditSpread);
         assert!((opportunities[0].trade.pnl - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn portfolio_spread_opportunities_honor_risk_regime_cooldown_days() {
+        let risk_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let skipped_date = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let eligible_date = NaiveDate::from_ymd_opt(2026, 1, 22).unwrap();
+        let exit_date = eligible_date + Duration::days(1);
+        let expiration = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let mut profile = ResearchProfile::weekly_baseline();
+        profile.structure = SpreadStructure::PutCreditSpread;
+        profile.min_dte = 1;
+        profile.max_dte = 30;
+        profile.min_short_delta_abs = 0.10;
+        profile.max_short_delta_abs = 0.35;
+        profile.max_width = 10.0;
+        profile.min_credit_width = 0.05;
+        profile.trend_lookback_days = Some(2);
+        profile.drawdown_lookback_days = Some(2);
+        profile.min_underlying_return = None;
+        profile.max_underlying_return = None;
+        profile.min_underlying_drawdown = None;
+        profile.max_underlying_drawdown = None;
+        profile.risk_regime_cooldown_guard = Some(TrendDrawdownGuard {
+            min_underlying_return: 0.30,
+            max_underlying_drawdown: 0.05,
+        });
+        profile.risk_regime_cooldown_days = 10;
+        profile.realized_vol_lookback_days = None;
+        profile.max_realized_vol = None;
+        profile.min_short_otm_pct = None;
+
+        let mut rows = Vec::new();
+        let add_underlying_marker = |rows: &mut Vec<OptionDay>, date, underlying| {
+            rows.push(option_day(date, 1.0, 0.01, 0.02, -0.01, underlying));
+        };
+        let add_candidate_day = |rows: &mut Vec<OptionDay>, date, underlying| {
+            rows.push(option_day(date, 100.0, 1.20, 1.30, -0.25, underlying));
+            rows.push(option_day(date, 95.0, 0.30, 0.35, -0.15, underlying));
+        };
+        add_underlying_marker(&mut rows, risk_date - Duration::days(2), 100.0);
+        add_underlying_marker(&mut rows, risk_date - Duration::days(1), 150.0);
+        add_candidate_day(&mut rows, risk_date, 130.0);
+        add_underlying_marker(&mut rows, skipped_date - Duration::days(2), 125.0);
+        add_underlying_marker(&mut rows, skipped_date - Duration::days(1), 128.0);
+        add_candidate_day(&mut rows, skipped_date, 127.0);
+        add_underlying_marker(&mut rows, eligible_date - Duration::days(2), 126.0);
+        add_underlying_marker(&mut rows, eligible_date - Duration::days(1), 128.0);
+        add_candidate_day(&mut rows, eligible_date, 127.0);
+        rows.push(option_day(exit_date, 100.0, 0.10, 0.20, -0.20, 129.0));
+        rows.push(option_day(exit_date, 95.0, 0.02, 0.05, -0.10, 129.0));
+
+        let mut put_rows_by_expiration = BTreeMap::new();
+        put_rows_by_expiration.insert(expiration, rows);
+        let put_lookup = build_lookup(&put_rows_by_expiration);
+        let data = PortfolioWheelSymbolData {
+            summary: PortfolioWheelLoadedSymbol {
+                symbol: "NVDA".to_owned(),
+                requested_from: risk_date,
+                from: risk_date,
+                to: exit_date,
+                expirations_discovered: 1,
+                expirations_skipped_before_data: 0,
+                expirations_loaded: 1,
+                put_expirations_loaded: 1,
+                call_expirations_loaded: 0,
+                rows_loaded: 12,
+                expirations_failed: 0,
+                expiration_load_failures: Vec::new(),
+            },
+            put_rows_by_expiration,
+            call_rows_by_expiration: BTreeMap::new(),
+            call_rows_by_date: BTreeMap::new(),
+            put_lookup,
+            call_lookup: HashMap::new(),
+            call_underlying_by_date: BTreeMap::new(),
+        };
+
+        let (opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
+            &data,
+            &profile,
+            risk_date,
+            eligible_date,
+            SpreadStructure::PutCreditSpread,
+        );
+
+        assert_eq!(candidates, 3);
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities[0].trade.entry_date, eligible_date);
     }
 
     #[test]
