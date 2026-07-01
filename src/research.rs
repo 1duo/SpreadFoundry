@@ -601,6 +601,8 @@ pub struct ResearchProfile {
     #[serde(default)]
     pub min_debit: Option<f64>,
     pub max_debit_width: Option<f64>,
+    #[serde(default)]
+    pub max_trade_max_loss: Option<f64>,
     pub max_quote_width_pct_of_mid: f64,
     pub max_quote_width_abs: f64,
     pub min_short_oi: u32,
@@ -658,6 +660,7 @@ impl ResearchProfile {
             min_credit_width: 0.20,
             min_debit: None,
             max_debit_width: None,
+            max_trade_max_loss: None,
             max_quote_width_pct_of_mid: 0.10,
             max_quote_width_abs: 0.10,
             min_short_oi: 500,
@@ -713,6 +716,7 @@ impl ResearchProfile {
             min_credit_width: 0.20,
             min_debit: None,
             max_debit_width: None,
+            max_trade_max_loss: None,
             max_quote_width_pct_of_mid: 0.10,
             max_quote_width_abs: 0.10,
             min_short_oi: 500,
@@ -774,6 +778,7 @@ impl ResearchProfile {
             min_credit_width: 0.15,
             min_debit: None,
             max_debit_width: None,
+            max_trade_max_loss: None,
             max_quote_width_pct_of_mid: 0.15,
             max_quote_width_abs: 0.20,
             min_short_oi: 100,
@@ -4474,6 +4479,9 @@ fn detector_filters(profile: &ResearchProfile) -> Vec<String> {
     if let Some(min_long_short_iv_diff) = profile.min_long_short_iv_diff {
         filters.push(format!("long_short_iv_diff>={min_long_short_iv_diff:.4}"));
     }
+    if let Some(max_trade_max_loss) = profile.max_trade_max_loss {
+        filters.push(format!("max_trade_max_loss<={max_trade_max_loss:.0}"));
+    }
     if profile.covered_call_min_strike_pct_of_assigned
         < default_covered_call_min_strike_pct() - f64::EPSILON
     {
@@ -4668,6 +4676,7 @@ fn profile_complexity(profile: &ResearchProfile) -> usize {
         &profile.min_long_short_iv_diff,
         &baseline.min_long_short_iv_diff,
     );
+    complexity += option_complexity(&profile.max_trade_max_loss, &baseline.max_trade_max_loss);
     complexity += option_complexity(
         &profile.low_delta_width_cap_delta_abs,
         &baseline.low_delta_width_cap_delta_abs,
@@ -6254,6 +6263,12 @@ fn portfolio_selector_profiles() -> Vec<PortfolioSelectorProfile> {
         &call_debit_profiles,
         "weekly_call_debit_legguard_outerdelta18_dte3_10_w20_delta20_45_mindebit30_minw5_debit45_take50",
     );
+    let put_crash_micro80 = profile_with_max_trade_loss(put_crash, "maxloss80", 80.0);
+    let call_costaware_micro80 = profile_with_max_trade_loss(call_costaware, "maxloss80", 80.0);
+    let put_crash_micro60 = profile_with_max_trade_loss(put_crash, "maxloss60", 60.0);
+    let call_costaware_micro60 = profile_with_max_trade_loss(call_costaware, "maxloss60", 60.0);
+    let put_crash_micro40 = profile_with_max_trade_loss(put_crash, "maxloss40", 40.0);
+    let call_costaware_micro40 = profile_with_max_trade_loss(call_costaware, "maxloss40", 40.0);
 
     vec![
         selector_profile_with_credit(
@@ -6397,6 +6412,24 @@ fn portfolio_selector_profiles() -> Vec<PortfolioSelectorProfile> {
             None,
             Some(put_crash),
             Some(call_costaware),
+        ),
+        selector_profile(
+            "selector_micro80_crash_put_and_costaware_call_debits_only",
+            None,
+            Some(&put_crash_micro80),
+            Some(&call_costaware_micro80),
+        ),
+        selector_profile(
+            "selector_micro60_crash_put_and_costaware_call_debits_only",
+            None,
+            Some(&put_crash_micro60),
+            Some(&call_costaware_micro60),
+        ),
+        selector_profile(
+            "selector_micro40_crash_put_and_costaware_call_debits_only",
+            None,
+            Some(&put_crash_micro40),
+            Some(&call_costaware_micro40),
         ),
         selector_profile(
             "selector_drawdown_put_and_call_debits_only",
@@ -6790,6 +6823,17 @@ fn profile_named<'a>(profiles: &'a [ResearchProfile], name: &str) -> &'a Researc
         .iter()
         .find(|profile| profile.name == name)
         .unwrap_or_else(|| panic!("missing research profile {name}"))
+}
+
+fn profile_with_max_trade_loss(
+    profile: &ResearchProfile,
+    suffix: &str,
+    max_loss: f64,
+) -> ResearchProfile {
+    let mut profile = profile.clone();
+    profile.name = format!("{}_{}", profile.name, suffix);
+    profile.max_trade_max_loss = Some(max_loss);
+    profile
 }
 
 fn research_profiles() -> Vec<ResearchProfile> {
@@ -9489,6 +9533,12 @@ fn primary_leg_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
         && iv_allowed(row, profile)
 }
 
+fn max_trade_loss_allowed(max_loss_per_share: f64, profile: &ResearchProfile) -> bool {
+    profile
+        .max_trade_max_loss
+        .is_none_or(|max_loss| max_loss_per_share * 100.0 <= max_loss + 1e-9)
+}
+
 fn generate_put_credit_candidates_for_day(
     expiration: NaiveDate,
     date: NaiveDate,
@@ -9533,6 +9583,9 @@ fn generate_put_credit_candidates_for_day(
             }
             let max_loss = width - credit;
             if max_loss <= 0.0 {
+                continue;
+            }
+            if !max_trade_loss_allowed(max_loss, profile) {
                 continue;
             }
             candidates.push(Candidate {
@@ -9604,6 +9657,9 @@ fn generate_call_credit_candidates_for_day(
             if max_loss <= 0.0 {
                 continue;
             }
+            if !max_trade_loss_allowed(max_loss, profile) {
+                continue;
+            }
             candidates.push(Candidate {
                 structure: SpreadStructure::CallCreditSpread,
                 entry_date: date,
@@ -9654,6 +9710,9 @@ fn generate_wheel_put_candidates_for_day(
         }
         let max_loss = cash_secured_put_max_loss_per_share(short.strike, credit);
         if max_loss <= 0.0 {
+            continue;
+        }
+        if !max_trade_loss_allowed(max_loss, profile) {
             continue;
         }
         let credit_width = credit / short.strike;
@@ -9728,6 +9787,9 @@ fn generate_put_debit_candidates_for_day(
             if debit / width > max_debit_width {
                 continue;
             }
+            if !max_trade_loss_allowed(debit, profile) {
+                continue;
+            }
             let max_profit = width - debit;
             if max_profit <= 0.0 {
                 continue;
@@ -9799,6 +9861,9 @@ fn generate_call_debit_candidates_for_day(
                 continue;
             }
             if debit / width > max_debit_width {
+                continue;
+            }
+            if !max_trade_loss_allowed(debit, profile) {
                 continue;
             }
             let max_profit = width - debit;
@@ -12631,6 +12696,39 @@ mod tests {
         profile.max_short_leg_delta_abs = Some(0.20);
         assert!(
             generate_candidates(&rows_by_expiration, &profile, entry_date, entry_date).is_empty()
+        );
+    }
+
+    #[test]
+    fn weekly_debit_candidate_respects_max_trade_loss_cap() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
+        let expiration = entry_date + Duration::days(11);
+        let mut profile = ResearchProfile::weekly_put_debit_baseline();
+        profile.trend_lookback_days = None;
+        profile.min_underlying_return = None;
+        profile.drawdown_lookback_days = None;
+        profile.max_underlying_drawdown = None;
+        profile.realized_vol_lookback_days = None;
+        profile.max_realized_vol = None;
+
+        let mut rows_by_expiration = BTreeMap::new();
+        rows_by_expiration.insert(
+            expiration,
+            vec![
+                option_day(entry_date, 100.0, 4.20, 4.40, -0.45, 105.0),
+                option_day(entry_date, 95.0, 2.00, 2.15, -0.25, 105.0),
+            ],
+        );
+
+        profile.max_trade_max_loss = Some(239.0);
+        assert!(
+            generate_candidates(&rows_by_expiration, &profile, entry_date, entry_date).is_empty()
+        );
+
+        profile.max_trade_max_loss = Some(240.0);
+        assert_eq!(
+            generate_candidates(&rows_by_expiration, &profile, entry_date, entry_date).len(),
+            1
         );
     }
 
