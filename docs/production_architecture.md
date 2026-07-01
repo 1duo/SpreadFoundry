@@ -50,7 +50,10 @@ capital, symbol allocation, open-position caps, and cooldowns. The optional
 multi-year research gates, recent-regime drawdown gates, and ablation gates.
 Selector reports therefore distinguish gate-normalized drawdown from
 account-budget-normalized drawdown; live/account heat is still controlled by
-the portfolio constraints, not by the research-gate denominator.
+the portfolio constraints, not by the research-gate denominator. Canary
+readiness requires both gate-normalized and account-budget-normalized drawdown
+to stay inside the canary drawdown cap, including the `$25/trade`
+friction-stressed account drawdown.
 Signal refresh uses `research_from` from the approved strategy for
 approval/research runs, so production does not silently drift onto a different
 research window. Live signal refresh may also set `live_detector_lookback_days`;

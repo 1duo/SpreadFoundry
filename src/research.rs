@@ -4009,10 +4009,12 @@ fn portfolio_canary_readiness(
         .iter()
         .find(|summary| summary.pnl < 0.0)
         .map(|summary| summary.strategy.clone());
+    let account_drawdown_block = portfolio_account_drawdown_block_reason(decision_metrics);
 
     let canary_ready = gate_pass
         && cost_25_pnl > 0.0
         && decision_metrics.max_capital_drawdown_pct <= PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
+        && account_drawdown_block.is_none()
         && decision_metrics.professional_risk_flag != "inventory_risk_high"
         && recent_regime.pass
         && negative_strategy.is_none();
@@ -4025,7 +4027,7 @@ fn portfolio_canary_readiness(
         (
             "full_promotion_candidate",
             0.25,
-            "research gate, friction stress, drawdown, symbol concentration, and ablation resilience passed"
+            "research gate, friction stress, gate/account drawdown, symbol concentration, and ablation resilience passed"
                 .to_owned(),
         )
     } else if canary_ready {
@@ -4060,6 +4062,8 @@ fn portfolio_canary_readiness(
                     "canary blocked: recent regime failed: {}",
                     recent_regime.reason
                 )
+            } else if let Some(reason) = account_drawdown_block {
+                reason
             } else {
                 format!(
                     "canary blocked: gate_pass={}, $25 cost PnL {:.2}, capital DD {:.2}%",
@@ -4083,6 +4087,30 @@ fn portfolio_canary_readiness(
         strategy_ablation_passes,
         cost_25_pnl,
     }
+}
+
+fn portfolio_account_drawdown_block_reason(
+    decision_metrics: &PortfolioDecisionMetrics,
+) -> Option<String> {
+    if decision_metrics.max_capital_drawdown_pct_account_budget
+        > PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
+    {
+        return Some(format!(
+            "canary blocked: account-budget capital DD {:.2}% exceeds canary cap {:.2}%",
+            decision_metrics.max_capital_drawdown_pct_account_budget * 100.0,
+            PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT * 100.0
+        ));
+    }
+    if decision_metrics.cost_25_max_capital_drawdown_pct_account_budget
+        > PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
+    {
+        return Some(format!(
+            "canary blocked: $25 account-budget capital DD {:.2}% exceeds canary cap {:.2}%",
+            decision_metrics.cost_25_max_capital_drawdown_pct_account_budget * 100.0,
+            PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT * 100.0
+        ));
+    }
+    None
 }
 
 fn portfolio_promotion_readiness(
@@ -14822,6 +14850,50 @@ mod tests {
         assert!(!readiness.canary_ready);
         assert_eq!(readiness.recommended_capital_fraction, 0.0);
         assert!(readiness.reason.contains("capital DD"));
+    }
+
+    #[test]
+    fn portfolio_canary_blocks_account_budget_drawdown_above_cap() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let opportunity =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 500.0);
+        let trade = PortfolioWheelTrade {
+            symbol: opportunity.symbol,
+            strategy: SpreadStructure::PutDebitSpread,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade,
+        };
+        let metrics = metrics_with_min_trades_per_year(
+            std::slice::from_ref(&trade.trade),
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let decision_metrics = PortfolioDecisionMetrics {
+            max_capital_drawdown_pct: PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT - 0.001,
+            max_capital_drawdown_pct_account_budget: PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT
+                - 0.001,
+            cost_25_max_capital_drawdown_pct_account_budget:
+                PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT + 0.001,
+            professional_risk_flag: "no_wheel_inventory".to_owned(),
+            ..PortfolioDecisionMetrics::default()
+        };
+
+        let readiness = portfolio_canary_readiness(
+            &metrics,
+            &[trade],
+            &[],
+            &[],
+            &decision_metrics,
+            &portfolio_recent_regime_test_pass(),
+            true,
+            &portfolio_promotion_test_pass(),
+        );
+
+        assert_eq!(readiness.status, "blocked");
+        assert!(!readiness.canary_ready);
+        assert_eq!(readiness.recommended_capital_fraction, 0.0);
+        assert!(readiness.reason.contains("$25 account-budget capital DD"));
     }
 
     #[test]
