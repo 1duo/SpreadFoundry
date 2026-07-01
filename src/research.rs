@@ -420,6 +420,14 @@ pub struct PortfolioWheelProfileResult {
     pub profile: ResearchProfile,
     pub metrics: ResearchMetrics,
     #[serde(default)]
+    pub signal_quality: PortfolioSignalQualityMetrics,
+    #[serde(default)]
+    pub signal_recent_regime: PortfolioRecentRegimeMetrics,
+    #[serde(default)]
+    pub signal_recent_regime_score: f64,
+    #[serde(default)]
+    pub signal_recency_adjusted_score: f64,
+    #[serde(default)]
     pub recent_regime_score: f64,
     #[serde(default)]
     pub recency_adjusted_score: f64,
@@ -454,6 +462,28 @@ pub struct PortfolioWheelProfileResult {
     pub promotion_readiness: PortfolioPromotionReadiness,
     #[serde(default)]
     pub latest_actions: Vec<PortfolioLatestAction>,
+    pub gate_status: String,
+    pub gate_pass: bool,
+    pub gate_reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PortfolioSignalQualityMetrics {
+    pub trades: usize,
+    pub required_trades: usize,
+    pub trades_per_year: f64,
+    pub total_pnl: f64,
+    pub cost_25_pnl: f64,
+    pub win_rate: f64,
+    pub cost_25_win_rate: f64,
+    pub profit_factor: f64,
+    pub cost_25_profit_factor: f64,
+    pub max_drawdown: f64,
+    pub max_closed_equity_drawdown: f64,
+    pub cost_25_max_closed_equity_drawdown: f64,
+    pub score: f64,
+    pub robust_score: f64,
+    pub robust_ranking_eligible: bool,
     pub gate_status: String,
     pub gate_pass: bool,
     pub gate_reason: String,
@@ -2746,12 +2776,31 @@ async fn run_portfolio_research(
                 request.to,
                 &request,
             );
+            let signal_trades = portfolio_signal_trades(&simulation.opportunities);
+            let signal_research_trades = portfolio_research_trades(&signal_trades);
+            let signal_metrics = metrics_with_min_trades_per_year(
+                &signal_research_trades,
+                from,
+                request.to,
+                MIN_WEEKLY_RANKING_TRADES_PER_YEAR,
+            );
+            let signal_quality = portfolio_signal_quality_metrics(
+                &signal_trades,
+                &signal_metrics,
+                research_gate_capital_budget,
+            );
+            let signal_recent_regime = portfolio_recent_regime_metrics(
+                &signal_trades,
+                from,
+                request.to,
+                research_gate_capital_budget,
+            );
+            let signal_recent_regime_score =
+                portfolio_recent_regime_score(&signal_recent_regime, research_gate_capital_budget);
+            let signal_recency_adjusted_score =
+                portfolio_recency_adjusted_score(&signal_metrics, signal_recent_regime_score);
             let allocation = simulation.allocation;
-            let research_trades = allocation
-                .trades
-                .iter()
-                .map(|trade| trade.trade.clone())
-                .collect::<Vec<_>>();
+            let research_trades = portfolio_research_trades(&allocation.trades);
             let metrics = metrics_with_min_trades_per_year(
                 &research_trades,
                 from,
@@ -2816,6 +2865,10 @@ async fn run_portfolio_research(
             PortfolioWheelProfileResult {
                 profile: selector_profile.summary_profile,
                 metrics,
+                signal_quality,
+                signal_recent_regime,
+                signal_recent_regime_score,
+                signal_recency_adjusted_score,
                 recent_regime_score,
                 recency_adjusted_score,
                 trades: allocation.trades.clone(),
@@ -3850,6 +3903,58 @@ fn portfolio_recent_regime_metrics(
     }
 }
 
+fn portfolio_signal_trades(
+    opportunities: &[PortfolioWheelOpportunity],
+) -> Vec<PortfolioWheelTrade> {
+    opportunities
+        .iter()
+        .map(|opportunity| PortfolioWheelTrade {
+            symbol: opportunity.symbol.clone(),
+            strategy: opportunity.strategy,
+            capital_at_risk: opportunity.capital_at_risk,
+            trade: opportunity.trade.clone(),
+        })
+        .collect()
+}
+
+fn portfolio_research_trades(trades: &[PortfolioWheelTrade]) -> Vec<ResearchTrade> {
+    trades.iter().map(|trade| trade.trade.clone()).collect()
+}
+
+fn portfolio_signal_quality_metrics(
+    trades: &[PortfolioWheelTrade],
+    metrics: &ResearchMetrics,
+    capital_budget: f64,
+) -> PortfolioSignalQualityMetrics {
+    let cost_25 = metrics
+        .cost_stress
+        .iter()
+        .find(|stress| (stress.per_trade_cost - 25.0).abs() < f64::EPSILON)
+        .cloned()
+        .unwrap_or_else(|| cost_stress_metric(&portfolio_research_trades(trades), 25.0));
+    let (gate_status, gate_pass, gate_reason) = portfolio_wheel_gate(metrics, capital_budget);
+    PortfolioSignalQualityMetrics {
+        trades: metrics.trades,
+        required_trades: metrics.required_trades,
+        trades_per_year: metrics.trades_per_year,
+        total_pnl: metrics.total_pnl,
+        cost_25_pnl: cost_25.total_pnl,
+        win_rate: metrics.win_rate,
+        cost_25_win_rate: cost_25.win_rate,
+        profit_factor: metrics.profit_factor,
+        cost_25_profit_factor: cost_25.profit_factor,
+        max_drawdown: metrics.max_drawdown,
+        max_closed_equity_drawdown: portfolio_closed_equity_drawdown(trades, 0.0),
+        cost_25_max_closed_equity_drawdown: portfolio_closed_equity_drawdown(trades, 25.0),
+        score: metrics.score,
+        robust_score: metrics.robust_score,
+        robust_ranking_eligible: metrics.robust_ranking_eligible,
+        gate_status,
+        gate_pass,
+        gate_reason,
+    }
+}
+
 fn positive_denominator_ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator > 0.0 {
         numerator / denominator
@@ -4443,24 +4548,36 @@ fn portfolio_wheel_profile_order(
     a: &PortfolioWheelProfileResult,
     b: &PortfolioWheelProfileResult,
 ) -> Ordering {
-    let a_recency_eligible = a.gate_pass && a.recent_regime.pass;
-    let b_recency_eligible = b.gate_pass && b.recent_regime.pass;
-    b_recency_eligible.cmp(&a_recency_eligible).then_with(|| {
-        if a_recency_eligible && b_recency_eligible {
-            b.recency_adjusted_score
-                .total_cmp(&a.recency_adjusted_score)
-                .then_with(|| b.metrics.score.total_cmp(&a.metrics.score))
-                .then_with(|| b.metrics.robust_score.total_cmp(&a.metrics.robust_score))
-                .then_with(|| {
-                    risk_regime_cooldown_tiebreak_score(&b.profile)
-                        .cmp(&risk_regime_cooldown_tiebreak_score(&a.profile))
-                })
-                .then_with(|| profile_complexity(&a.profile).cmp(&profile_complexity(&b.profile)))
-                .then_with(|| a.profile.name.cmp(&b.profile.name))
-        } else {
-            profile_rank_order(&a.metrics, &a.profile, &b.metrics, &b.profile)
-        }
-    })
+    let a_signal_recency_eligible = a.signal_quality.gate_pass && a.signal_recent_regime.pass;
+    let b_signal_recency_eligible = b.signal_quality.gate_pass && b.signal_recent_regime.pass;
+    b_signal_recency_eligible
+        .cmp(&a_signal_recency_eligible)
+        .then_with(|| {
+            if a_signal_recency_eligible && b_signal_recency_eligible {
+                b.signal_recency_adjusted_score
+                    .total_cmp(&a.signal_recency_adjusted_score)
+            } else {
+                Ordering::Equal
+            }
+        })
+        .then_with(|| b.signal_quality.gate_pass.cmp(&a.signal_quality.gate_pass))
+        .then_with(|| {
+            b.signal_quality
+                .robust_ranking_eligible
+                .cmp(&a.signal_quality.robust_ranking_eligible)
+        })
+        .then_with(|| b.signal_quality.score.total_cmp(&a.signal_quality.score))
+        .then_with(|| {
+            b.signal_quality
+                .robust_score
+                .total_cmp(&a.signal_quality.robust_score)
+        })
+        .then_with(|| {
+            risk_regime_cooldown_tiebreak_score(&b.profile)
+                .cmp(&risk_regime_cooldown_tiebreak_score(&a.profile))
+        })
+        .then_with(|| profile_complexity(&a.profile).cmp(&profile_complexity(&b.profile)))
+        .then_with(|| a.profile.name.cmp(&b.profile.name))
 }
 
 fn normalize_portfolio_symbols(symbols: &[String]) -> Vec<String> {
@@ -4523,7 +4640,7 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
         .research_gate_capital_budget
         .unwrap_or(report.capital_budget);
     out.push_str(&format!(
-        "- Run: `{}`\n- Symbols: `{}`\n- Window: `{}` to `{}`\n- Capital budget: `${:.0}`\n- Research gate capital budget: `${:.0}`\n- Max symbol allocation: `{:.0}%`\n- Max open positions: `{}`\n- Max positions per symbol: `{}`\n- Portfolio DD cooldown: `{}`\n- Symbol DD cooldown: `{}`\n\n",
+        "- Run: `{}`\n- Symbols: `{}`\n- Window: `{}` to `{}`\n- Capital budget: `${:.0}`\n- Research gate capital budget: `${:.0}`\n- Max symbol allocation: `{:.0}%`\n- Max open positions: `{}`\n- Max positions per symbol: `{}`\n- Portfolio DD cooldown: `{}`\n- Symbol DD cooldown: `{}`\n- Ranking basis: `uncapped signal quality before portfolio allocator caps`; allocation/canary metrics remain account-constrained\n\n",
         report.run_id,
         report.symbols.join(","),
         report.from,
@@ -4567,18 +4684,11 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     out.push('\n');
 
     out.push_str("## Top Profiles\n\n");
-    out.push_str("| Rank | Profile | Gate | Recent | Adj Score | Hist Score | Recent Score | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Gate DD | Account DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
+    out.push_str("| Rank | Profile | Signal Gate | Signal Recent | Signal Adj Score | Signal Score | Signal Trades | Signal Req | Signal/Yr | Signal $25 PnL | Signal PF | Alloc Gate | Alloc Trades | Alloc PnL | Alloc PF | Gate DD | Account DD | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
     out.push_str(
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for (idx, result) in report.profiles.iter().take(10).enumerate() {
-        let cost_10_pnl = result
-            .metrics
-            .cost_stress
-            .iter()
-            .find(|stress| (stress.per_trade_cost - 10.0).abs() < f64::EPSILON)
-            .map(|stress| stress.total_pnl)
-            .unwrap_or(result.metrics.total_pnl);
         let rejected = result.rejected_capital_budget
             + result.rejected_symbol_allocation
             + result.rejected_open_positions
@@ -4617,26 +4727,27 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             .filter(|trade| trade.strategy == SpreadStructure::CallDebitSpread)
             .count();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {:.2} | {:.2} | {:.2} | {} | {} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
             idx + 1,
             result.profile.name,
+            result.signal_quality.gate_status,
+            result.signal_recent_regime.status,
+            result.signal_recency_adjusted_score,
+            result.signal_quality.score,
+            result.signal_quality.trades,
+            result.signal_quality.required_trades,
+            result.signal_quality.trades_per_year,
+            result.signal_quality.cost_25_pnl,
+            result.signal_quality.profit_factor,
             result.gate_status,
-            result.recent_regime.status,
-            result.recency_adjusted_score,
-            result.metrics.score,
-            result.recent_regime_score,
             result.metrics.trades,
-            result.metrics.required_trades,
-            result.metrics.trades_per_year,
             result.metrics.total_pnl,
             result.metrics.profit_factor,
-            result.metrics.max_drawdown * 100.0,
             result.decision_metrics.max_capital_drawdown_pct * 100.0,
             result
                 .decision_metrics
                 .max_capital_drawdown_pct_account_budget
                 * 100.0,
-            cost_10_pnl,
             result.recent_regime.cost_25_pnl,
             wheel_trades,
             put_debit_trades,
@@ -4685,10 +4796,22 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     if let Some(best) = report.profiles.first() {
         out.push_str("## Best Profile Detail\n\n");
         out.push_str(&format!(
-            "- Profile: `{}`\n- Gate: `{}` ({})\n- Max capital used: `${:.0}`\n- Avg capital used on entry: `${:.0}`\n- Capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- $25 cost capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- Rejected capital budget: `{}`\n- Rejected symbol allocation: `{}`\n- Rejected open positions: `{}`\n- Rejected symbol positions: `{}`\n- Rejected symbol total trades: `{}`\n- Rejected portfolio DD cooldown: `{}`\n- Rejected symbol DD cooldown: `{}`\n\n",
+            "- Profile: `{}`\n- Signal gate: `{}` ({})\n- Signal recent regime: `{}` ({})\n- Signal trades: `{}` (`{:.2}`/yr), required `{}`\n- Signal raw PnL: `{:.2}`\n- Signal $25 cost PnL: `{:.2}`\n- Signal profit factor: `{:.2}`\n- Signal $25 closed-equity drawdown: `${:.0}`\n- Allocation gate: `{}` ({})\n- Accepted allocation trades: `{}`\n- Max capital used: `${:.0}`\n- Avg capital used on entry: `${:.0}`\n- Capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- $25 cost capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- Rejected capital budget: `{}`\n- Rejected symbol allocation: `{}`\n- Rejected open positions: `{}`\n- Rejected symbol positions: `{}`\n- Rejected symbol total trades: `{}`\n- Rejected portfolio DD cooldown: `{}`\n- Rejected symbol DD cooldown: `{}`\n\n",
             best.profile.name,
+            best.signal_quality.gate_status,
+            best.signal_quality.gate_reason,
+            best.signal_recent_regime.status,
+            best.signal_recent_regime.reason,
+            best.signal_quality.trades,
+            best.signal_quality.trades_per_year,
+            best.signal_quality.required_trades,
+            best.signal_quality.total_pnl,
+            best.signal_quality.cost_25_pnl,
+            best.signal_quality.profit_factor,
+            best.signal_quality.cost_25_max_closed_equity_drawdown,
             best.gate_status,
             best.gate_reason,
+            best.metrics.trades,
             best.max_capital_used,
             best.avg_capital_used_on_entry,
             best.decision_metrics.max_capital_drawdown,
@@ -14562,6 +14685,46 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_signal_quality_ignores_open_position_allocator_caps() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let capped_request = portfolio_wheel_test_request(100_000.0, 1.0, 1, 1);
+        let uncapped_request = portfolio_wheel_test_request(100_000.0, 1.0, 5, 5);
+        let opportunities = vec![
+            portfolio_wheel_opportunity("IREN", entry, entry + Duration::days(7), 10_000.0, 600.0),
+            portfolio_wheel_opportunity("PLTR", entry, entry + Duration::days(7), 10_000.0, 500.0),
+            portfolio_wheel_opportunity(
+                "IREN",
+                entry + Duration::days(1),
+                entry + Duration::days(8),
+                10_000.0,
+                400.0,
+            ),
+        ];
+
+        let capped_allocation =
+            allocate_portfolio_wheel_opportunities(&opportunities, 3, &capped_request);
+        let uncapped_allocation =
+            allocate_portfolio_wheel_opportunities(&opportunities, 3, &uncapped_request);
+        let signal_trades = portfolio_signal_trades(&opportunities);
+        let signal_research_trades = portfolio_research_trades(&signal_trades);
+        let signal_metrics = metrics_with_min_trades_per_year(
+            &signal_research_trades,
+            entry,
+            entry + Duration::days(30),
+            1.0,
+        );
+        let signal_quality =
+            portfolio_signal_quality_metrics(&signal_trades, &signal_metrics, 100_000.0);
+
+        assert_eq!(capped_allocation.trades.len(), 1);
+        assert_eq!(uncapped_allocation.trades.len(), 3);
+        assert!(capped_allocation.rejected_open_positions > 0);
+        assert_eq!(signal_quality.trades, 3);
+        assert!((signal_quality.total_pnl - 1_500.0).abs() < 1e-9);
+        assert!((signal_quality.cost_25_pnl - 1_425.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn portfolio_risk_summary_attributes_wheel_inventory_losses() {
         let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let to_trade = |opportunity: PortfolioWheelOpportunity| PortfolioWheelTrade {
@@ -16427,6 +16590,27 @@ mod tests {
         results.sort_by(portfolio_wheel_profile_order);
 
         assert_eq!(results[0].profile.name, "deployable");
+    }
+
+    #[test]
+    fn portfolio_ranking_prefers_uncapped_signal_quality_over_allocated_cap_luck() {
+        let mut allocated_leader =
+            portfolio_profile_result_for_order("allocated_leader", 0.40, 0.40, true, true);
+        allocated_leader.signal_quality.score = 0.05;
+        allocated_leader.signal_quality.robust_score = 0.05;
+        allocated_leader.signal_recency_adjusted_score = 0.05;
+
+        let mut signal_leader =
+            portfolio_profile_result_for_order("signal_leader", 0.10, 0.10, true, true);
+        signal_leader.signal_quality.score = 0.30;
+        signal_leader.signal_quality.robust_score = 0.30;
+        signal_leader.signal_recency_adjusted_score = 0.30;
+
+        let mut results = [allocated_leader, signal_leader];
+        results.sort_by(portfolio_wheel_profile_order);
+
+        assert_eq!(results[0].profile.name, "signal_leader");
+        assert!(results[0].metrics.score < results[1].metrics.score);
     }
 
     #[test]
@@ -18772,9 +18956,46 @@ mod tests {
         metrics.robust_ranking_eligible = true;
         let recency_adjusted_score =
             portfolio_recency_adjusted_score(&metrics, recent_regime_score);
+        let signal_quality = PortfolioSignalQualityMetrics {
+            trades: metrics.trades,
+            required_trades: metrics.required_trades,
+            trades_per_year: metrics.trades_per_year,
+            total_pnl: metrics.total_pnl,
+            cost_25_pnl: metrics.total_pnl,
+            win_rate: metrics.win_rate,
+            cost_25_win_rate: metrics.win_rate,
+            profit_factor: metrics.profit_factor,
+            cost_25_profit_factor: metrics.profit_factor,
+            max_drawdown: metrics.max_drawdown,
+            score: history_score,
+            robust_score: history_score,
+            robust_ranking_eligible: true,
+            gate_status: if gate_pass {
+                "research_pass"
+            } else {
+                "blocked"
+            }
+            .to_owned(),
+            gate_pass,
+            gate_reason: "test signal gate".to_owned(),
+            ..PortfolioSignalQualityMetrics::default()
+        };
         PortfolioWheelProfileResult {
             profile,
             metrics,
+            signal_quality,
+            signal_recent_regime: PortfolioRecentRegimeMetrics {
+                status: if recent_regime_pass {
+                    "pass"
+                } else {
+                    "blocked"
+                }
+                .to_owned(),
+                pass: recent_regime_pass,
+                ..PortfolioRecentRegimeMetrics::default()
+            },
+            signal_recent_regime_score: recent_regime_score,
+            signal_recency_adjusted_score: recency_adjusted_score,
             recent_regime_score,
             recency_adjusted_score,
             trades: Vec::new(),

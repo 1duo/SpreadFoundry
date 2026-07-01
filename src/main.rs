@@ -1504,11 +1504,14 @@ async fn main() -> Result<()> {
             .await?;
             if let Some(best) = report.profiles.first() {
                 println!(
-                    "best={} trades={} pnl={:.2} score={:.4} gate={}",
+                    "best={} signal_trades={} signal_pnl={:.2} signal_score={:.4} signal_gate={} alloc_trades={} alloc_pnl={:.2} alloc_gate={}",
                     best.profile.name,
+                    best.signal_quality.trades,
+                    best.signal_quality.total_pnl,
+                    best.signal_quality.score,
+                    best.signal_quality.gate_status,
                     best.metrics.trades,
                     best.metrics.total_pnl,
-                    best.metrics.score,
                     best.gate_status
                 );
             }
@@ -1645,11 +1648,14 @@ async fn main() -> Result<()> {
             };
             if let Some(best) = report.profiles.first() {
                 println!(
-                    "best={} trades={} pnl={:.2} score={:.4} gate={}",
+                    "best={} signal_trades={} signal_pnl={:.2} signal_score={:.4} signal_gate={} alloc_trades={} alloc_pnl={:.2} alloc_gate={}",
                     best.profile.name,
+                    best.signal_quality.trades,
+                    best.signal_quality.total_pnl,
+                    best.signal_quality.score,
+                    best.signal_quality.gate_status,
                     best.metrics.trades,
                     best.metrics.total_pnl,
-                    best.metrics.score,
                     best.gate_status
                 );
             }
