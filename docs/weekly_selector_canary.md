@@ -1089,6 +1089,19 @@ The approved +DDOG run `runs/portfolio-weekly-selector-research-20260701T142520.
 
 Professional decision: promote DDOG into the production-approved basket at existing account-sized live constraints. This is a modest edge, not a reason to increase sizing. The next baseline refresh should treat `runs/portfolio-weekly-selector-research-20260701T142520.495816000Z` as the current benchmark, and future expansions must beat `69461` $25-cost PnL after their own direct new-symbol contribution remains positive.
 
+Follow-up infrastructure hardening added first-class `--research-store` and `--skip-cache-sync` flags to `audit-option-cache-coverage`, `warm-option-cache-coverage`, and `research-portfolio-selector`. Manual expansion work should copy `data/spreadfoundry.duckdb` into a `var/research/*.duckdb` snapshot and run against that snapshot. This avoids the production `refresh-live-signal` writer lock while preserving an apples-to-apples baseline.
+
+The next isolated coverage round used `var/research/selector_snapshot_20260701_next_universe.duckdb`. The broad zero/low-coverage warm for `NOW,SHOP,CRM,ADBE,ASML,LRCX,KLAC,TSM,DELL,PANW` completed without lock failures and lifted each symbol to at least `16` complete put/call windows (`PANW` reached `17`). This proved the new workflow removes the research-store contention bottleneck; the remaining bottleneck is data coverage and strategy fit.
+
+Selector diagnostics against the DDOG baseline did not produce a new promotion:
+
+- `runs/portfolio-weekly-selector-research-20260701T143916.649367000Z` (`AMZN,GOOGL`) was rejected: the best profile was blocked by a material negative `2016`, $25-cost PnL fell to `67079` versus the `69461` baseline, `AMZN` had only `3` trades and lost `-1737` after $25/trade, and `GOOGL` had `7` trades but lost `-1483` after costs.
+- `runs/portfolio-weekly-selector-research-20260701T145016.254622000Z` (`NOW,SHOP,CRM,ADBE,PANW`) was only a watchlist result: $25-cost PnL improved by just `8`, but promotion was blocked because `ADBE` had `2` trades and `-7` after-cost PnL while `SHOP` had only `2` trades and `15` after-cost PnL.
+- `runs/portfolio-weekly-selector-research-20260701T145300.782427000Z` (`ASML,LRCX,KLAC,TSM,DELL`) was rejected: $25-cost PnL fell to `69081`, with `DELL` at `1` trade / `-65` after cost and `LRCX` at `4` trades / `-315` after cost.
+- `SHOP` was deepened to `40` complete windows and retested alone in `runs/portfolio-weekly-selector-research-20260701T145821.112868000Z`. It is rejected for this selector family: `40` direct trades, `-550` raw PnL, and `-1550` after $25/trade. Do not lower the promotion floor to admit this kind of high-count negative expectancy.
+
+Professional decision after this round: keep the DDOG-approved production basket. The next useful research should not be more generic add-the-symbol tests for SHOP/AMZN/GOOGL/semicap equipment under the current selector. Either build recent-plus-historical coverage for a new liquid candidate with a clear mechanism thesis, or test a symbol-specific entry family that changes the edge source before rerunning promotion gates.
+
 Require an actionable signal before any canary action:
 
 ```sh

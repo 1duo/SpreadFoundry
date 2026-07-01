@@ -18,6 +18,8 @@ const RESEARCH_STORE_SKIP_CACHE_SYNC_ENV: &str = "SPREAD_RESEARCH_STORE_SKIP_CAC
 const STORE_DATA_VERSION: &str = "duckdb-v1";
 
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RESEARCH_STORE_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+static RESEARCH_STORE_CACHE_SYNC_OVERRIDE: OnceLock<bool> = OnceLock::new();
 static CACHE_SYNCED_SYMBOL_DIRS: OnceLock<Mutex<HashSet<(PathBuf, String, PathBuf)>>> =
     OnceLock::new();
 
@@ -1225,7 +1227,28 @@ impl ResearchStore {
 }
 
 pub fn default_research_store_path() -> PathBuf {
+    if let Some(path) = RESEARCH_STORE_PATH_OVERRIDE.get() {
+        return path.clone();
+    }
     research_store_path_from_env(std::env::var_os(RESEARCH_STORE_PATH_ENV))
+}
+
+pub fn set_research_store_path_override(path: PathBuf) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("research store path override cannot be empty");
+    }
+    if let Some(existing) = RESEARCH_STORE_PATH_OVERRIDE.get() {
+        if existing == &path {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "research store path override already set to {}",
+            existing.display()
+        );
+    }
+    RESEARCH_STORE_PATH_OVERRIDE
+        .set(path)
+        .map_err(|_| anyhow::anyhow!("research store path override already set"))
 }
 
 fn research_store_path_from_env(value: Option<std::ffi::OsString>) -> PathBuf {
@@ -1236,7 +1259,22 @@ fn research_store_path_from_env(value: Option<std::ffi::OsString>) -> PathBuf {
 }
 
 pub fn research_store_cache_sync_enabled() -> bool {
+    if let Some(enabled) = RESEARCH_STORE_CACHE_SYNC_OVERRIDE.get() {
+        return *enabled;
+    }
     !env_flag_enabled(std::env::var_os(RESEARCH_STORE_SKIP_CACHE_SYNC_ENV))
+}
+
+pub fn set_research_store_cache_sync_enabled_override(enabled: bool) -> Result<()> {
+    if let Some(existing) = RESEARCH_STORE_CACHE_SYNC_OVERRIDE.get() {
+        if *existing == enabled {
+            return Ok(());
+        }
+        anyhow::bail!("research store cache sync override already set to {existing}");
+    }
+    RESEARCH_STORE_CACHE_SYNC_OVERRIDE
+        .set(enabled)
+        .map_err(|_| anyhow::anyhow!("research store cache sync override already set"))
 }
 
 fn env_flag_enabled(value: Option<std::ffi::OsString>) -> bool {

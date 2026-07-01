@@ -42,6 +42,7 @@ use spreadfoundry::research::{
 use spreadfoundry::research_store::{
     ResearchStore, ResearchStoreHealth, ResearchStoreImportReport, ResearchStorePerfReport,
     default_research_store_path, import_research_store, research_store_perf_check,
+    set_research_store_cache_sync_enabled_override, set_research_store_path_override,
 };
 use spreadfoundry::sim::{ExitRules, SpreadExitQuote, choose_exit};
 use spreadfoundry::strategy::{CandidateFilters, generate_put_spread_candidates};
@@ -357,6 +358,10 @@ enum Commands {
         to: NaiveDate,
         #[arg(long)]
         max_expirations: Option<usize>,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -387,6 +392,10 @@ enum Commands {
         force_refresh: bool,
         #[arg(long, default_value_t = false)]
         progress: bool,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -595,6 +604,10 @@ enum Commands {
         promotion_baseline_run: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
         promotion_min_new_symbol_trades: usize,
+        #[arg(long)]
+        research_store: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        skip_cache_sync: bool,
     },
 }
 
@@ -900,6 +913,19 @@ struct PlateauRunStatus {
     expansion_ready: bool,
 }
 
+fn configure_research_store_for_command(
+    research_store: Option<PathBuf>,
+    skip_cache_sync: bool,
+) -> Result<()> {
+    if let Some(path) = research_store {
+        set_research_store_path_override(path)?;
+    }
+    if skip_cache_sync {
+        set_research_store_cache_sync_enabled_override(false)?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1174,8 +1200,11 @@ async fn main() -> Result<()> {
             from,
             to,
             max_expirations,
+            research_store,
+            skip_cache_sync,
             json,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             let symbols = if symbols.is_empty() {
                 DEFAULT_WEEKLY_RESEARCH_SYMBOLS
                     .iter()
@@ -1210,8 +1239,11 @@ async fn main() -> Result<()> {
             window_timeout_seconds,
             force_refresh,
             progress,
+            research_store,
+            skip_cache_sync,
             json,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             let symbols = if symbols.is_empty() {
                 DEFAULT_WEEKLY_RESEARCH_SYMBOLS
                     .iter()
@@ -1464,7 +1496,10 @@ async fn main() -> Result<()> {
             symbol_drawdown_cooldown_days,
             promotion_baseline_run,
             promotion_min_new_symbol_trades,
+            research_store,
+            skip_cache_sync,
         } => {
+            configure_research_store_for_command(research_store, skip_cache_sync)?;
             let promotion_reference = promotion_baseline_run
                 .as_deref()
                 .map(portfolio_promotion_reference_from_run)
@@ -11116,6 +11151,7 @@ mod tests {
                 to,
                 max_expirations,
                 json,
+                ..
             } => {
                 assert_eq!(symbols, vec!["IREN", "TSLA"]);
                 assert_eq!(from.to_string(), "2020-01-01");
@@ -11150,6 +11186,9 @@ mod tests {
             "--window-timeout-seconds",
             "45",
             "--progress",
+            "--research-store",
+            "var/research/offline.duckdb",
+            "--skip-cache-sync",
             "--json",
         ])
         .unwrap();
@@ -11165,9 +11204,11 @@ mod tests {
                 option_side,
                 fetch_concurrency,
                 window_timeout_seconds,
+                force_refresh,
                 progress,
+                research_store,
+                skip_cache_sync,
                 json,
-                ..
             } => {
                 assert_eq!(symbols, vec!["SOFI", "HOOD"]);
                 assert_eq!(from.to_string(), "2024-01-01");
@@ -11178,7 +11219,13 @@ mod tests {
                 assert_eq!(option_side, WarmOptionSideArg::Call);
                 assert_eq!(fetch_concurrency, 2);
                 assert_eq!(window_timeout_seconds, 45);
+                assert!(!force_refresh);
                 assert!(progress);
+                assert_eq!(
+                    research_store,
+                    Some(PathBuf::from("var/research/offline.duckdb"))
+                );
+                assert!(skip_cache_sync);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
