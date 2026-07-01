@@ -1774,9 +1774,6 @@ struct PortfolioWheelSymbolData {
     put_rows_by_expiration: BTreeMap<NaiveDate, Vec<OptionDay>>,
     call_rows_by_expiration: BTreeMap<NaiveDate, Vec<OptionDay>>,
     call_rows_by_date: BTreeMap<NaiveDate, Vec<ExpiringOptionDay>>,
-    put_lookup: HashMap<(NaiveDate, String), BTreeMap<NaiveDate, OptionDay>>,
-    call_lookup: HashMap<(NaiveDate, String), BTreeMap<NaiveDate, OptionDay>>,
-    call_underlying_by_date: BTreeMap<NaiveDate, f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2839,10 +2836,7 @@ async fn load_portfolio_wheel_symbol_data(
             .chain(call_rows_by_expiration.keys().copied()),
     );
 
-    let put_lookup = build_lookup(&put_rows_by_expiration);
-    let call_lookup = build_lookup(&call_rows_by_expiration);
     let call_rows_by_date = expiring_rows_by_date(&call_rows_by_expiration);
-    let call_underlying_by_date = underlying_by_date_from_expirations(&call_rows_by_expiration);
     let expirations_loaded = put_rows_by_expiration
         .keys()
         .chain(call_rows_by_expiration.keys())
@@ -2869,9 +2863,6 @@ async fn load_portfolio_wheel_symbol_data(
         put_rows_by_expiration,
         call_rows_by_expiration,
         call_rows_by_date,
-        put_lookup,
-        call_lookup,
-        call_underlying_by_date,
     })
 }
 
@@ -2981,45 +2972,21 @@ fn portfolio_wheel_opportunities_for_symbol(
     to: NaiveDate,
 ) -> (Vec<PortfolioWheelOpportunity>, usize) {
     let candidates = generate_candidates(&data.put_rows_by_expiration, profile, from, to);
-    let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
-    for candidate in &candidates {
-        by_date
-            .entry(candidate.entry_date)
-            .or_default()
-            .push(candidate);
-    }
-
-    let mut opportunities = Vec::new();
-    let mut next_entry_date = NaiveDate::MIN;
-    for (date, mut day_candidates) in by_date {
-        if date < next_entry_date {
-            continue;
-        }
-        if risk_regime_cooldown_triggered(&day_candidates, profile) {
-            next_entry_date = next_entry_date_after_risk_regime(date, profile);
-            continue;
-        }
-        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
-        for candidate in day_candidates {
-            if let Some(trade) = simulate_wheel_candidate(
-                candidate,
-                &data.put_lookup,
-                &data.call_rows_by_date,
-                &data.call_lookup,
-                &data.call_underlying_by_date,
-                profile,
-                to,
-            ) {
-                opportunities.push(PortfolioWheelOpportunity {
-                    symbol: data.summary.symbol.clone(),
-                    strategy: SpreadStructure::Wheel,
-                    capital_at_risk: trade.max_loss,
-                    trade,
-                });
-                break;
-            }
-        }
-    }
+    let opportunities = simulate_wheel_non_overlapping(
+        &candidates,
+        &data.put_rows_by_expiration,
+        &data.call_rows_by_expiration,
+        profile,
+        to,
+    )
+    .into_iter()
+    .map(|trade| PortfolioWheelOpportunity {
+        symbol: data.summary.symbol.clone(),
+        strategy: SpreadStructure::Wheel,
+        capital_at_risk: trade.max_loss,
+        trade,
+    })
+    .collect();
 
     (opportunities, candidates.len())
 }
@@ -3031,47 +2998,25 @@ fn portfolio_spread_opportunities_for_symbol(
     to: NaiveDate,
     strategy: SpreadStructure,
 ) -> (Vec<PortfolioWheelOpportunity>, usize) {
-    let (rows_by_expiration, lookup) = match strategy {
-        SpreadStructure::PutCreditSpread => (&data.put_rows_by_expiration, &data.put_lookup),
-        SpreadStructure::CallCreditSpread => (&data.call_rows_by_expiration, &data.call_lookup),
-        SpreadStructure::PutDebitSpread => (&data.put_rows_by_expiration, &data.put_lookup),
-        SpreadStructure::CallDebitSpread => (&data.call_rows_by_expiration, &data.call_lookup),
+    let rows_by_expiration = match strategy {
+        SpreadStructure::PutCreditSpread => &data.put_rows_by_expiration,
+        SpreadStructure::CallCreditSpread => &data.call_rows_by_expiration,
+        SpreadStructure::PutDebitSpread => &data.put_rows_by_expiration,
+        SpreadStructure::CallDebitSpread => &data.call_rows_by_expiration,
         SpreadStructure::Wheel => {
             return (Vec::new(), 0);
         }
     };
     let candidates = generate_candidates(rows_by_expiration, profile, from, to);
-    let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
-    for candidate in &candidates {
-        by_date
-            .entry(candidate.entry_date)
-            .or_default()
-            .push(candidate);
-    }
-
-    let mut opportunities = Vec::new();
-    let mut next_entry_date = NaiveDate::MIN;
-    for (date, mut day_candidates) in by_date {
-        if date < next_entry_date {
-            continue;
-        }
-        if risk_regime_cooldown_triggered(&day_candidates, profile) {
-            next_entry_date = next_entry_date_after_risk_regime(date, profile);
-            continue;
-        }
-        day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
-        for candidate in day_candidates {
-            if let Some(trade) = simulate_candidate(candidate, lookup, profile) {
-                opportunities.push(PortfolioWheelOpportunity {
-                    symbol: data.summary.symbol.clone(),
-                    strategy,
-                    capital_at_risk: trade.max_loss,
-                    trade,
-                });
-                break;
-            }
-        }
-    }
+    let opportunities = simulate_non_overlapping(&candidates, rows_by_expiration, profile)
+        .into_iter()
+        .map(|trade| PortfolioWheelOpportunity {
+            symbol: data.summary.symbol.clone(),
+            strategy,
+            capital_at_risk: trade.max_loss,
+            trade,
+        })
+        .collect();
 
     (opportunities, candidates.len())
 }
@@ -13612,7 +13557,6 @@ mod tests {
                 option_day(exit_date, 95.0, 0.20, 0.25, -0.10, 107.0),
             ],
         );
-        let put_lookup = build_lookup(&put_rows_by_expiration);
         let data = PortfolioWheelSymbolData {
             summary: PortfolioWheelLoadedSymbol {
                 symbol: "NVDA".to_owned(),
@@ -13631,9 +13575,6 @@ mod tests {
             put_rows_by_expiration,
             call_rows_by_expiration: BTreeMap::new(),
             call_rows_by_date: BTreeMap::new(),
-            put_lookup,
-            call_lookup: HashMap::new(),
-            call_underlying_by_date: BTreeMap::new(),
         };
 
         let (opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
@@ -13702,7 +13643,6 @@ mod tests {
 
         let mut put_rows_by_expiration = BTreeMap::new();
         put_rows_by_expiration.insert(expiration, rows);
-        let put_lookup = build_lookup(&put_rows_by_expiration);
         let data = PortfolioWheelSymbolData {
             summary: PortfolioWheelLoadedSymbol {
                 symbol: "NVDA".to_owned(),
@@ -13721,9 +13661,6 @@ mod tests {
             put_rows_by_expiration,
             call_rows_by_expiration: BTreeMap::new(),
             call_rows_by_date: BTreeMap::new(),
-            put_lookup,
-            call_lookup: HashMap::new(),
-            call_underlying_by_date: BTreeMap::new(),
         };
 
         let (opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
@@ -13737,6 +13674,79 @@ mod tests {
         assert_eq!(candidates, 3);
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].trade.entry_date, eligible_date);
+    }
+
+    #[test]
+    fn portfolio_spread_opportunities_honor_stop_loss_cooldown_days() {
+        let first_date = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let skipped_date = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let eligible_date = NaiveDate::from_ymd_opt(2026, 1, 22).unwrap();
+        let mut profile = ResearchProfile::legacy_baseline();
+        profile.stop_loss_multiple = 1.10;
+        profile.stop_loss_cooldown_days = 10;
+        profile.trend_lookback_days = None;
+        profile.drawdown_lookback_days = None;
+        profile.realized_vol_lookback_days = None;
+
+        let mut put_rows_by_expiration = BTreeMap::new();
+        for entry_date in [first_date, skipped_date, eligible_date] {
+            let expiration = entry_date + Duration::days(35);
+            let exit_date = entry_date + Duration::days(1);
+            let mut exit_short = option_day(exit_date, 95.0, 1.20, 1.40, -0.25, 100.0);
+            exit_short.open_interest = 0;
+            let mut exit_long = option_day(exit_date, 90.0, 0.10, 0.20, -0.15, 100.0);
+            exit_long.open_interest = 0;
+            put_rows_by_expiration.insert(
+                expiration,
+                vec![
+                    option_day(entry_date, 95.0, 1.20, 1.30, -0.25, 100.0),
+                    option_day(entry_date, 90.0, 0.10, 0.20, -0.15, 100.0),
+                    exit_short,
+                    exit_long,
+                ],
+            );
+        }
+        let data = PortfolioWheelSymbolData {
+            summary: PortfolioWheelLoadedSymbol {
+                symbol: "NVDA".to_owned(),
+                requested_from: first_date,
+                from: first_date,
+                to: eligible_date + Duration::days(1),
+                expirations_discovered: 3,
+                expirations_skipped_before_data: 0,
+                expirations_loaded: 3,
+                put_expirations_loaded: 3,
+                call_expirations_loaded: 0,
+                rows_loaded: 12,
+                expirations_failed: 0,
+                expiration_load_failures: Vec::new(),
+            },
+            put_rows_by_expiration,
+            call_rows_by_expiration: BTreeMap::new(),
+            call_rows_by_date: BTreeMap::new(),
+        };
+
+        let (opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
+            &data,
+            &profile,
+            first_date,
+            eligible_date,
+            SpreadStructure::PutCreditSpread,
+        );
+
+        assert_eq!(candidates, 3);
+        assert_eq!(
+            opportunities
+                .iter()
+                .map(|opportunity| opportunity.trade.entry_date)
+                .collect::<Vec<_>>(),
+            vec![first_date, eligible_date]
+        );
+        assert!(
+            opportunities
+                .iter()
+                .all(|opportunity| opportunity.trade.exit_reason == "stop_loss")
+        );
     }
 
     #[test]
@@ -13790,9 +13800,6 @@ mod tests {
             put_rows_by_expiration: BTreeMap::new(),
             call_rows_by_expiration: call_rows_by_expiration.clone(),
             call_rows_by_date: expiring_rows_by_date(&call_rows_by_expiration),
-            put_lookup: HashMap::new(),
-            call_lookup: build_lookup(&call_rows_by_expiration),
-            call_underlying_by_date: underlying_by_date_from_expirations(&call_rows_by_expiration),
         };
         let selector = PortfolioSelectorProfile::single(profile);
 
