@@ -560,9 +560,13 @@ pub struct PortfolioDecisionMetrics {
     #[serde(default)]
     pub max_capital_drawdown_pct: f64,
     #[serde(default)]
+    pub max_capital_drawdown_pct_account_budget: f64,
+    #[serde(default)]
     pub cost_25_max_capital_drawdown: f64,
     #[serde(default)]
     pub cost_25_max_capital_drawdown_pct: f64,
+    #[serde(default)]
+    pub cost_25_max_capital_drawdown_pct_account_budget: f64,
     pub pnl_per_max_capital_used: f64,
     pub cost_25_pnl_per_max_capital_used: f64,
     pub pnl_per_avg_capital_used_on_entry: f64,
@@ -2770,7 +2774,7 @@ async fn run_portfolio_research(
                 &metrics,
                 allocation.max_capital_used,
                 allocation.avg_capital_used_on_entry,
-                research_gate_capital_budget,
+                request.capital_budget,
                 &risk_summary,
             );
             let recent_regime = portfolio_recent_regime_metrics(
@@ -3708,7 +3712,7 @@ fn portfolio_decision_metrics(
     metrics: &ResearchMetrics,
     max_capital_used: f64,
     avg_capital_used_on_entry: f64,
-    _capital_budget: f64,
+    capital_budget: f64,
     risk: &PortfolioWheelRiskSummary,
 ) -> PortfolioDecisionMetrics {
     let cost_25_pnl = metrics
@@ -3740,8 +3744,16 @@ fn portfolio_decision_metrics(
         cost_25_pnl_to_drawdown_capital,
         max_capital_drawdown: risk.max_closed_equity_drawdown,
         max_capital_drawdown_pct: risk.max_closed_equity_drawdown_pct_capital,
+        max_capital_drawdown_pct_account_budget: positive_denominator_ratio(
+            risk.max_closed_equity_drawdown,
+            capital_budget,
+        ),
         cost_25_max_capital_drawdown: risk.cost_25_max_closed_equity_drawdown,
         cost_25_max_capital_drawdown_pct: risk.cost_25_max_closed_equity_drawdown_pct_capital,
+        cost_25_max_capital_drawdown_pct_account_budget: positive_denominator_ratio(
+            risk.cost_25_max_closed_equity_drawdown,
+            capital_budget,
+        ),
         pnl_per_max_capital_used: positive_denominator_ratio(metrics.total_pnl, max_capital_used),
         cost_25_pnl_per_max_capital_used: positive_denominator_ratio(cost_25_pnl, max_capital_used),
         pnl_per_avg_capital_used_on_entry: positive_denominator_ratio(
@@ -4527,9 +4539,9 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     out.push('\n');
 
     out.push_str("## Top Profiles\n\n");
-    out.push_str("| Rank | Profile | Gate | Recent | Adj Score | Hist Score | Recent Score | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Capital DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
+    out.push_str("| Rank | Profile | Gate | Recent | Adj Score | Hist Score | Recent Score | Trades | Required | Trades/Yr | PnL | PF | Risk-Norm DD | Gate DD | Account DD | $10 Cost PnL | Recent $25 PnL | Wheel | Put Debit | Call Debit | Assigned | Called | Marked | Rejected |\n");
     out.push_str(
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for (idx, result) in report.profiles.iter().take(10).enumerate() {
         let cost_10_pnl = result
@@ -4577,7 +4589,7 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             .filter(|trade| trade.strategy == SpreadStructure::CallDebitSpread)
             .count();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.2}% | {:.2}% | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |\n",
             idx + 1,
             result.profile.name,
             result.gate_status,
@@ -4592,6 +4604,10 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             result.metrics.profit_factor,
             result.metrics.max_drawdown * 100.0,
             result.decision_metrics.max_capital_drawdown_pct * 100.0,
+            result
+                .decision_metrics
+                .max_capital_drawdown_pct_account_budget
+                * 100.0,
             cost_10_pnl,
             result.recent_regime.cost_25_pnl,
             wheel_trades,
@@ -4606,11 +4622,11 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     out.push('\n');
 
     out.push_str("## Profile Decision Metrics\n\n");
-    out.push_str("| Rank | Profile | Gate | Capital DD | $25 Capital DD | PnL/DD Capital | $25 PnL/DD Capital | PnL/Max Cap | $25 PnL/Max Cap | Marked Loss/PnL | Assignment Rate | Risk Flag |\n");
-    out.push_str("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Rank | Profile | Gate | Gate DD | $25 Gate DD | Account DD | $25 Account DD | PnL/DD Capital | $25 PnL/DD Capital | PnL/Max Cap | $25 PnL/Max Cap | Marked Loss/PnL | Assignment Rate | Risk Flag |\n");
+    out.push_str("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for (idx, result) in report.profiles.iter().take(10).enumerate() {
         out.push_str(&format!(
-            "| {} | {} | {} | {:.2}% | {:.2}% | {:.2} | {:.2} | {:.3} | {:.3} | {:.1}% | {:.1}% | {} |\n",
+            "| {} | {} | {} | {:.2}% | {:.2}% | {:.2}% | {:.2}% | {:.2} | {:.2} | {:.3} | {:.3} | {:.1}% | {:.1}% | {} |\n",
             idx + 1,
             result.profile.name,
             result.gate_status,
@@ -4618,6 +4634,14 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             result
                 .decision_metrics
                 .cost_25_max_capital_drawdown_pct
+                * 100.0,
+            result
+                .decision_metrics
+                .max_capital_drawdown_pct_account_budget
+                * 100.0,
+            result
+                .decision_metrics
+                .cost_25_max_capital_drawdown_pct_account_budget
                 * 100.0,
             result.decision_metrics.pnl_to_drawdown_capital,
             result.decision_metrics.cost_25_pnl_to_drawdown_capital,
@@ -4633,7 +4657,7 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
     if let Some(best) = report.profiles.first() {
         out.push_str("## Best Profile Detail\n\n");
         out.push_str(&format!(
-            "- Profile: `{}`\n- Gate: `{}` ({})\n- Max capital used: `${:.0}`\n- Avg capital used on entry: `${:.0}`\n- Capital drawdown: `${:.0}` (`{:.2}%`)\n- $25 cost capital drawdown: `${:.0}` (`{:.2}%`)\n- Rejected capital budget: `{}`\n- Rejected symbol allocation: `{}`\n- Rejected open positions: `{}`\n- Rejected symbol positions: `{}`\n- Rejected symbol total trades: `{}`\n- Rejected portfolio DD cooldown: `{}`\n- Rejected symbol DD cooldown: `{}`\n\n",
+            "- Profile: `{}`\n- Gate: `{}` ({})\n- Max capital used: `${:.0}`\n- Avg capital used on entry: `${:.0}`\n- Capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- $25 cost capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n- Rejected capital budget: `{}`\n- Rejected symbol allocation: `{}`\n- Rejected open positions: `{}`\n- Rejected symbol positions: `{}`\n- Rejected symbol total trades: `{}`\n- Rejected portfolio DD cooldown: `{}`\n- Rejected symbol DD cooldown: `{}`\n\n",
             best.profile.name,
             best.gate_status,
             best.gate_reason,
@@ -4641,8 +4665,12 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             best.avg_capital_used_on_entry,
             best.decision_metrics.max_capital_drawdown,
             best.decision_metrics.max_capital_drawdown_pct * 100.0,
+            best.decision_metrics.max_capital_drawdown_pct_account_budget * 100.0,
             best.decision_metrics.cost_25_max_capital_drawdown,
             best.decision_metrics.cost_25_max_capital_drawdown_pct * 100.0,
+            best.decision_metrics
+                .cost_25_max_capital_drawdown_pct_account_budget
+                * 100.0,
             best.rejected_capital_budget,
             best.rejected_symbol_allocation,
             best.rejected_open_positions,
@@ -4652,7 +4680,7 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             best.rejected_symbol_drawdown_cooldown
         ));
         out.push_str(&format!(
-            "- Recent regime: `{}` ({})\n- Recent window: `{}` to `{}` (`{}` days)\n- Recent trades: `{}`\n- Recent raw PnL: `{:.2}`\n- Recent $25 cost PnL: `{:.2}`\n- Recent $25 win rate: `{:.1}%`\n- Recent $25 profit factor: `{:.2}`\n- Recent $25 capital drawdown: `${:.0}` (`{:.2}%`)\n\n",
+            "- Recent regime: `{}` ({})\n- Recent window: `{}` to `{}` (`{}` days)\n- Recent trades: `{}`\n- Recent raw PnL: `{:.2}`\n- Recent $25 cost PnL: `{:.2}`\n- Recent $25 win rate: `{:.1}%`\n- Recent $25 profit factor: `{:.2}`\n- Recent $25 capital drawdown: `${:.0}` (`{:.2}%` research gate, `{:.2}%` account budget)\n\n",
             best.recent_regime.status,
             best.recent_regime.reason,
             best.recent_regime
@@ -4672,6 +4700,11 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             best.recent_regime.cost_25_max_closed_equity_drawdown,
             best.recent_regime
                 .cost_25_max_closed_equity_drawdown_pct_capital
+                * 100.0,
+            positive_denominator_ratio(
+                best.recent_regime.cost_25_max_closed_equity_drawdown,
+                report.capital_budget,
+            )
                 * 100.0
         ));
         out.push_str(&format!(
@@ -14590,9 +14623,10 @@ mod tests {
             entry + Duration::days(60),
             1.0,
         );
-        let decision = portfolio_decision_metrics(&metrics, 20_000.0, 12_000.0, 100_000.0, &risk);
+        let decision = portfolio_decision_metrics(&metrics, 20_000.0, 12_000.0, 50_000.0, &risk);
         assert_eq!(decision.professional_risk_flag, "wheel_edge_negative");
         assert!((decision.max_capital_drawdown_pct - 0.0045).abs() < 1e-9);
+        assert!((decision.max_capital_drawdown_pct_account_budget - 0.009).abs() < 1e-9);
         assert!(decision.pnl_to_drawdown_capital > 0.0);
         assert!(decision.marked_stock_loss_to_pnl > 0.0);
     }

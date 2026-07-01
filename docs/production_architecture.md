@@ -48,6 +48,9 @@ production approval metadata. Portfolio constraints size live/account heat:
 capital, symbol allocation, open-position caps, and cooldowns. The optional
 `research_gate_capital_budget` is only the normalization denominator for
 multi-year research gates, recent-regime drawdown gates, and ablation gates.
+Selector reports therefore distinguish gate-normalized drawdown from
+account-budget-normalized drawdown; live/account heat is still controlled by
+the portfolio constraints, not by the research-gate denominator.
 Signal refresh uses `research_from` from the approved strategy for
 approval/research runs, so production does not silently drift onto a different
 research window. Live signal refresh may also set `live_detector_lookback_days`;
