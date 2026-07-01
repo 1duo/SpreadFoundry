@@ -1521,6 +1521,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
     let mut rows_loaded = 0;
     let mut expiration_load_failures = Vec::new();
     let fetch_concurrency = request.fetch_concurrency.max(1);
+    let verbose_expiration_loads = !request.cache_only;
     for chunk in candidate_expirations.chunks(fetch_concurrency) {
         let fetches = chunk.iter().copied().filter_map(|expiration| {
             let (start, end) = expiration_load_window(expiration, effective_load_bounds)?;
@@ -1529,7 +1530,9 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
             let force_refresh = request.force_refresh;
             let cache_only = request.cache_only;
             Some(async move {
-                println!("loading {} {}..{}", expiration, start, end);
+                if verbose_expiration_loads {
+                    println!("loading {} {}..{}", expiration, start, end);
+                }
                 load_expiration_rows_for_mode_with_cache_mode(
                     &symbol,
                     expiration,
@@ -1563,14 +1566,23 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
                         });
                     }
                     let failure = expiration_load_failure_from_error(expiration, &error);
-                    eprintln!(
-                        "skipping {} after expiration load failure: {}",
-                        failure.expiration, failure.message
-                    );
+                    if verbose_expiration_loads {
+                        eprintln!(
+                            "skipping {} after expiration load failure: {}",
+                            failure.expiration, failure.message
+                        );
+                    }
                     expiration_load_failures.push(failure);
                 }
             }
         }
+    }
+    if request.cache_only && !expiration_load_failures.is_empty() {
+        eprintln!(
+            "{} cache-only expiration load failures for {}; see research report for details",
+            expiration_load_failures.len(),
+            request.symbol
+        );
     }
     research_from = loaded_rows_effective_from(
         research_from,
