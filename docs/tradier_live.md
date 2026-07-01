@@ -162,6 +162,8 @@ scripts/execution-service.sh set-mode live
   bid/ask size on positive-priced executable sides and quote timestamps no older
   than
   `SPREAD_EXECUTION_MAX_QUOTE_AGE_SECONDS` seconds; default `30`
+- rechecks broker positions and active same-underlying orders after preview and
+  before local ledger reservation/place
 - places only after preview, local ledger reservation, and post-submit broker
   order confirmation
 
@@ -172,20 +174,21 @@ Execution is fail-closed.
 - Local validation failures become `blocked`.
 - Tradier quote validation failures become `blocked`.
 - Tradier preview rejections become `rejected` and are recorded in the ledger.
-- Placement transport failures after ledger reservation become
-  `submit_unknown`.
+- Placement transport failures after ledger reservation become `submit_unknown`.
+  Later cycles reconcile `pending_unknown` entries by broker order id or the
+  deterministic SpreadFoundry order tag when Tradier returns conclusive order
+  state; ambiguous or unmatched state remains `submit_unknown`.
 - Duplicate submitted ledger keys become `already_submitted`.
 - Duplicate rejected ledger keys stay `rejected` until an operator clears or
   reconciles the ledger.
 - Close-order preview rejections are recorded as retryable
   `preview_rejected` observations; they do not block a later close retry when
   broker state and quotes improve. Submitted and `pending_unknown` close orders
-  still block duplicates unless the submitted order is a DAY close that broker
-  reconciliation now shows as terminal-unfilled (`canceled`, `cancelled`,
-  `rejected`, `expired`, or `error`) while exposure remains and no active
-  matching order is present. A prior close reported `filled` while positions
-  still show exposure blocks for manual reconciliation rather than submitting a
-  second close.
+  still block duplicates unless broker reconciliation shows a prior DAY close is
+  terminal-unfilled (`canceled`, `cancelled`, `rejected`, `expired`, or `error`)
+  while exposure remains and no active matching order is present. A prior close
+  reported `filled` while positions still show exposure blocks for manual
+  reconciliation rather than submitting a second close.
 - No selected entry or open-position management signal becomes `no_signal`.
 
 Notifications are best-effort. Notification failure is logged but does not

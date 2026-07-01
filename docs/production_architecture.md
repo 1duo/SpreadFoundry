@@ -226,11 +226,15 @@ research selected a new target. If assigned stock exists but today's export has
 no covered-call target, the worker holds intentionally until a future refresh
 exports an eligible target or the stock liquidation rule becomes due.
 Close-order preview rejections are recorded as retryable `preview_rejected`
-observations. `pending_unknown` close ledger entries remain duplicate guards.
-Submitted DAY close entries remain guards while active or ambiguous, but become
-retryable after broker reconciliation shows the prior close is terminal-unfilled
-and exposure still remains. A prior filled close with remaining broker exposure
-blocks for manual reconciliation.
+observations. Live placement adds a deterministic SpreadFoundry order tag and
+rechecks broker positions plus active same-underlying orders after preview before
+ledger reservation/place. `pending_unknown` entries remain duplicate guards
+unless broker reconciliation can match exactly one Tradier order by broker id or
+tag and the broker state is conclusive. Submitted or reconciled DAY close entries
+remain guards while active or ambiguous, but become retryable after broker
+reconciliation shows the prior close is terminal-unfilled and exposure still
+remains. A prior filled close with remaining broker exposure blocks for manual
+reconciliation.
 
 Notifications are best-effort and never block monitoring or order handling.
 

@@ -4816,12 +4816,12 @@ fn apply_tradier_rest_bridge_with_config(
         return Ok(());
     }
 
-    if action.strategy == "wheel" {
-        if let Err(err) = tradier_assert_wheel_broker_state(&client, &action, &decision.risk) {
-            decision.status = "blocked".to_owned();
-            decision.reason = format!("Tradier wheel pre-place broker-state recheck failed: {err}");
-            return Ok(());
-        }
+    if action.strategy == "wheel"
+        && let Err(err) = tradier_assert_wheel_broker_state(&client, &action, &decision.risk)
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = format!("Tradier wheel pre-place broker-state recheck failed: {err}");
+        return Ok(());
     }
     if is_vertical_spread_strategy(action.strategy.as_str())
         && let Err(err) = tradier_assert_vertical_spread_lifecycle_flat(&client, &action)

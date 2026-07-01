@@ -2690,10 +2690,10 @@ async fn run_portfolio_research(
     if request.capital_budget <= 0.0 {
         anyhow::bail!("capital budget must be positive");
     }
-    if let Some(research_gate_capital_budget) = request.research_gate_capital_budget {
-        if !research_gate_capital_budget.is_finite() || research_gate_capital_budget <= 0.0 {
-            anyhow::bail!("research gate capital budget must be positive and finite");
-        }
+    if let Some(research_gate_capital_budget) = request.research_gate_capital_budget
+        && (!research_gate_capital_budget.is_finite() || research_gate_capital_budget <= 0.0)
+    {
+        anyhow::bail!("research gate capital budget must be positive and finite");
     }
     if request.max_symbol_allocation_pct <= 0.0 || request.max_symbol_allocation_pct > 1.0 {
         anyhow::bail!("max symbol allocation pct must be in (0, 1]");
@@ -3972,6 +3972,7 @@ fn portfolio_ablation_summary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn portfolio_canary_readiness(
     metrics: &ResearchMetrics,
     trades: &[PortfolioWheelTrade],
@@ -18145,7 +18146,7 @@ mod tests {
         let eligible_loss =
             fixed_profile_walk_forward_result_for_order("eligible_loss", true, -50.0, 0.30, 10);
 
-        let mut fixed = vec![eligible_loss, profitable_thin, gate_pass];
+        let mut fixed = [eligible_loss, profitable_thin, gate_pass];
         fixed.sort_by(fixed_profile_walk_forward_result_order);
 
         assert_eq!(fixed[0].profile.name, "gate_pass");
