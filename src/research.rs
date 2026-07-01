@@ -183,6 +183,8 @@ pub struct PortfolioWheelResearchRequest {
     pub force_refresh: bool,
     pub cache_only: bool,
     pub capital_budget: f64,
+    #[serde(default)]
+    pub research_gate_capital_budget: Option<f64>,
     pub max_symbol_allocation_pct: f64,
     pub max_open_positions: usize,
     pub max_positions_per_symbol: usize,
@@ -377,6 +379,8 @@ pub struct PortfolioWheelReport {
     pub force_refresh: bool,
     pub cache_only: bool,
     pub capital_budget: f64,
+    #[serde(default)]
+    pub research_gate_capital_budget: Option<f64>,
     pub max_symbol_allocation_pct: f64,
     pub max_open_positions: usize,
     pub max_positions_per_symbol: usize,
@@ -2686,6 +2690,11 @@ async fn run_portfolio_research(
     if request.capital_budget <= 0.0 {
         anyhow::bail!("capital budget must be positive");
     }
+    if let Some(research_gate_capital_budget) = request.research_gate_capital_budget {
+        if !research_gate_capital_budget.is_finite() || research_gate_capital_budget <= 0.0 {
+            anyhow::bail!("research gate capital budget must be positive and finite");
+        }
+    }
     if request.max_symbol_allocation_pct <= 0.0 || request.max_symbol_allocation_pct > 1.0 {
         anyhow::bail!("max symbol allocation pct must be in (0, 1]");
     }
@@ -2702,6 +2711,9 @@ async fn run_portfolio_research(
     let run_id = research_run_id(run_prefix);
     let run_dir = PathBuf::from("runs").join(&run_id);
     fs::create_dir_all(&run_dir)?;
+    let research_gate_capital_budget = request
+        .research_gate_capital_budget
+        .unwrap_or(request.capital_budget);
 
     let load_profiles = selector_profiles
         .iter()
@@ -2743,32 +2755,32 @@ async fn run_portfolio_research(
                 MIN_WEEKLY_RANKING_TRADES_PER_YEAR,
             );
             let (gate_status, gate_pass, gate_reason) =
-                portfolio_wheel_gate(&metrics, request.capital_budget);
+                portfolio_wheel_gate(&metrics, research_gate_capital_budget);
             let ablations = portfolio_ablation_summaries(
                 &simulation.opportunities,
                 from,
                 request.to,
-                request.capital_budget,
+                research_gate_capital_budget,
                 &request,
             );
             let strategy_summaries = portfolio_strategy_summaries(&allocation.trades);
             let risk_summary =
-                portfolio_wheel_risk_summary(&allocation.trades, request.capital_budget);
+                portfolio_wheel_risk_summary(&allocation.trades, research_gate_capital_budget);
             let decision_metrics = portfolio_decision_metrics(
                 &metrics,
                 allocation.max_capital_used,
                 allocation.avg_capital_used_on_entry,
-                request.capital_budget,
+                research_gate_capital_budget,
                 &risk_summary,
             );
             let recent_regime = portfolio_recent_regime_metrics(
                 &allocation.trades,
                 from,
                 request.to,
-                request.capital_budget,
+                research_gate_capital_budget,
             );
             let recent_regime_score =
-                portfolio_recent_regime_score(&recent_regime, request.capital_budget);
+                portfolio_recent_regime_score(&recent_regime, research_gate_capital_budget);
             let recency_adjusted_score =
                 portfolio_recency_adjusted_score(&metrics, recent_regime_score);
             let symbol_summaries = portfolio_wheel_symbol_summaries(&allocation.trades);
@@ -2843,6 +2855,7 @@ async fn run_portfolio_research(
         force_refresh: request.force_refresh,
         cache_only: request.cache_only,
         capital_budget: request.capital_budget,
+        research_gate_capital_budget: Some(research_gate_capital_budget),
         max_symbol_allocation_pct: request.max_symbol_allocation_pct,
         max_open_positions: request.max_open_positions,
         max_positions_per_symbol: request.max_positions_per_symbol,
@@ -4465,13 +4478,17 @@ fn avg_wheel_call_count(trades: &[PortfolioWheelTrade]) -> f64 {
 fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {title}\n\n"));
+    let research_gate_capital_budget = report
+        .research_gate_capital_budget
+        .unwrap_or(report.capital_budget);
     out.push_str(&format!(
-        "- Run: `{}`\n- Symbols: `{}`\n- Window: `{}` to `{}`\n- Capital budget: `${:.0}`\n- Max symbol allocation: `{:.0}%`\n- Max open positions: `{}`\n- Max positions per symbol: `{}`\n- Portfolio DD cooldown: `{}`\n- Symbol DD cooldown: `{}`\n\n",
+        "- Run: `{}`\n- Symbols: `{}`\n- Window: `{}` to `{}`\n- Capital budget: `${:.0}`\n- Research gate capital budget: `${:.0}`\n- Max symbol allocation: `{:.0}%`\n- Max open positions: `{}`\n- Max positions per symbol: `{}`\n- Portfolio DD cooldown: `{}`\n- Symbol DD cooldown: `{}`\n\n",
         report.run_id,
         report.symbols.join(","),
         report.from,
         report.to,
         report.capital_budget,
+        research_gate_capital_budget,
         report.max_symbol_allocation_pct * 100.0,
         report.max_open_positions,
         report.max_positions_per_symbol,
@@ -18894,6 +18911,7 @@ mod tests {
             force_refresh: false,
             cache_only: false,
             capital_budget,
+            research_gate_capital_budget: None,
             max_symbol_allocation_pct,
             max_open_positions,
             max_positions_per_symbol,

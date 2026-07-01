@@ -562,6 +562,8 @@ enum Commands {
         cache_only: bool,
         #[arg(long, default_value_t = 100_000.0)]
         capital_budget: f64,
+        #[arg(long)]
+        research_gate_capital_budget: Option<f64>,
         #[arg(long, default_value_t = 0.35)]
         max_symbol_allocation_pct: f64,
         #[arg(long, default_value_t = 5)]
@@ -606,6 +608,8 @@ enum Commands {
         cache_only: bool,
         #[arg(long, default_value_t = 100_000.0)]
         capital_budget: f64,
+        #[arg(long)]
+        research_gate_capital_budget: Option<f64>,
         #[arg(long, default_value_t = 0.35)]
         max_symbol_allocation_pct: f64,
         #[arg(long, default_value_t = 5)]
@@ -1456,6 +1460,7 @@ async fn main() -> Result<()> {
             force_refresh,
             cache_only,
             capital_budget,
+            research_gate_capital_budget,
             max_symbol_allocation_pct,
             max_open_positions,
             max_positions_per_symbol,
@@ -1483,6 +1488,7 @@ async fn main() -> Result<()> {
                 force_refresh,
                 cache_only,
                 capital_budget,
+                research_gate_capital_budget,
                 max_symbol_allocation_pct,
                 max_open_positions,
                 max_positions_per_symbol,
@@ -1521,6 +1527,7 @@ async fn main() -> Result<()> {
             force_refresh,
             cache_only,
             capital_budget,
+            research_gate_capital_budget,
             max_symbol_allocation_pct,
             max_open_positions,
             max_positions_per_symbol,
@@ -1557,6 +1564,8 @@ async fn main() -> Result<()> {
                         force_refresh,
                         cache_only,
                         capital_budget,
+                        research_gate_capital_budget: research_gate_capital_budget
+                            .or(approved_strategy.research_gate_capital_budget),
                         max_symbol_allocation_pct,
                         max_open_positions,
                         max_positions_per_symbol,
@@ -1599,6 +1608,7 @@ async fn main() -> Result<()> {
                     force_refresh,
                     cache_only,
                     capital_budget,
+                    research_gate_capital_budget,
                     max_symbol_allocation_pct,
                     max_open_positions,
                     max_positions_per_symbol,
@@ -2148,6 +2158,7 @@ async fn refresh_live_signal_selector_run(args: RefreshLiveSignalArgs) -> Result
             force_refresh: args.force_refresh,
             cache_only: args.cache_only,
             capital_budget: constraints.capital_budget,
+            research_gate_capital_budget: approved_strategy.research_gate_capital_budget,
             max_symbol_allocation_pct: constraints.max_symbol_allocation_pct,
             max_open_positions: constraints.max_open_positions,
             max_positions_per_symbol: constraints.max_positions_per_symbol,
@@ -11371,6 +11382,8 @@ mod tests {
             "2026-06-21",
             "--capital-budget",
             "75000",
+            "--research-gate-capital-budget",
+            "100000",
             "--max-symbol-allocation-pct",
             "0.4",
             "--max-open-positions",
@@ -11385,6 +11398,7 @@ mod tests {
             Commands::ResearchPortfolioWheel {
                 symbols,
                 capital_budget,
+                research_gate_capital_budget,
                 max_symbol_allocation_pct,
                 max_open_positions,
                 max_positions_per_symbol,
@@ -11393,6 +11407,7 @@ mod tests {
             } => {
                 assert_eq!(symbols, vec!["IREN", "PLTR"]);
                 assert_eq!(capital_budget, 75_000.0);
+                assert_eq!(research_gate_capital_budget, Some(100_000.0));
                 assert_eq!(max_symbol_allocation_pct, 0.4);
                 assert_eq!(max_open_positions, 3);
                 assert_eq!(max_positions_per_symbol, 1);
@@ -11413,6 +11428,8 @@ mod tests {
             "NVDA,smci",
             "--to",
             "2026-06-30",
+            "--research-gate-capital-budget",
+            "100000",
             "--cache-only",
         ])
         .unwrap();
@@ -11421,6 +11438,7 @@ mod tests {
             Commands::ResearchPortfolioSelector {
                 approved_strategy,
                 candidate_symbols,
+                research_gate_capital_budget,
                 cache_only,
                 ..
             } => {
@@ -11429,6 +11447,7 @@ mod tests {
                     Some(PathBuf::from("configs/approved_strategy.json"))
                 );
                 assert_eq!(candidate_symbols, vec!["NVDA", "smci"]);
+                assert_eq!(research_gate_capital_budget, Some(100_000.0));
                 assert!(cache_only);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -12489,6 +12508,19 @@ mod tests {
         assert_eq!(
             approved_strategy_research_from(&artifact.approved_strategy, fallback),
             configured_from
+        );
+    }
+
+    #[test]
+    fn approved_strategy_rejects_invalid_research_gate_capital_budget() {
+        let mut artifact = test_canary_artifact(serde_json::json!([]));
+        artifact.approved_strategy.research_gate_capital_budget = Some(0.0);
+
+        let err = artifact.approved_strategy.validate_contract().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("research_gate_capital_budget must be positive and finite")
         );
     }
 
@@ -16516,6 +16548,7 @@ mod tests {
             strategy_id: "test_strategy".to_owned(),
             profile_name: "test_profile".to_owned(),
             research_from: None,
+            research_gate_capital_budget: None,
             live_detector_lookback_days: None,
             symbols: vec![
                 "CRWV".to_owned(),

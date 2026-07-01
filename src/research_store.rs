@@ -2102,6 +2102,7 @@ mod tests {
             strategy_id: "approved_v1".to_owned(),
             profile_name: "profile_v1".to_owned(),
             research_from: None,
+            research_gate_capital_budget: None,
             live_detector_lookback_days: Some(30),
             symbols: vec!["TSLA".to_owned()],
             portfolio_constraints: ApprovedPortfolioConstraints {

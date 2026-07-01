@@ -11,6 +11,8 @@ pub struct ApprovedStrategy {
     #[serde(default)]
     pub research_from: Option<NaiveDate>,
     #[serde(default)]
+    pub research_gate_capital_budget: Option<f64>,
+    #[serde(default)]
     pub live_detector_lookback_days: Option<i64>,
     pub symbols: Vec<String>,
     pub portfolio_constraints: ApprovedPortfolioConstraints,
@@ -146,6 +148,12 @@ impl ApprovedStrategy {
             anyhow::ensure!(
                 research_from <= Utc::now().date_naive(),
                 "approved strategy research_from {research_from} cannot be in the future"
+            );
+        }
+        if let Some(capital_budget) = self.research_gate_capital_budget {
+            anyhow::ensure!(
+                capital_budget.is_finite() && capital_budget > 0.0,
+                "approved strategy research_gate_capital_budget must be positive and finite"
             );
         }
         if let Some(days) = self.live_detector_lookback_days {

@@ -42,17 +42,21 @@ flowchart LR
 ## Contracts
 
 `ApprovedStrategy` contains the strategy id, profile name, optional
-`research_from`, symbols, portfolio constraints, allowed live strategies, canary
-risk policy id, and optional production approval metadata. Signal refresh uses
-`research_from` from the approved strategy for approval/research runs, so
-production does not silently drift onto a different research window. Live signal
-refresh may also set `live_detector_lookback_days`; when present, each market
-refresh loads only that recent detector window while relying on the approved
-strategy's production approval instead of re-running the multi-year promotion
-gate every interval. A selected live entry must have either canary approval or an
-explicit operator risk override with an auditable reason. When an override
-includes `max_order_max_loss`, the live signal contract rejects selected entries
-above that cap.
+`research_from`, optional `research_gate_capital_budget`, symbols, portfolio
+constraints, allowed live strategies, canary risk policy id, and optional
+production approval metadata. Portfolio constraints size live/account heat:
+capital, symbol allocation, open-position caps, and cooldowns. The optional
+`research_gate_capital_budget` is only the normalization denominator for
+multi-year research gates, recent-regime drawdown gates, and ablation gates.
+Signal refresh uses `research_from` from the approved strategy for
+approval/research runs, so production does not silently drift onto a different
+research window. Live signal refresh may also set `live_detector_lookback_days`;
+when present, each market refresh loads only that recent detector window while
+relying on the approved strategy's production approval instead of re-running the
+multi-year promotion gate every interval. A selected live entry must have either
+canary approval or an explicit operator risk override with an auditable reason.
+When an override includes `max_order_max_loss`, the live signal contract rejects
+selected entries above that cap.
 
 `LiveSignalArtifact` contains:
 
