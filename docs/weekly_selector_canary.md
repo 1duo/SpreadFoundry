@@ -1078,6 +1078,8 @@ SMCI was rechecked after fixing warm-cache DuckDB lock contention and expanding 
 
 The broader relaxed candidate basket `QCOM,RIVN,RKLB,APP,VRT,UBER,SMCI` was rejected in `runs/portfolio-weekly-selector-research-20260701T134356.656707000Z`: it increased activity to `2339` trades but reduced raw PnL to `125063` and $25-cost PnL to `66588`. Direct contributions were not robust after friction: `QCOM` added `19` trades / `271` raw PnL, `RIVN` `24` / `146`, `APP` `11` / `-880`, `RKLB` `4` / `-232`, `SMCI` `1` / `257`, `UBER` `20` / `-174`, and `VRT` `2` / `-459`.
 
+The promotion comparison is now first-class in `research-portfolio-selector` via `--promotion-baseline-run`. Re-running the same basket in `runs/portfolio-weekly-selector-research-20260701T135425.822721000Z` with the approved baseline run blocked promotion automatically: canary readiness fell to `canary_only`, promotion status was `blocked`, and $25-cost PnL was `66588` versus the baseline `69106`. The new-symbol checks also exposed the exact failure modes: `QCOM`, `RIVN`, `APP`, and `UBER` were negative after $25/trade; `RKLB`, `SMCI`, and `VRT` did not meet the `10` direct-trade floor.
+
 Professional decision: keep the current COIN-approved production basket. The relaxed gates are useful for search, but new symbols still need to improve the current after-cost baseline with enough direct trades to avoid single-allocation overfit.
 
 Require an actionable signal before any canary action:

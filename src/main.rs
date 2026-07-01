@@ -591,6 +591,10 @@ enum Commands {
         symbol_drawdown_cooldown_trigger_pct: Option<f64>,
         #[arg(long, default_value_t = 0)]
         symbol_drawdown_cooldown_days: i64,
+        #[arg(long)]
+        promotion_baseline_run: Option<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        promotion_min_new_symbol_trades: usize,
     },
 }
 
@@ -1421,6 +1425,9 @@ async fn main() -> Result<()> {
                 portfolio_drawdown_cooldown_days,
                 symbol_drawdown_cooldown_trigger_pct,
                 symbol_drawdown_cooldown_days,
+                promotion_baseline_cost_25_pnl: None,
+                promotion_baseline_symbols: Vec::new(),
+                promotion_min_new_symbol_trades: 10,
             })
             .await?;
             if let Some(best) = report.profiles.first() {
@@ -1455,7 +1462,13 @@ async fn main() -> Result<()> {
             portfolio_drawdown_cooldown_days,
             symbol_drawdown_cooldown_trigger_pct,
             symbol_drawdown_cooldown_days,
+            promotion_baseline_run,
+            promotion_min_new_symbol_trades,
         } => {
+            let promotion_reference = promotion_baseline_run
+                .as_deref()
+                .map(portfolio_promotion_reference_from_run)
+                .transpose()?;
             let report = if let Some(approved_strategy_path) = approved_strategy {
                 let approved_strategy = read_approved_strategy(&approved_strategy_path)?;
                 let constraints = approved_strategy.portfolio_constraints.clone();
@@ -1482,6 +1495,14 @@ async fn main() -> Result<()> {
                         symbol_drawdown_cooldown_trigger_pct: constraints
                             .symbol_drawdown_cooldown_trigger_pct,
                         symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
+                        promotion_baseline_cost_25_pnl: promotion_reference
+                            .as_ref()
+                            .map(|reference| reference.cost_25_pnl),
+                        promotion_baseline_symbols: promotion_reference
+                            .as_ref()
+                            .map(|reference| reference.symbols.clone())
+                            .unwrap_or_default(),
+                        promotion_min_new_symbol_trades,
                     },
                     &approved_strategy.profile_name,
                 )
@@ -1513,6 +1534,14 @@ async fn main() -> Result<()> {
                     portfolio_drawdown_cooldown_days,
                     symbol_drawdown_cooldown_trigger_pct,
                     symbol_drawdown_cooldown_days,
+                    promotion_baseline_cost_25_pnl: promotion_reference
+                        .as_ref()
+                        .map(|reference| reference.cost_25_pnl),
+                    promotion_baseline_symbols: promotion_reference
+                        .as_ref()
+                        .map(|reference| reference.symbols.clone())
+                        .unwrap_or_default(),
+                    promotion_min_new_symbol_trades,
                 })
                 .await?
             };
@@ -1691,6 +1720,36 @@ fn portfolio_report_json_path(run: &Path) -> PathBuf {
     } else {
         run.to_path_buf()
     }
+}
+
+#[derive(Clone, Debug)]
+struct PortfolioPromotionReference {
+    cost_25_pnl: f64,
+    symbols: Vec<String>,
+}
+
+fn portfolio_promotion_reference_from_run(run: &Path) -> Result<PortfolioPromotionReference> {
+    let report_path = portfolio_report_json_path(run);
+    let report: PortfolioWheelReport = serde_json::from_str(
+        &fs::read_to_string(&report_path)
+            .with_context(|| format!("read portfolio report {}", report_path.display()))?,
+    )
+    .with_context(|| format!("parse portfolio report {}", report_path.display()))?;
+    let best = report
+        .profiles
+        .first()
+        .with_context(|| format!("portfolio report {} has no profiles", report_path.display()))?;
+    let cost_25_pnl = best
+        .metrics
+        .cost_stress
+        .iter()
+        .find(|stress| (stress.per_trade_cost - 25.0).abs() < f64::EPSILON)
+        .map(|stress| stress.total_pnl)
+        .unwrap_or(best.metrics.total_pnl);
+    Ok(PortfolioPromotionReference {
+        cost_25_pnl,
+        symbols: report.symbols,
+    })
 }
 
 fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
@@ -2021,6 +2080,9 @@ async fn refresh_live_signal_selector_run(args: RefreshLiveSignalArgs) -> Result
             portfolio_drawdown_cooldown_days: constraints.portfolio_drawdown_cooldown_days,
             symbol_drawdown_cooldown_trigger_pct: constraints.symbol_drawdown_cooldown_trigger_pct,
             symbol_drawdown_cooldown_days: constraints.symbol_drawdown_cooldown_days,
+            promotion_baseline_cost_25_pnl: None,
+            promotion_baseline_symbols: Vec::new(),
+            promotion_min_new_symbol_trades: 10,
         },
         &approved_strategy.profile_name,
     )

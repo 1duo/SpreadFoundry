@@ -36,6 +36,7 @@ const COST_STRESS_PER_TRADE: [f64; 3] = [5.0, 10.0, 25.0];
 const PORTFOLIO_MAX_MATERIAL_NEGATIVE_YEAR_PCT_OF_CAPITAL: f64 = 0.02;
 const PORTFOLIO_RESEARCH_MAX_DRAWDOWN: f64 = 0.15;
 const PORTFOLIO_CANARY_MAX_CAPITAL_DRAWDOWN_PCT: f64 = 0.10;
+const PROMOTION_MIN_NEW_SYMBOL_TRADES: usize = 10;
 const WALK_FORWARD_MIN_TRAIN_DAYS: i64 = 365 * 3;
 const ROLLING_WALK_FORWARD_TRAIN_DAYS: i64 = 365 * 4;
 const WALK_FORWARD_SELECTION_DIAGNOSTIC_LIMIT: usize = 5;
@@ -178,6 +179,16 @@ pub struct PortfolioWheelResearchRequest {
     pub symbol_drawdown_cooldown_trigger_pct: Option<f64>,
     #[serde(default)]
     pub symbol_drawdown_cooldown_days: i64,
+    #[serde(default)]
+    pub promotion_baseline_cost_25_pnl: Option<f64>,
+    #[serde(default)]
+    pub promotion_baseline_symbols: Vec<String>,
+    #[serde(default = "default_promotion_min_new_symbol_trades")]
+    pub promotion_min_new_symbol_trades: usize,
+}
+
+fn default_promotion_min_new_symbol_trades() -> usize {
+    PROMOTION_MIN_NEW_SYMBOL_TRADES
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -386,6 +397,8 @@ pub struct PortfolioWheelProfileResult {
     pub ablations: Vec<PortfolioAblationSummary>,
     pub canary_readiness: PortfolioCanaryReadiness,
     #[serde(default)]
+    pub promotion_readiness: PortfolioPromotionReadiness,
+    #[serde(default)]
     pub latest_actions: Vec<PortfolioLatestAction>,
     pub gate_status: String,
     pub gate_pass: bool,
@@ -516,6 +529,29 @@ pub struct PortfolioCanaryReadiness {
     pub symbol_ablation_passes: usize,
     pub strategy_ablation_passes: usize,
     pub cost_25_pnl: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PortfolioPromotionReadiness {
+    pub status: String,
+    pub pass: bool,
+    pub reason: String,
+    pub cost_25_pnl: f64,
+    pub baseline_cost_25_pnl: Option<f64>,
+    pub cost_25_pnl_improvement: Option<f64>,
+    pub baseline_symbols: Vec<String>,
+    pub min_new_symbol_trades: usize,
+    pub new_symbol_checks: Vec<PortfolioPromotionSymbolCheck>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PortfolioPromotionSymbolCheck {
+    pub symbol: String,
+    pub trades: usize,
+    pub pnl: f64,
+    pub cost_25_pnl: f64,
+    pub pass: bool,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2612,6 +2648,14 @@ async fn run_portfolio_research(
                 request.capital_budget,
                 &risk_summary,
             );
+            let symbol_summaries = portfolio_wheel_symbol_summaries(&allocation.trades);
+            let promotion_readiness = portfolio_promotion_readiness(
+                &metrics,
+                &symbol_summaries,
+                request.promotion_baseline_cost_25_pnl,
+                &request.promotion_baseline_symbols,
+                request.promotion_min_new_symbol_trades,
+            );
             let canary_readiness = portfolio_canary_readiness(
                 &metrics,
                 &allocation.trades,
@@ -2619,6 +2663,7 @@ async fn run_portfolio_research(
                 &strategy_summaries,
                 &decision_metrics,
                 gate_pass,
+                &promotion_readiness,
             );
             let latest_actions = portfolio_latest_actions(
                 &allocation.trades,
@@ -2643,12 +2688,13 @@ async fn run_portfolio_research(
                 rejected_symbol_drawdown_cooldown: allocation.rejected_symbol_drawdown_cooldown,
                 max_capital_used: allocation.max_capital_used,
                 avg_capital_used_on_entry: allocation.avg_capital_used_on_entry,
-                symbol_summaries: portfolio_wheel_symbol_summaries(&allocation.trades),
+                symbol_summaries,
                 strategy_summaries,
                 risk_summary,
                 decision_metrics,
                 ablations,
                 canary_readiness,
+                promotion_readiness,
                 latest_actions,
                 gate_status,
                 gate_pass,
@@ -3692,13 +3738,9 @@ fn portfolio_canary_readiness(
     strategy_summaries: &[PortfolioStrategySummary],
     decision_metrics: &PortfolioDecisionMetrics,
     gate_pass: bool,
+    promotion_readiness: &PortfolioPromotionReadiness,
 ) -> PortfolioCanaryReadiness {
-    let cost_25_pnl = metrics
-        .cost_stress
-        .iter()
-        .find(|stress| (stress.per_trade_cost - 25.0).abs() < f64::EPSILON)
-        .map(|stress| stress.total_pnl)
-        .unwrap_or(metrics.total_pnl);
+    let cost_25_pnl = portfolio_cost_25_pnl(metrics);
     let (max_symbol, max_symbol_pnl_share) = max_symbol_pnl_share(trades, metrics.total_pnl);
     let symbol_ablation_passes = ablations
         .iter()
@@ -3719,6 +3761,7 @@ fn portfolio_canary_readiness(
         && decision_metrics.professional_risk_flag != "inventory_risk_high"
         && negative_strategy.is_none();
     let full_promotion_ready = canary_ready
+        && promotion_readiness.pass
         && max_symbol_pnl_share <= 0.50
         && symbol_ablation_passes >= 3
         && strategy_ablation_passes > 0;
@@ -3730,16 +3773,20 @@ fn portfolio_canary_readiness(
                 .to_owned(),
         )
     } else if canary_ready {
-        (
-            "canary_only",
-            0.05,
+        let reason = if !promotion_readiness.pass {
+            format!(
+                "research gate passed, but promotion comparison failed: {}",
+                promotion_readiness.reason
+            )
+        } else {
             format!(
                 "research gate passed, but concentration remains: max symbol PnL share {:.1}%, symbol ablation passes {}, strategy ablation passes {}",
                 max_symbol_pnl_share * 100.0,
                 symbol_ablation_passes,
                 strategy_ablation_passes
-            ),
-        )
+            )
+        };
+        ("canary_only", 0.05, reason)
     } else {
         (
             "blocked",
@@ -3775,6 +3822,121 @@ fn portfolio_canary_readiness(
         strategy_ablation_passes,
         cost_25_pnl,
     }
+}
+
+fn portfolio_promotion_readiness(
+    metrics: &ResearchMetrics,
+    symbol_summaries: &[PortfolioWheelSymbolSummary],
+    baseline_cost_25_pnl: Option<f64>,
+    baseline_symbols: &[String],
+    min_new_symbol_trades: usize,
+) -> PortfolioPromotionReadiness {
+    let cost_25_pnl = portfolio_cost_25_pnl(metrics);
+    let baseline_symbols = normalize_portfolio_symbols(baseline_symbols);
+    let baseline_symbol_set = baseline_symbols.iter().cloned().collect::<BTreeSet<_>>();
+    let min_new_symbol_trades = min_new_symbol_trades.max(1);
+    let configured = baseline_cost_25_pnl.is_some() || !baseline_symbols.is_empty();
+    let new_symbol_checks = if baseline_symbols.is_empty() {
+        Vec::new()
+    } else {
+        symbol_summaries
+            .iter()
+            .filter(|summary| !baseline_symbol_set.contains(&summary.symbol.to_ascii_uppercase()))
+            .map(|summary| {
+                let cost_25_pnl = summary.pnl - 25.0 * summary.trades as f64;
+                let (pass, reason) = if summary.trades < min_new_symbol_trades {
+                    (
+                        false,
+                        format!(
+                            "new symbol has {} trades versus required {}",
+                            summary.trades, min_new_symbol_trades
+                        ),
+                    )
+                } else if cost_25_pnl <= 0.0 {
+                    (
+                        false,
+                        format!("new symbol $25 cost PnL {cost_25_pnl:.2} is not positive"),
+                    )
+                } else {
+                    (
+                        true,
+                        format!(
+                            "new symbol passed with {} trades and $25 cost PnL {:.2}",
+                            summary.trades, cost_25_pnl
+                        ),
+                    )
+                };
+                PortfolioPromotionSymbolCheck {
+                    symbol: summary.symbol.clone(),
+                    trades: summary.trades,
+                    pnl: summary.pnl,
+                    cost_25_pnl,
+                    pass,
+                    reason,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let cost_25_pnl_improvement = baseline_cost_25_pnl.map(|baseline| cost_25_pnl - baseline);
+    let baseline_pass = cost_25_pnl_improvement
+        .map(|improvement| improvement > 0.0)
+        .unwrap_or(true);
+    let new_symbols_pass = new_symbol_checks.iter().all(|check| check.pass);
+    let pass = !configured || (baseline_pass && new_symbols_pass);
+    let (status, reason) = if !configured {
+        (
+            "not_configured",
+            "no promotion baseline configured; canary readiness uses intrinsic gates only"
+                .to_owned(),
+        )
+    } else if !baseline_pass {
+        let baseline = baseline_cost_25_pnl.unwrap_or(0.0);
+        (
+            "blocked",
+            format!(
+                "$25 cost PnL {:.2} did not beat baseline {:.2}",
+                cost_25_pnl, baseline
+            ),
+        )
+    } else if let Some(failing) = new_symbol_checks.iter().find(|check| !check.pass) {
+        (
+            "blocked",
+            format!(
+                "{} failed promotion check: {}",
+                failing.symbol, failing.reason
+            ),
+        )
+    } else {
+        (
+            "promotion_pass",
+            format!(
+                "$25 cost PnL improved by {:.2} and {} new-symbol checks passed",
+                cost_25_pnl_improvement.unwrap_or(0.0),
+                new_symbol_checks.len()
+            ),
+        )
+    };
+
+    PortfolioPromotionReadiness {
+        status: status.to_owned(),
+        pass,
+        reason,
+        cost_25_pnl,
+        baseline_cost_25_pnl,
+        cost_25_pnl_improvement,
+        baseline_symbols,
+        min_new_symbol_trades,
+        new_symbol_checks,
+    }
+}
+
+fn portfolio_cost_25_pnl(metrics: &ResearchMetrics) -> f64 {
+    metrics
+        .cost_stress
+        .iter()
+        .find(|stress| (stress.per_trade_cost - 25.0).abs() < f64::EPSILON)
+        .map(|stress| stress.total_pnl)
+        .unwrap_or(metrics.total_pnl)
 }
 
 fn max_symbol_pnl_share(trades: &[PortfolioWheelTrade], total_pnl: f64) -> (Option<String>, f64) {
@@ -4218,6 +4380,37 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             best.canary_readiness.symbol_ablation_passes,
             best.canary_readiness.strategy_ablation_passes
         ));
+        out.push_str(&format!(
+            "- Promotion comparison: `{}` ({})\n- Promotion $25 cost PnL: `{:.2}`\n- Promotion baseline $25 cost PnL: `{}`\n- Promotion $25 cost improvement: `{}`\n- Minimum new-symbol trades: `{}`\n\n",
+            best.promotion_readiness.status,
+            best.promotion_readiness.reason,
+            best.promotion_readiness.cost_25_pnl,
+            best.promotion_readiness
+                .baseline_cost_25_pnl
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            best.promotion_readiness
+                .cost_25_pnl_improvement
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            best.promotion_readiness.min_new_symbol_trades
+        ));
+        if !best.promotion_readiness.new_symbol_checks.is_empty() {
+            out.push_str("| New Symbol | Pass | Trades | PnL | $25 Cost PnL | Reason |\n");
+            out.push_str("|---|---:|---:|---:|---:|---|\n");
+            for check in &best.promotion_readiness.new_symbol_checks {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {:.2} | {:.2} | {} |\n",
+                    check.symbol,
+                    check.pass,
+                    check.trades,
+                    check.pnl,
+                    check.cost_25_pnl,
+                    check.reason
+                ));
+            }
+            out.push('\n');
+        }
         out.push_str(&format!(
             "- Covered-call strike floor: `{:.1}%` of assigned put strike\n- Average covered calls per completed cycle: `{:.2}`\n\n",
             best.profile.covered_call_min_strike_pct_of_assigned * 100.0,
@@ -14137,6 +14330,7 @@ mod tests {
             &strategies,
             &PortfolioDecisionMetrics::default(),
             true,
+            &portfolio_promotion_test_pass(),
         );
 
         assert_eq!(readiness.status, "blocked");
@@ -14172,8 +14366,15 @@ mod tests {
             ..PortfolioDecisionMetrics::default()
         };
 
-        let readiness =
-            portfolio_canary_readiness(&metrics, &[trade], &[], &[], &decision_metrics, true);
+        let readiness = portfolio_canary_readiness(
+            &metrics,
+            &[trade],
+            &[],
+            &[],
+            &decision_metrics,
+            true,
+            &portfolio_promotion_test_pass(),
+        );
 
         assert_eq!(readiness.status, "blocked");
         assert_eq!(readiness.recommended_capital_fraction, 0.0);
@@ -14203,8 +14404,15 @@ mod tests {
             ..PortfolioDecisionMetrics::default()
         };
 
-        let readiness =
-            portfolio_canary_readiness(&metrics, &[trade], &[], &[], &decision_metrics, true);
+        let readiness = portfolio_canary_readiness(
+            &metrics,
+            &[trade],
+            &[],
+            &[],
+            &decision_metrics,
+            true,
+            &portfolio_promotion_test_pass(),
+        );
 
         assert_eq!(readiness.status, "canary_only");
         assert!(readiness.canary_ready);
@@ -14235,13 +14443,80 @@ mod tests {
             ..PortfolioDecisionMetrics::default()
         };
 
-        let readiness =
-            portfolio_canary_readiness(&metrics, &[trade], &[], &[], &decision_metrics, true);
+        let readiness = portfolio_canary_readiness(
+            &metrics,
+            &[trade],
+            &[],
+            &[],
+            &decision_metrics,
+            true,
+            &portfolio_promotion_test_pass(),
+        );
 
         assert_eq!(readiness.status, "blocked");
         assert!(!readiness.canary_ready);
         assert_eq!(readiness.recommended_capital_fraction, 0.0);
         assert!(readiness.reason.contains("capital DD"));
+    }
+
+    #[test]
+    fn portfolio_promotion_blocks_one_trade_new_symbol_artifact() {
+        let entry = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let tsla =
+            portfolio_wheel_opportunity("TSLA", entry, entry + Duration::days(1), 1_000.0, 800.0);
+        let smci = portfolio_wheel_opportunity(
+            "SMCI",
+            entry + Duration::days(2),
+            entry + Duration::days(3),
+            100.0,
+            257.0,
+        );
+        let trades = vec![
+            PortfolioWheelTrade {
+                symbol: tsla.symbol,
+                strategy: SpreadStructure::PutDebitSpread,
+                capital_at_risk: tsla.capital_at_risk,
+                trade: tsla.trade,
+            },
+            PortfolioWheelTrade {
+                symbol: smci.symbol,
+                strategy: SpreadStructure::CallDebitSpread,
+                capital_at_risk: smci.capital_at_risk,
+                trade: smci.trade,
+            },
+        ];
+        let research_trades = trades
+            .iter()
+            .map(|trade| trade.trade.clone())
+            .collect::<Vec<_>>();
+        let metrics = metrics_with_min_trades_per_year(
+            &research_trades,
+            entry,
+            entry + Duration::days(30),
+            0.1,
+        );
+        let symbols = portfolio_wheel_symbol_summaries(&trades);
+
+        let readiness = portfolio_promotion_readiness(
+            &metrics,
+            &symbols,
+            Some(700.0),
+            &["TSLA".to_owned()],
+            PROMOTION_MIN_NEW_SYMBOL_TRADES,
+        );
+
+        assert_eq!(readiness.status, "blocked");
+        assert!(!readiness.pass);
+        assert!(readiness.cost_25_pnl_improvement.unwrap() > 0.0);
+        assert!(readiness.reason.contains("SMCI failed promotion check"));
+        let smci_check = readiness
+            .new_symbol_checks
+            .iter()
+            .find(|check| check.symbol == "SMCI")
+            .unwrap();
+        assert_eq!(smci_check.trades, 1);
+        assert!(smci_check.cost_25_pnl > 0.0);
+        assert!(!smci_check.pass);
     }
 
     #[test]
@@ -18053,6 +18328,19 @@ mod tests {
             portfolio_drawdown_cooldown_days: 0,
             symbol_drawdown_cooldown_trigger_pct: None,
             symbol_drawdown_cooldown_days: 0,
+            promotion_baseline_cost_25_pnl: None,
+            promotion_baseline_symbols: Vec::new(),
+            promotion_min_new_symbol_trades: PROMOTION_MIN_NEW_SYMBOL_TRADES,
+        }
+    }
+
+    fn portfolio_promotion_test_pass() -> PortfolioPromotionReadiness {
+        PortfolioPromotionReadiness {
+            status: "not_configured".to_owned(),
+            pass: true,
+            reason: "test promotion baseline not configured".to_owned(),
+            min_new_symbol_trades: PROMOTION_MIN_NEW_SYMBOL_TRADES,
+            ..PortfolioPromotionReadiness::default()
         }
     }
 
