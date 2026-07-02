@@ -1,5 +1,5 @@
 {
-  "strategy_id": "weekly_selector_costaware_puts_ddog_dell_rblx_20260701",
+  "strategy_id": "weekly_selector_cap45k_sym02_max1_no_sofi_mdb_20260702",
   "profile_name": "selector_crash_and_costaware_puts_and_call_debits_only",
   "research_from": "2010-01-01",
   "research_gate_capital_budget": 100000.0,
@@ -16,7 +16,6 @@
     "COIN",
     "AVGO",
     "AAPL",
-    "SOFI",
     "MSFT",
     "ASTS",
     "INTC",
@@ -26,13 +25,14 @@
     "CRWD",
     "DDOG",
     "DELL",
-    "RBLX"
+    "RBLX",
+    "MDB"
   ],
   "portfolio_constraints": {
-    "capital_budget": 7897.67,
-    "max_symbol_allocation_pct": 0.15,
-    "max_open_positions": 3,
-    "max_positions_per_symbol": 2,
+    "capital_budget": 45000.0,
+    "max_symbol_allocation_pct": 0.02,
+    "max_open_positions": 1,
+    "max_positions_per_symbol": 1,
     "max_total_trades_per_symbol": null,
     "portfolio_drawdown_cooldown_trigger_pct": null,
     "portfolio_drawdown_cooldown_days": 0,
@@ -43,10 +43,10 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "canary_approved",
-    "approved_at": "2026-07-01T21:41:00Z",
+    "approved_at": "2026-07-02T08:25:00Z",
     "approved_by": "operator",
-    "reason": "Targeted no-QCOM approved-config refresh runs/portfolio-weekly-selector-research-20260701T214649.247655000Z-p19047-s0 promoted selector_crash_and_costaware_puts_and_call_debits_only without broad universe expansion or wheel execution. The run used the 22-symbol approved basket, account-sized capital budget 7897.67, 100000 research gate denominator, 15% max symbol allocation, max 3 open positions, and max 2 positions per symbol. It produced 2152 trades, 157978 raw PnL, 104178 $25-cost PnL, 2.33 profit factor, 205.28 trades/year, 7.13% capital DD, 11.28% $25-cost capital DD, and full_promotion_candidate status. Promotion comparison passed versus runs/portfolio-weekly-selector-research-20260701T212249.397953000Z-p61224-s0 by 10690 $25-cost PnL. Recent-regime validation passed with 732 trailing trades, 77527 $25-cost PnL, 44.3% $25-cost win rate, 2.92 $25-cost profit factor, and 4.27% recent $25-cost capital DD. TSLA max PnL share fell to 38.3%. Failed symbol ablations were AMD removal and DDOG removal, so AMD/DDOG dependency must be monitored, but the strategy remains debit-spread-only: put debit spreads contributed 89863 raw PnL across 1500 trades and call debit spreads contributed 68115 raw PnL across 652 trades. Production remains limited to broker-reconciled Tradier put/call debit-spread entry and close lifecycle gates with account-sized budget controls.",
-    "source_canary_status": "full_promotion_candidate",
-    "max_order_max_loss": 1000.0
+    "reason": "Canary-only safety refresh from runs/portfolio-weekly-selector-research-20260702T082455.238157000Z-p74314-s0. The prior July 1 approval no longer clears current account-budget drawdown checks under the 7897.67 sleeve. This replacement keeps the live scope debit-spread-only, removes SOFI, adds MDB, raises the approved capital denominator to 45000, and tightens live heat to 2% max symbol allocation, max 1 open position, and max 1 position per symbol, so per-symbol/open debit exposure is capped near 900. The full-history run used 2010-01-01 through 2026-06-30, 100000 research gate denominator, cache-only snapshot-backed data, and produced 682 allocated trades, 87191.50 raw PnL, 70141.50 $25-cost PnL, 52.1% win rate, 3.25 profit factor, 65.06 trades/year, 4.81% account-budget capital DD, and 8.46% $25-cost account-budget capital DD. Recent-regime validation passed with 211 trailing trades and 45709.50 $25-cost PnL. MDB passed the new-symbol check with 11 trades and 724.00 $25-cost PnL. Source canary status was canary_only rather than full_promotion_candidate because $25-cost PnL did not beat the superseded 104178.00 baseline; this approval is intentionally a safer canary-ready live envelope, not a full-size profit-maximizing promotion.",
+    "source_canary_status": "canary_only",
+    "max_order_max_loss": 900.0
   }
 }
