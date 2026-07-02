@@ -209,12 +209,20 @@ enum Commands {
         as_of: Option<NaiveDate>,
         #[arg(long, default_value_t = 45_000.0)]
         account_cash: f64,
+        #[arg(long, value_enum, default_value = "configured")]
+        account_cash_source: ExecutionAccountCashSource,
         #[arg(long, default_value_t = 1_000.0)]
         debit_max_loss: f64,
         #[arg(long, default_value_t = 35_000.0)]
         wheel_reserve_cap: f64,
         #[arg(long, default_value_t = 11_250.0)]
         free_cash_buffer: f64,
+        #[arg(long)]
+        free_cash_buffer_pct: Option<f64>,
+        #[arg(long)]
+        max_daily_loss_pct: Option<f64>,
+        #[arg(long)]
+        max_open_loss_pct: Option<f64>,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
         #[arg(long, value_enum, default_value = "tradier")]
@@ -243,12 +251,20 @@ enum Commands {
         max_loss: Option<f64>,
         #[arg(long, default_value_t = 45_000.0)]
         account_cash: f64,
+        #[arg(long, value_enum, default_value = "configured")]
+        account_cash_source: ExecutionAccountCashSource,
         #[arg(long, default_value_t = 1_000.0)]
         debit_max_loss: f64,
         #[arg(long, default_value_t = 35_000.0)]
         wheel_reserve_cap: f64,
         #[arg(long, default_value_t = 11_250.0)]
         free_cash_buffer: f64,
+        #[arg(long)]
+        free_cash_buffer_pct: Option<f64>,
+        #[arg(long)]
+        max_daily_loss_pct: Option<f64>,
+        #[arg(long)]
+        max_open_loss_pct: Option<f64>,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
         #[arg(long, value_enum, default_value = "monitor")]
@@ -277,12 +293,20 @@ enum Commands {
         as_of: Option<NaiveDate>,
         #[arg(long, default_value_t = 45_000.0)]
         account_cash: f64,
+        #[arg(long, value_enum, default_value = "configured")]
+        account_cash_source: ExecutionAccountCashSource,
         #[arg(long, default_value_t = 1_000.0)]
         debit_max_loss: f64,
         #[arg(long, default_value_t = 35_000.0)]
         wheel_reserve_cap: f64,
         #[arg(long, default_value_t = 11_250.0)]
         free_cash_buffer: f64,
+        #[arg(long)]
+        free_cash_buffer_pct: Option<f64>,
+        #[arg(long)]
+        max_daily_loss_pct: Option<f64>,
+        #[arg(long)]
+        max_open_loss_pct: Option<f64>,
         #[arg(long, default_value_t = 1)]
         max_wheel_positions_per_symbol: usize,
         #[arg(long, value_enum, default_value = "monitor")]
@@ -662,6 +686,12 @@ enum ExecutionMode {
 enum BrokerKind {
     Robinhood,
     Tradier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExecutionAccountCashSource {
+    Configured,
+    Broker,
 }
 
 #[derive(Clone, Debug)]
@@ -1058,9 +1088,13 @@ async fn main() -> Result<()> {
             live_signal,
             as_of,
             account_cash,
+            account_cash_source,
             debit_max_loss,
             wheel_reserve_cap,
             free_cash_buffer,
+            free_cash_buffer_pct,
+            max_daily_loss_pct,
+            max_open_loss_pct,
             max_wheel_positions_per_symbol,
             broker,
             broker_multi_leg_options,
@@ -1074,9 +1108,13 @@ async fn main() -> Result<()> {
             &live_signal,
             as_of,
             account_cash,
+            account_cash_source,
             debit_max_loss,
             wheel_reserve_cap,
             free_cash_buffer,
+            free_cash_buffer_pct,
+            max_daily_loss_pct,
+            max_open_loss_pct,
             max_wheel_positions_per_symbol,
             broker,
             broker_multi_leg_options,
@@ -1092,9 +1130,13 @@ async fn main() -> Result<()> {
             as_of,
             max_loss,
             account_cash,
+            account_cash_source,
             debit_max_loss,
             wheel_reserve_cap,
             free_cash_buffer,
+            free_cash_buffer_pct,
+            max_daily_loss_pct,
+            max_open_loss_pct,
             max_wheel_positions_per_symbol,
             mode,
             broker,
@@ -1110,9 +1152,13 @@ async fn main() -> Result<()> {
             as_of,
             max_loss,
             account_cash,
+            account_cash_source,
             debit_max_loss,
             wheel_reserve_cap,
             free_cash_buffer,
+            free_cash_buffer_pct,
+            max_daily_loss_pct,
+            max_open_loss_pct,
             max_wheel_positions_per_symbol,
             mode,
             broker,
@@ -1128,9 +1174,13 @@ async fn main() -> Result<()> {
             live_signal,
             as_of,
             account_cash,
+            account_cash_source,
             debit_max_loss,
             wheel_reserve_cap,
             free_cash_buffer,
+            free_cash_buffer_pct,
+            max_daily_loss_pct,
+            max_open_loss_pct,
             max_wheel_positions_per_symbol,
             mode,
             broker,
@@ -1150,18 +1200,22 @@ async fn main() -> Result<()> {
             run_execution_worker(ExecutionWorkerArgs {
                 live_signal,
                 as_of,
-                risk: CanaryRiskPolicy {
+                risk: CanaryRiskInput {
+                    account_cash_source,
                     account_cash,
                     debit_max_loss,
                     wheel_reserve_cap,
                     free_cash_buffer,
+                    free_cash_buffer_pct,
                     max_wheel_positions_per_symbol,
                     max_daily_loss_usd: env_optional_positive_f64(
                         "SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD",
                     )?,
+                    max_daily_loss_pct,
                     max_open_loss_usd: env_optional_positive_f64(
                         "SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD",
                     )?,
+                    max_open_loss_pct,
                 },
                 broker: execution_broker(
                     broker,
@@ -2445,9 +2499,13 @@ fn run_execution_decision(
     as_of: Option<NaiveDate>,
     max_loss: Option<f64>,
     account_cash: f64,
+    account_cash_source: ExecutionAccountCashSource,
     debit_max_loss: f64,
     wheel_reserve_cap: f64,
     free_cash_buffer: f64,
+    free_cash_buffer_pct: Option<f64>,
+    max_daily_loss_pct: Option<f64>,
+    max_open_loss_pct: Option<f64>,
     max_wheel_positions_per_symbol: usize,
     mode: ExecutionMode,
     broker_kind: BrokerKind,
@@ -2470,16 +2528,17 @@ fn run_execution_decision(
             .with_context(|| format!("read live signal artifact {}", live_signal.display()))?,
     )
     .with_context(|| format!("parse live signal artifact {}", live_signal.display()))?;
-    let risk = CanaryRiskPolicy {
+    let risk_input = canary_risk_input(
+        account_cash_source,
         account_cash,
-        debit_max_loss: max_loss.unwrap_or(debit_max_loss),
+        max_loss.unwrap_or(debit_max_loss),
         wheel_reserve_cap,
         free_cash_buffer,
+        free_cash_buffer_pct,
         max_wheel_positions_per_symbol,
-        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
-        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
-    };
-    validate_canary_risk_policy(&risk)?;
+        max_daily_loss_pct,
+        max_open_loss_pct,
+    )?;
     let broker = execution_broker(
         broker_kind,
         broker_multi_leg_options,
@@ -2487,6 +2546,8 @@ fn run_execution_decision(
         broker_covered_calls,
         mode == ExecutionMode::Live,
     );
+    let broker_account = snapshot_broker_account(broker_kind);
+    let risk = resolve_canary_risk_policy(&risk_input, broker_account.as_ref())?;
     let mut decision = compute_execution_decision(
         &artifact,
         as_of,
@@ -2495,10 +2556,7 @@ fn run_execution_decision(
         mode,
         max_order_age_seconds,
     );
-    apply_execution_account_halt_to_decision(
-        &mut decision,
-        snapshot_broker_account(broker_kind).as_ref(),
-    );
+    apply_execution_account_halt_to_decision(&mut decision, broker_account.as_ref());
     apply_broker_bridge(
         &mut decision,
         &broker,
@@ -2567,9 +2625,13 @@ fn execution_readiness(
     live_signal: &Path,
     as_of: Option<NaiveDate>,
     account_cash: f64,
+    account_cash_source: ExecutionAccountCashSource,
     debit_max_loss: f64,
     wheel_reserve_cap: f64,
     free_cash_buffer: f64,
+    free_cash_buffer_pct: Option<f64>,
+    max_daily_loss_pct: Option<f64>,
+    max_open_loss_pct: Option<f64>,
     max_wheel_positions_per_symbol: usize,
     broker_kind: BrokerKind,
     broker_multi_leg_options: bool,
@@ -2581,16 +2643,17 @@ fn execution_readiness(
     json: bool,
 ) -> Result<()> {
     let as_of = as_of.unwrap_or_else(|| execution_default_as_of(Utc::now()));
-    let risk = CanaryRiskPolicy {
+    let risk_input = canary_risk_input(
+        account_cash_source,
         account_cash,
         debit_max_loss,
         wheel_reserve_cap,
         free_cash_buffer,
+        free_cash_buffer_pct,
         max_wheel_positions_per_symbol,
-        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
-        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
-    };
-    validate_canary_risk_policy(&risk)?;
+        max_daily_loss_pct,
+        max_open_loss_pct,
+    )?;
     let broker = execution_broker(
         broker_kind,
         broker_multi_leg_options,
@@ -2598,6 +2661,8 @@ fn execution_readiness(
         broker_covered_calls,
         true,
     );
+    let broker_account = snapshot_broker_account(broker_kind);
+    let risk = resolve_canary_risk_policy(&risk_input, broker_account.as_ref())?;
     let signal_body = fs::read_to_string(live_signal);
     let live_signal_readable = signal_body.is_ok();
     let mut signal_error = None;
@@ -2615,7 +2680,6 @@ fn execution_readiness(
         }
     };
     let live_signal_parse_ok = artifact.is_some();
-    let broker_account = snapshot_broker_account(broker_kind);
     let report = build_execution_readiness_report(
         live_signal,
         live_signal_readable,
@@ -2805,6 +2869,21 @@ struct CanaryRiskPolicy {
     /// When set, blocks new live entries once broker open P&L is at or below
     /// this loss. Defaults to max_daily_loss_usd when unset.
     max_open_loss_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct CanaryRiskInput {
+    account_cash_source: ExecutionAccountCashSource,
+    account_cash: f64,
+    debit_max_loss: f64,
+    wheel_reserve_cap: f64,
+    free_cash_buffer: f64,
+    free_cash_buffer_pct: Option<f64>,
+    max_wheel_positions_per_symbol: usize,
+    max_daily_loss_usd: Option<f64>,
+    max_daily_loss_pct: Option<f64>,
+    max_open_loss_usd: Option<f64>,
+    max_open_loss_pct: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -8814,7 +8893,7 @@ fn require_option_nonzero_f64(value: Option<f64>, field: &str) -> Result<f64> {
 struct ExecutionWorkerArgs {
     live_signal: PathBuf,
     as_of: Option<NaiveDate>,
-    risk: CanaryRiskPolicy,
+    risk: CanaryRiskInput,
     broker: ExecutionBrokerAdapter,
     mode: ExecutionMode,
     robinhood_mcp_command: Option<String>,
@@ -9553,7 +9632,7 @@ fn pid_file_running(pid_file: &Path) -> bool {
 }
 
 async fn run_execution_worker(args: ExecutionWorkerArgs) -> Result<()> {
-    validate_canary_risk_policy(&args.risk)?;
+    validate_canary_risk_input(&args.risk)?;
     if args.poll_seconds == 0 && !args.once {
         anyhow::bail!("--poll-seconds must be positive unless --once is used");
     }
@@ -9593,24 +9672,33 @@ async fn run_execution_worker_from_env(once_flag: bool) -> Result<()> {
     let mode = parse_execution_mode_env("SPREAD_EXECUTION_MODE", ExecutionMode::Monitor)?;
     let broker_kind = parse_broker_kind_env("SPREAD_EXECUTION_BROKER", BrokerKind::Tradier)?;
     let once = once_flag || env_bool("SPREAD_EXECUTION_ONCE", false);
+    let risk = CanaryRiskInput {
+        account_cash_source: parse_account_cash_source_env(
+            "SPREAD_EXECUTION_ACCOUNT_CASH_SOURCE",
+            ExecutionAccountCashSource::Configured,
+        )?,
+        account_cash: env_f64("SPREAD_EXECUTION_ACCOUNT_CASH", 45_000.0)?,
+        debit_max_loss: env_f64("SPREAD_CANARY_RISK_DEBIT_MAX_LOSS", 1_000.0)?,
+        wheel_reserve_cap: env_f64("SPREAD_CANARY_RISK_WHEEL_RESERVE_CAP", 35_000.0)?,
+        free_cash_buffer: env_f64("SPREAD_CANARY_RISK_FREE_CASH_BUFFER", 11_250.0)?,
+        free_cash_buffer_pct: env_optional_f64("SPREAD_CANARY_RISK_FREE_CASH_BUFFER_PCT")?,
+        max_wheel_positions_per_symbol: env_usize(
+            "SPREAD_CANARY_RISK_MAX_WHEEL_POSITIONS_PER_SYMBOL",
+            1,
+        )?,
+        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
+        max_daily_loss_pct: env_optional_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_PCT")?,
+        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
+        max_open_loss_pct: env_optional_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_PCT")?,
+    };
+    validate_canary_risk_input(&risk)?;
     run_execution_worker(ExecutionWorkerArgs {
         live_signal: PathBuf::from(env_string(
             "SPREAD_LIVE_SIGNAL_ARTIFACT",
             "var/live_signal.json",
         )),
         as_of: None,
-        risk: CanaryRiskPolicy {
-            account_cash: env_f64("SPREAD_EXECUTION_ACCOUNT_CASH", 45_000.0)?,
-            debit_max_loss: env_f64("SPREAD_CANARY_RISK_DEBIT_MAX_LOSS", 1_000.0)?,
-            wheel_reserve_cap: env_f64("SPREAD_CANARY_RISK_WHEEL_RESERVE_CAP", 35_000.0)?,
-            free_cash_buffer: env_f64("SPREAD_CANARY_RISK_FREE_CASH_BUFFER", 11_250.0)?,
-            max_wheel_positions_per_symbol: env_usize(
-                "SPREAD_CANARY_RISK_MAX_WHEEL_POSITIONS_PER_SYMBOL",
-                1,
-            )?,
-            max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
-            max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
-        },
+        risk,
         broker: execution_broker(
             broker_kind,
             env_bool("SPREAD_EXECUTION_BROKER_MULTI_LEG_OPTIONS", false),
@@ -9698,6 +9786,18 @@ fn env_optional_positive_f64(name: &str) -> Result<Option<f64>> {
     }
 }
 
+fn env_optional_f64(name: &str) -> Result<Option<f64>> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => value
+            .parse::<f64>()
+            .with_context(|| format!("parse {name}={value} as number"))
+            .map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn env_u64(name: &str, default: u64) -> Result<u64> {
     std::env::var(name)
         .ok()
@@ -9753,6 +9853,22 @@ fn parse_broker_kind_env(name: &str, default: BrokerKind) -> Result<BrokerKind> 
         "robinhood" => Ok(BrokerKind::Robinhood),
         "tradier" => Ok(BrokerKind::Tradier),
         other => anyhow::bail!("{name} must be robinhood or tradier; got {other}"),
+    }
+}
+
+fn parse_account_cash_source_env(
+    name: &str,
+    default: ExecutionAccountCashSource,
+) -> Result<ExecutionAccountCashSource> {
+    let default = match default {
+        ExecutionAccountCashSource::Configured => "configured",
+        ExecutionAccountCashSource::Broker => "broker",
+    };
+    let value = env_string(name, default).to_ascii_lowercase();
+    match value.as_str() {
+        "configured" => Ok(ExecutionAccountCashSource::Configured),
+        "broker" => Ok(ExecutionAccountCashSource::Broker),
+        other => anyhow::bail!("{name} must be configured or broker; got {other}"),
     }
 }
 
@@ -9909,35 +10025,52 @@ fn build_execution_worker_health(
     let live_signal_readable = signal_body.is_ok();
     let mut error = None;
     let mut decision = None;
+    let risk = match resolve_canary_risk_policy(&args.risk, broker_account.as_ref()) {
+        Ok(risk) => risk,
+        Err(err) => {
+            error = Some(format!("resolve execution risk policy: {err}"));
+            configured_canary_risk_policy(&args.risk).unwrap_or(CanaryRiskPolicy {
+                account_cash: args.risk.account_cash,
+                debit_max_loss: args.risk.debit_max_loss,
+                wheel_reserve_cap: args.risk.wheel_reserve_cap,
+                free_cash_buffer: args.risk.free_cash_buffer,
+                max_wheel_positions_per_symbol: args.risk.max_wheel_positions_per_symbol,
+                max_daily_loss_usd: args.risk.max_daily_loss_usd,
+                max_open_loss_usd: args.risk.max_open_loss_usd,
+            })
+        }
+    };
     let live_signal_parse_ok = match signal_body {
         Ok(body) => match serde_json::from_str::<LiveSignalArtifact>(&body) {
             Ok(artifact) => {
-                let mut execution_decision = compute_execution_decision(
-                    &artifact,
-                    as_of,
-                    &args.risk,
-                    &args.broker,
-                    args.mode,
-                    args.max_order_age_seconds,
-                );
-                apply_execution_account_halt_to_decision(
-                    &mut execution_decision,
-                    broker_account.as_ref(),
-                );
-                if apply_broker_side_effects
-                    && let Err(err) = apply_broker_bridge(
-                        &mut execution_decision,
+                if error.is_none() {
+                    let mut execution_decision = compute_execution_decision(
+                        &artifact,
+                        as_of,
+                        &risk,
                         &args.broker,
-                        args.robinhood_mcp_command.as_deref(),
-                        Some(&args.order_ledger),
-                    )
-                {
-                    error = Some(format!(
-                        "{} broker bridge: {err}",
-                        broker_label(args.broker.kind)
-                    ));
+                        args.mode,
+                        args.max_order_age_seconds,
+                    );
+                    apply_execution_account_halt_to_decision(
+                        &mut execution_decision,
+                        broker_account.as_ref(),
+                    );
+                    if apply_broker_side_effects
+                        && let Err(err) = apply_broker_bridge(
+                            &mut execution_decision,
+                            &args.broker,
+                            args.robinhood_mcp_command.as_deref(),
+                            Some(&args.order_ledger),
+                        )
+                    {
+                        error = Some(format!(
+                            "{} broker bridge: {err}",
+                            broker_label(args.broker.kind)
+                        ));
+                    }
+                    decision = Some(execution_decision);
                 }
-                decision = Some(execution_decision);
                 true
             }
             Err(err) => {
@@ -9964,7 +10097,7 @@ fn build_execution_worker_health(
         live_signal_readable,
         live_signal_parse_ok,
         as_of,
-        risk: args.risk.clone(),
+        risk,
         broker_multi_leg_options: args.broker.capabilities.multi_leg_options,
         broker_cash_secured_puts: args.broker.capabilities.cash_secured_puts,
         broker_covered_calls: args.broker.capabilities.covered_calls,
@@ -10065,6 +10198,133 @@ fn broker_label(kind: BrokerKind) -> &'static str {
         BrokerKind::Robinhood => "robinhood",
         BrokerKind::Tradier => "tradier",
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canary_risk_input(
+    account_cash_source: ExecutionAccountCashSource,
+    account_cash: f64,
+    debit_max_loss: f64,
+    wheel_reserve_cap: f64,
+    free_cash_buffer: f64,
+    free_cash_buffer_pct: Option<f64>,
+    max_wheel_positions_per_symbol: usize,
+    max_daily_loss_pct: Option<f64>,
+    max_open_loss_pct: Option<f64>,
+) -> Result<CanaryRiskInput> {
+    let input = CanaryRiskInput {
+        account_cash_source,
+        account_cash,
+        debit_max_loss,
+        wheel_reserve_cap,
+        free_cash_buffer,
+        free_cash_buffer_pct,
+        max_wheel_positions_per_symbol,
+        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
+        max_daily_loss_pct,
+        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
+        max_open_loss_pct,
+    };
+    validate_canary_risk_input(&input)?;
+    Ok(input)
+}
+
+fn validate_canary_risk_input(input: &CanaryRiskInput) -> Result<()> {
+    let configured = CanaryRiskPolicy {
+        account_cash: input.account_cash,
+        debit_max_loss: input.debit_max_loss,
+        wheel_reserve_cap: input.wheel_reserve_cap,
+        free_cash_buffer: input.free_cash_buffer,
+        max_wheel_positions_per_symbol: input.max_wheel_positions_per_symbol,
+        max_daily_loss_usd: input.max_daily_loss_usd,
+        max_open_loss_usd: input.max_open_loss_usd,
+    };
+    validate_canary_risk_policy(&configured)?;
+    if let Some(pct) = input.free_cash_buffer_pct
+        && (!pct.is_finite() || !(0.0..1.0).contains(&pct))
+    {
+        anyhow::bail!("--free-cash-buffer-pct must be >= 0 and < 1 when set");
+    }
+    validate_optional_loss_pct(input.max_daily_loss_pct, "--max-daily-loss-pct")?;
+    validate_optional_loss_pct(input.max_open_loss_pct, "--max-open-loss-pct")?;
+    Ok(())
+}
+
+fn validate_optional_loss_pct(value: Option<f64>, name: &str) -> Result<()> {
+    if let Some(pct) = value
+        && (!pct.is_finite() || pct <= 0.0 || pct > 1.0)
+    {
+        anyhow::bail!("{name} must be > 0 and <= 1 when set");
+    }
+    Ok(())
+}
+
+fn resolve_canary_risk_policy(
+    input: &CanaryRiskInput,
+    broker_account: Option<&BrokerAccountSnapshot>,
+) -> Result<CanaryRiskPolicy> {
+    validate_canary_risk_input(input)?;
+    let account_cash = match input.account_cash_source {
+        ExecutionAccountCashSource::Configured => input.account_cash,
+        ExecutionAccountCashSource::Broker => broker_account_cash_for_risk(broker_account)?,
+    };
+    let free_cash_buffer = input
+        .free_cash_buffer_pct
+        .map(|pct| account_cash * pct)
+        .unwrap_or(input.free_cash_buffer);
+    let max_daily_loss_usd = input
+        .max_daily_loss_pct
+        .map(|pct| account_cash * pct)
+        .or(input.max_daily_loss_usd);
+    let max_open_loss_usd = input
+        .max_open_loss_pct
+        .map(|pct| account_cash * pct)
+        .or(input.max_open_loss_usd)
+        .or(max_daily_loss_usd);
+    let policy = CanaryRiskPolicy {
+        account_cash,
+        debit_max_loss: input.debit_max_loss,
+        wheel_reserve_cap: input.wheel_reserve_cap,
+        free_cash_buffer,
+        max_wheel_positions_per_symbol: input.max_wheel_positions_per_symbol,
+        max_daily_loss_usd,
+        max_open_loss_usd,
+    };
+    validate_canary_risk_policy(&policy)?;
+    Ok(policy)
+}
+
+fn configured_canary_risk_policy(input: &CanaryRiskInput) -> Result<CanaryRiskPolicy> {
+    let mut configured = input.clone();
+    configured.account_cash_source = ExecutionAccountCashSource::Configured;
+    resolve_canary_risk_policy(&configured, None)
+}
+
+fn broker_account_cash_for_risk(account: Option<&BrokerAccountSnapshot>) -> Result<f64> {
+    let account = account.ok_or_else(|| {
+        anyhow::anyhow!(
+            "broker-sourced account cash requested, but no broker account snapshot is available"
+        )
+    })?;
+    if account.status != "ok" {
+        anyhow::bail!(
+            "broker-sourced account cash requested, but broker account snapshot status is {}{}",
+            account.status,
+            account
+                .error
+                .as_ref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        );
+    }
+    let mut values = [account.buying_power, account.cash]
+        .into_iter()
+        .flatten()
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let Some(first) = values.next() else {
+        anyhow::bail!("broker-sourced account cash requested, but buying power/cash is missing");
+    };
+    Ok(values.fold(first, f64::min))
 }
 
 fn validate_canary_risk_policy(risk: &CanaryRiskPolicy) -> Result<()> {
@@ -12279,12 +12539,20 @@ mod tests {
             "500",
             "--account-cash",
             "45000",
+            "--account-cash-source",
+            "broker",
             "--debit-max-loss",
             "1000",
             "--wheel-reserve-cap",
             "35000",
             "--free-cash-buffer",
             "11250",
+            "--free-cash-buffer-pct",
+            "0.25",
+            "--max-daily-loss-pct",
+            "0.03",
+            "--max-open-loss-pct",
+            "0.03",
             "--max-wheel-positions-per-symbol",
             "1",
             "--mode",
@@ -12302,9 +12570,13 @@ mod tests {
                 as_of,
                 max_loss,
                 account_cash,
+                account_cash_source,
                 debit_max_loss,
                 wheel_reserve_cap,
                 free_cash_buffer,
+                free_cash_buffer_pct,
+                max_daily_loss_pct,
+                max_open_loss_pct,
                 max_wheel_positions_per_symbol,
                 mode,
                 broker,
@@ -12320,9 +12592,13 @@ mod tests {
                 assert_eq!(as_of, Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()));
                 assert_eq!(max_loss, Some(500.0));
                 assert_eq!(account_cash, 45_000.0);
+                assert_eq!(account_cash_source, ExecutionAccountCashSource::Broker);
                 assert_eq!(debit_max_loss, 1_000.0);
                 assert_eq!(wheel_reserve_cap, 35_000.0);
                 assert_eq!(free_cash_buffer, 11_250.0);
+                assert_eq!(free_cash_buffer_pct, Some(0.25));
+                assert_eq!(max_daily_loss_pct, Some(0.03));
+                assert_eq!(max_open_loss_pct, Some(0.03));
                 assert_eq!(max_wheel_positions_per_symbol, 1);
                 assert_eq!(mode, ExecutionMode::Live);
                 assert_eq!(broker, BrokerKind::Tradier);
@@ -12375,9 +12651,13 @@ mod tests {
                 live_signal,
                 as_of,
                 account_cash,
+                account_cash_source,
                 debit_max_loss,
                 wheel_reserve_cap,
                 free_cash_buffer,
+                free_cash_buffer_pct,
+                max_daily_loss_pct,
+                max_open_loss_pct,
                 max_wheel_positions_per_symbol,
                 broker,
                 broker_multi_leg_options,
@@ -12391,9 +12671,13 @@ mod tests {
                 assert_eq!(live_signal, PathBuf::from("candidates/example.json"));
                 assert_eq!(as_of, Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()));
                 assert_eq!(account_cash, 45_000.0);
+                assert_eq!(account_cash_source, ExecutionAccountCashSource::Configured);
                 assert_eq!(debit_max_loss, 1_000.0);
                 assert_eq!(wheel_reserve_cap, 35_000.0);
                 assert_eq!(free_cash_buffer, 11_250.0);
+                assert_eq!(free_cash_buffer_pct, None);
+                assert_eq!(max_daily_loss_pct, None);
+                assert_eq!(max_open_loss_pct, None);
                 assert_eq!(max_wheel_positions_per_symbol, 1);
                 assert_eq!(broker, BrokerKind::Tradier);
                 assert!(broker_multi_leg_options);
@@ -15040,7 +15324,7 @@ mod tests {
         let args = ExecutionWorkerArgs {
             live_signal: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
-            risk: test_canary_risk(),
+            risk: test_canary_risk_input(),
             broker: execution_broker(BrokerKind::Tradier, false, false, false, false),
             mode: ExecutionMode::Monitor,
             robinhood_mcp_command: None,
@@ -16922,6 +17206,95 @@ mod tests {
     }
 
     #[test]
+    fn broker_sourced_risk_uses_conservative_cash_and_percent_caps() {
+        let input = CanaryRiskInput {
+            account_cash_source: ExecutionAccountCashSource::Broker,
+            account_cash: 1.0,
+            debit_max_loss: 1_000.0,
+            wheel_reserve_cap: 1_000.0,
+            free_cash_buffer: 0.0,
+            free_cash_buffer_pct: Some(0.25),
+            max_wheel_positions_per_symbol: 1,
+            max_daily_loss_usd: Some(123.0),
+            max_daily_loss_pct: Some(0.03),
+            max_open_loss_usd: Some(456.0),
+            max_open_loss_pct: Some(0.03),
+        };
+        let account = BrokerAccountSnapshot {
+            broker: BrokerKind::Tradier,
+            status: "ok".to_owned(),
+            account: "test".to_owned(),
+            equity: Some(20_000.0),
+            buying_power: Some(8_656.37),
+            cash: Some(9_000.00),
+            day_pnl: Some(0.0),
+            open_pnl: Some(0.0),
+            close_pnl: Some(0.0),
+            requirement: Some(0.0),
+            error: None,
+        };
+
+        let risk = resolve_canary_risk_policy(&input, Some(&account)).unwrap();
+
+        assert_eq!(risk.account_cash, 8_656.37);
+        assert_eq!(risk.free_cash_buffer, 2_164.0925);
+        assert_eq!(risk.max_daily_loss_usd, Some(259.6911));
+        assert_eq!(risk.max_open_loss_usd, Some(259.6911));
+    }
+
+    #[test]
+    fn execution_worker_fails_closed_when_broker_sourced_cash_is_unavailable() {
+        let path = unique_main_test_path("execution-worker-broker-cash-unavailable.json");
+        let artifact = test_live_signal_artifact_as_of(
+            Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            serde_json::json!([{
+                "status":"recent_closed",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":"2026-06-25",
+                "exit_date":"2026-06-26",
+                "max_loss":100.0
+            }]),
+        );
+        fs::write(&path, serde_json::to_string(&artifact).unwrap()).unwrap();
+        let mut risk = test_canary_risk_input();
+        risk.account_cash_source = ExecutionAccountCashSource::Broker;
+        let args = ExecutionWorkerArgs {
+            live_signal: path.clone(),
+            as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
+            risk,
+            broker: execution_broker(BrokerKind::Robinhood, false, false, false, false),
+            mode: ExecutionMode::Monitor,
+            robinhood_mcp_command: None,
+            order_ledger: unique_main_test_path(
+                "execution-worker-broker-cash-unavailable-ledger.json",
+            ),
+            notify_command: None,
+            notify_ledger: unique_main_test_path(
+                "execution-worker-broker-cash-unavailable-notify.json",
+            ),
+            max_order_age_seconds: DEFAULT_MAX_ORDER_AGE_SECONDS,
+            poll_seconds: 60,
+            once: true,
+            health_output: None,
+            json: true,
+        };
+
+        let health = execution_worker_health(&args);
+
+        assert_eq!(health.status, "unhealthy");
+        assert!(health.decision.is_none());
+        assert!(
+            health
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("broker-sourced account cash requested")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn tradier_network_error_does_not_crash_worker_decision() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -17153,7 +17526,7 @@ mod tests {
         let args = ExecutionWorkerArgs {
             live_signal: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
-            risk: test_canary_risk(),
+            risk: test_canary_risk_input(),
             broker: execution_broker(BrokerKind::Robinhood, false, false, false, false),
             mode: ExecutionMode::Monitor,
             robinhood_mcp_command: None,
@@ -17204,7 +17577,7 @@ mod tests {
         let args = ExecutionWorkerArgs {
             live_signal: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
-            risk: test_canary_risk(),
+            risk: test_canary_risk_input(),
             broker: execution_broker(BrokerKind::Robinhood, true, false, false, false),
             mode: ExecutionMode::Review,
             robinhood_mcp_command: None,
@@ -17261,7 +17634,7 @@ mod tests {
         let args = ExecutionWorkerArgs {
             live_signal: path.clone(),
             as_of: Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
-            risk: test_canary_risk(),
+            risk: test_canary_risk_input(),
             broker: execution_broker(BrokerKind::Robinhood, true, false, false, false),
             mode: ExecutionMode::Monitor,
             robinhood_mcp_command: None,
@@ -17364,9 +17737,13 @@ mod tests {
             &path,
             Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             45_000.0,
+            ExecutionAccountCashSource::Configured,
             1_000.0,
             35_000.0,
             11_250.0,
+            None,
+            None,
+            None,
             1,
             BrokerKind::Robinhood,
             true,
@@ -17384,9 +17761,13 @@ mod tests {
             &path,
             Some(NaiveDate::from_ymd_opt(2026, 6, 28).unwrap()),
             45_000.0,
+            ExecutionAccountCashSource::Configured,
             1_000.0,
             35_000.0,
             11_250.0,
+            None,
+            None,
+            None,
             1,
             BrokerKind::Robinhood,
             true,
@@ -17807,6 +18188,23 @@ mod tests {
             max_wheel_positions_per_symbol: 1,
             max_daily_loss_usd: None,
             max_open_loss_usd: None,
+        }
+    }
+
+    fn test_canary_risk_input() -> CanaryRiskInput {
+        let risk = test_canary_risk();
+        CanaryRiskInput {
+            account_cash_source: ExecutionAccountCashSource::Configured,
+            account_cash: risk.account_cash,
+            debit_max_loss: risk.debit_max_loss,
+            wheel_reserve_cap: risk.wheel_reserve_cap,
+            free_cash_buffer: risk.free_cash_buffer,
+            free_cash_buffer_pct: None,
+            max_wheel_positions_per_symbol: risk.max_wheel_positions_per_symbol,
+            max_daily_loss_usd: risk.max_daily_loss_usd,
+            max_daily_loss_pct: None,
+            max_open_loss_usd: risk.max_open_loss_usd,
+            max_open_loss_pct: None,
         }
     }
 

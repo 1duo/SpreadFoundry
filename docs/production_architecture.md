@@ -49,8 +49,14 @@ flowchart LR
   preview/place results, ledger idempotency, notifications, and health. Vertical
   spread exit management uses the shared `VerticalSpreadExitRules` evaluator in
   `execution.rs` (same thresholds as research simulation). New live entries halt
-  when broker day P&L breaches `max_daily_loss_usd` (default 3% of account cash)
-  or open P&L breaches `max_open_loss_usd` (defaults to the daily cap). Live
+  when broker day P&L breaches `max_daily_loss_usd` (default 3% of resolved
+  account cash) or open P&L breaches `max_open_loss_usd` (defaults to the daily
+  cap). Production Tradier runtime should set
+  `SPREAD_EXECUTION_ACCOUNT_CASH_SOURCE=broker` plus percentage controls such as
+  `SPREAD_CANARY_RISK_FREE_CASH_BUFFER_PCT=0.25` and
+  `SPREAD_CANARY_RISK_MAX_DAILY_LOSS_PCT=0.03`, so cash, buffer, and loss caps
+  refresh from current conservative broker buying power instead of a stale
+  point-in-time balance. Live
   entries also halt when broker P&L telemetry is unavailable or the account
   snapshot is not `ok`. Malformed risk-cap env values fail startup instead of
   silently reverting to defaults. Robinhood
@@ -67,8 +73,11 @@ flowchart LR
 `ApprovedStrategy` contains the strategy id, profile name, optional
 `research_from`, optional `research_gate_capital_budget`, symbols, portfolio
 constraints, allowed live strategies, canary risk policy id, and optional
-production approval metadata. Portfolio constraints size live/account heat:
-capital, symbol allocation, open-position caps, and cooldowns. The optional
+production approval metadata. Portfolio constraints are the approved allocation
+envelope for live/account heat: capital, symbol allocation, open-position caps,
+and cooldowns. They are not a continuously refreshed broker buying-power cache;
+runtime execution resolves current cash/BP separately and cannot place an order
+that breaches either the approved envelope or current broker buying power. The optional
 `research_gate_capital_budget` is only the normalization denominator for
 multi-year research gates, recent-regime drawdown gates, and ablation gates.
 Selector reports therefore distinguish gate-normalized drawdown from
