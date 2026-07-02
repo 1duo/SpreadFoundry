@@ -12,9 +12,16 @@ live_engine_enabled() {
   [[ -f "$repo_root/var/live_market_engine.env" ]]
 }
 
+load_saved_live_engine_env() {
+  [[ -f "$repo_root/var/live_market_engine.env" ]] || return 0
+  # shellcheck disable=SC1091
+  source "$repo_root/var/live_market_engine.env"
+}
+
 case "${1:-status}" in
   start)
     if live_engine_enabled; then
+      load_saved_live_engine_env
       "$repo_root/scripts/signal-refresh-service.sh" stop
       SPREAD_LIVE_SIGNAL_ARTIFACT="${SPREAD_LIVE_ENGINE_SOURCE_ARTIFACT:-var/live_signal_refresh_source.json}" \
         "$repo_root/scripts/signal-refresh-service.sh" start
