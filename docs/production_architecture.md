@@ -216,7 +216,10 @@ Tradier order flow:
 2. Canary risk policy validation.
 3. Ledger idempotency and rejection suppression.
 4. Tradier market-clock gate before live order work.
-5. For entries, broker buying-power check from current Tradier balances.
+5. For entries, broker buying-power check from current Tradier balances using
+   the conservative minimum of every reported balance field (cash-account
+   `total_cash` includes uncleared funds, so the minimum sizes against
+   settled, spendable cash only).
 6. Position and active-order checks for the exact supported vertical-spread
    lifecycle.
 7. Current Tradier quote validation for supported vertical-spread entries and
