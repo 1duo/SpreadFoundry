@@ -6,9 +6,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use spreadfoundry::broker::{
     BrokerCapabilities, RobinhoodBrokerAdapter, RobinhoodMcpCommandExecutor,
-    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierClient, TradierConfig,
-    TradierMarketClock, TradierMarketClockResponse, TradierOrder, TradierOrderResponse,
-    TradierPosition, TradierQuote, TradierQuotesResponse, tradier_http_status_is_ambiguous,
+    RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierAccountBalances, TradierClient,
+    TradierConfig, TradierMarketClock, TradierMarketClockResponse, TradierOrder,
+    TradierOrderResponse, TradierPosition, TradierQuote, TradierQuotesResponse,
+    tradier_http_status_is_ambiguous,
 };
 use spreadfoundry::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
@@ -6945,10 +6946,7 @@ fn tradier_assert_buying_power(
     let balances = balances
         .balances
         .ok_or_else(|| anyhow::anyhow!("Tradier balances response missing balances"))?;
-    let buying_power = balances
-        .option_buying_power
-        .or(balances.total_cash)
-        .or(balances.cash)
+    let buying_power = tradier_conservative_buying_power(&balances)
         .ok_or_else(|| anyhow::anyhow!("Tradier balances missing option buying power/cash"))?;
     let required_buying_power = reserve + risk.free_cash_buffer;
     if buying_power < required_buying_power {
@@ -6960,6 +6958,24 @@ fn tradier_assert_buying_power(
         );
     }
     Ok(())
+}
+
+/// Conservative live buying power: the minimum across every balance field the
+/// broker reports. Tradier cash accounts report `total_cash` inclusive of
+/// uncleared funds, so a preference chain that falls back to `total_cash`
+/// can overstate what is actually available to trade; taking the minimum of
+/// the present fields sizes orders against settled, spendable cash.
+fn tradier_conservative_buying_power(balances: &TradierAccountBalances) -> Option<f64> {
+    [
+        balances.option_buying_power,
+        balances.total_cash,
+        balances.cash,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(None, |min, value| {
+        Some(min.map_or(value, |current: f64| current.min(value)))
+    })
 }
 
 fn tradier_assert_wheel_broker_state(
@@ -9296,7 +9312,7 @@ fn snapshot_tradier_account() -> Option<BrokerAccountSnapshot> {
         status: "ok".to_owned(),
         account,
         equity: balances.equity,
-        buying_power: balances.option_buying_power.or(balances.total_cash),
+        buying_power: tradier_conservative_buying_power(&balances),
         cash: balances.cash,
         day_pnl,
         open_pnl: balances.open_pl,
@@ -14203,6 +14219,44 @@ mod tests {
         let halt = execution_account_halt_blocks_new_entry(Some(&account), &policy);
         assert!(halt.is_some());
         assert!(halt.unwrap().contains("missing day and open P&L"));
+    }
+
+    #[test]
+    fn tradier_conservative_buying_power_takes_minimum_of_reported_fields() {
+        let balances = TradierAccountBalances {
+            account_number: Some("TEST".to_owned()),
+            account_type: Some("cash".to_owned()),
+            option_buying_power: None,
+            // total_cash includes uncleared funds on Tradier cash accounts
+            total_cash: Some(15_836.37),
+            cash: Some(8_656.37),
+            equity: Some(0.0),
+            close_pl: None,
+            open_pl: None,
+            market_value: None,
+            option_long_value: None,
+            option_short_value: None,
+            option_requirement: None,
+            current_requirement: None,
+        };
+        assert_eq!(tradier_conservative_buying_power(&balances), Some(8_656.37));
+
+        let all_missing = TradierAccountBalances {
+            account_number: None,
+            account_type: None,
+            option_buying_power: None,
+            total_cash: None,
+            cash: None,
+            equity: None,
+            close_pl: None,
+            open_pl: None,
+            market_value: None,
+            option_long_value: None,
+            option_short_value: None,
+            option_requirement: None,
+            current_requirement: None,
+        };
+        assert_eq!(tradier_conservative_buying_power(&all_missing), None);
     }
 
     #[test]
