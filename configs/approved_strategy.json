@@ -1,5 +1,5 @@
 {
-  "strategy_id": "weekly_selector_cap45k_sym02_max1_no_sofi_mdb_20260702",
+  "strategy_id": "weekly_selector_cap45k_sym02_max1_no_sofi_mdb_nvda_20260702",
   "profile_name": "selector_crash_and_costaware_puts_and_call_debits_only",
   "research_from": "2010-01-01",
   "research_gate_capital_budget": 100000.0,
@@ -26,7 +26,8 @@
     "DDOG",
     "DELL",
     "RBLX",
-    "MDB"
+    "MDB",
+    "NVDA"
   ],
   "portfolio_constraints": {
     "capital_budget": 45000.0,
@@ -43,9 +44,9 @@
   "canary_risk_policy_id": "tradier_canary_debit_v1",
   "production_approval": {
     "status": "canary_approved",
-    "approved_at": "2026-07-02T08:25:00Z",
+    "approved_at": "2026-07-02T08:40:00Z",
     "approved_by": "operator",
-    "reason": "Canary-only safety refresh from runs/portfolio-weekly-selector-research-20260702T082455.238157000Z-p74314-s0. The prior July 1 approval no longer clears current account-budget drawdown checks under the 7897.67 sleeve. This replacement keeps the live scope debit-spread-only, removes SOFI, adds MDB, raises the approved capital denominator to 45000, and tightens live heat to 2% max symbol allocation, max 1 open position, and max 1 position per symbol, so per-symbol/open debit exposure is capped near 900. The full-history run used 2010-01-01 through 2026-06-30, 100000 research gate denominator, cache-only snapshot-backed data, and produced 682 allocated trades, 87191.50 raw PnL, 70141.50 $25-cost PnL, 52.1% win rate, 3.25 profit factor, 65.06 trades/year, 4.81% account-budget capital DD, and 8.46% $25-cost account-budget capital DD. Recent-regime validation passed with 211 trailing trades and 45709.50 $25-cost PnL. MDB passed the new-symbol check with 11 trades and 724.00 $25-cost PnL. Source canary status was canary_only rather than full_promotion_candidate because $25-cost PnL did not beat the superseded 104178.00 baseline; this approval is intentionally a safer canary-ready live envelope, not a full-size profit-maximizing promotion.",
+    "reason": "Canary-only NVDA expansion from runs/portfolio-weekly-selector-research-20260702T083957.824535000Z-p81952-s0. This keeps the live scope debit-spread-only and preserves the safer 45000 capital denominator, 2% max symbol allocation, max 1 open position, and max 1 position per symbol, so per-symbol/open debit exposure remains capped near 900. The full-history run used 2010-01-01 through 2026-06-30, 100000 research gate denominator, cache-only snapshot-backed data, and produced 708 allocated trades, 106314.50 raw PnL, 88614.50 $25-cost PnL, 55.2% win rate, 3.80 profit factor, 67.54 trades/year, 3.44% account-budget capital DD, and 4.24% $25-cost account-budget capital DD. Recent-regime validation passed with 210 trailing trades and 45659.50 $25-cost PnL. MDB remained valid with 10 trades and 806.00 $25-cost PnL. NVDA passed the new-symbol check with 115 trades and 5662.00 $25-cost PnL. Source canary status remains canary_only rather than full_promotion_candidate because $25-cost PnL did not beat the superseded 104178.00 baseline; this approval is a safer canary-ready expansion that improves the prior canary-only envelope by 18473.00 after $25/trade costs without loosening live heat.",
     "source_canary_status": "canary_only",
     "max_order_max_loss": 900.0
   }
