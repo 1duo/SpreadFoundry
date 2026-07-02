@@ -10230,16 +10230,38 @@ fn canary_risk_input(
 }
 
 fn validate_canary_risk_input(input: &CanaryRiskInput) -> Result<()> {
-    let configured = CanaryRiskPolicy {
-        account_cash: input.account_cash,
-        debit_max_loss: input.debit_max_loss,
-        wheel_reserve_cap: input.wheel_reserve_cap,
-        free_cash_buffer: input.free_cash_buffer,
-        max_wheel_positions_per_symbol: input.max_wheel_positions_per_symbol,
-        max_daily_loss_usd: input.max_daily_loss_usd,
-        max_open_loss_usd: input.max_open_loss_usd,
-    };
-    validate_canary_risk_policy(&configured)?;
+    if !input.account_cash.is_finite()
+        || !input.debit_max_loss.is_finite()
+        || !input.wheel_reserve_cap.is_finite()
+        || !input.free_cash_buffer.is_finite()
+    {
+        anyhow::bail!("canary risk amounts must be finite");
+    }
+    if input.account_cash <= 0.0 {
+        anyhow::bail!("--account-cash must be positive");
+    }
+    if input.debit_max_loss <= 0.0 {
+        anyhow::bail!("--debit-max-loss must be positive");
+    }
+    if input.wheel_reserve_cap <= 0.0 {
+        anyhow::bail!("--wheel-reserve-cap must be positive");
+    }
+    if input.free_cash_buffer < 0.0 {
+        anyhow::bail!("--free-cash-buffer must be >= 0");
+    }
+    if input.max_wheel_positions_per_symbol == 0 {
+        anyhow::bail!("--max-wheel-positions-per-symbol must be positive");
+    }
+    if let Some(max_daily_loss) = input.max_daily_loss_usd
+        && (!max_daily_loss.is_finite() || max_daily_loss <= 0.0)
+    {
+        anyhow::bail!("--max-daily-loss-usd must be positive when set");
+    }
+    if let Some(max_open_loss) = input.max_open_loss_usd
+        && (!max_open_loss.is_finite() || max_open_loss <= 0.0)
+    {
+        anyhow::bail!("--max-open-loss-usd must be positive when set");
+    }
     if let Some(pct) = input.free_cash_buffer_pct
         && (!pct.is_finite() || !(0.0..1.0).contains(&pct))
     {
@@ -17218,6 +17240,43 @@ mod tests {
             max_daily_loss_usd: Some(123.0),
             max_daily_loss_pct: Some(0.03),
             max_open_loss_usd: Some(456.0),
+            max_open_loss_pct: Some(0.03),
+        };
+        let account = BrokerAccountSnapshot {
+            broker: BrokerKind::Tradier,
+            status: "ok".to_owned(),
+            account: "test".to_owned(),
+            equity: Some(20_000.0),
+            buying_power: Some(8_656.37),
+            cash: Some(9_000.00),
+            day_pnl: Some(0.0),
+            open_pnl: Some(0.0),
+            close_pnl: Some(0.0),
+            requirement: Some(0.0),
+            error: None,
+        };
+
+        let risk = resolve_canary_risk_policy(&input, Some(&account)).unwrap();
+
+        assert_eq!(risk.account_cash, 8_656.37);
+        assert_eq!(risk.free_cash_buffer, 2_164.0925);
+        assert_eq!(risk.max_daily_loss_usd, Some(259.6911));
+        assert_eq!(risk.max_open_loss_usd, Some(259.6911));
+    }
+
+    #[test]
+    fn broker_sourced_risk_allows_stale_absolute_buffer_when_percent_buffer_is_set() {
+        let input = CanaryRiskInput {
+            account_cash_source: ExecutionAccountCashSource::Broker,
+            account_cash: 1.0,
+            debit_max_loss: 1_000.0,
+            wheel_reserve_cap: 1_000.0,
+            free_cash_buffer: 11_250.0,
+            free_cash_buffer_pct: Some(0.25),
+            max_wheel_positions_per_symbol: 1,
+            max_daily_loss_usd: None,
+            max_daily_loss_pct: Some(0.03),
+            max_open_loss_usd: None,
             max_open_loss_pct: Some(0.03),
         };
         let account = BrokerAccountSnapshot {
