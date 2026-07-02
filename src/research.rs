@@ -453,6 +453,8 @@ pub struct PortfolioWheelProfileResult {
     #[serde(default)]
     pub strategy_summaries: Vec<PortfolioStrategySummary>,
     #[serde(default)]
+    pub component_summaries: Vec<PortfolioComponentSummary>,
+    #[serde(default)]
     pub risk_summary: PortfolioWheelRiskSummary,
     #[serde(default)]
     pub decision_metrics: PortfolioDecisionMetrics,
@@ -553,6 +555,20 @@ pub struct PortfolioStrategySummary {
     pub worst_trade_pnl: f64,
     pub assigned_cycles: usize,
     pub marked_stock_cycles: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PortfolioComponentSummary {
+    pub component: String,
+    pub strategy: String,
+    pub trades: usize,
+    pub pnl: f64,
+    pub cost_25_pnl: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub avg_pnl: f64,
+    pub avg_days_held: f64,
+    pub worst_trade_pnl: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -669,6 +685,8 @@ pub struct PortfolioWheelTrade {
     pub symbol: String,
     #[serde(default)]
     pub strategy: SpreadStructure,
+    #[serde(default)]
+    pub selector_component: String,
     pub capital_at_risk: f64,
     pub trade: ResearchTrade,
 }
@@ -1950,6 +1968,7 @@ struct ExpiringOptionDay {
 struct PortfolioWheelOpportunity {
     symbol: String,
     strategy: SpreadStructure,
+    selector_component: String,
     trade: ResearchTrade,
     capital_at_risk: f64,
 }
@@ -2820,6 +2839,7 @@ async fn run_portfolio_research(
                 &request,
             );
             let strategy_summaries = portfolio_strategy_summaries(&allocation.trades);
+            let component_summaries = portfolio_component_summaries(&allocation.trades);
             let risk_summary =
                 portfolio_wheel_risk_summary(&allocation.trades, research_gate_capital_budget);
             let decision_metrics = portfolio_decision_metrics(
@@ -2889,6 +2909,7 @@ async fn run_portfolio_research(
                 avg_capital_used_on_entry: allocation.avg_capital_used_on_entry,
                 symbol_summaries,
                 strategy_summaries,
+                component_summaries,
                 risk_summary,
                 decision_metrics,
                 recent_regime,
@@ -3237,13 +3258,15 @@ fn simulate_portfolio_selector_profile(
         if let Some(profile) = &selector_profile.put_credit_profile
             && sleeve_allows_symbol(&selector_profile.put_credit_symbols, &data.summary.symbol)
         {
-            let (symbol_opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
-                data,
-                profile,
-                from,
-                to,
-                profile.structure,
-            );
+            let (symbol_opportunities, candidates) =
+                portfolio_spread_opportunities_for_symbol_with_component(
+                    data,
+                    profile,
+                    from,
+                    to,
+                    profile.structure,
+                    "put_credit",
+                );
             candidate_count += candidates;
             opportunities.extend(symbol_opportunities);
         }
@@ -3258,13 +3281,15 @@ fn simulate_portfolio_selector_profile(
         if let Some(profile) = &selector_profile.put_debit_profile
             && sleeve_allows_symbol(&selector_profile.put_debit_symbols, &data.summary.symbol)
         {
-            let (symbol_opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
-                data,
-                profile,
-                from,
-                to,
-                SpreadStructure::PutDebitSpread,
-            );
+            let (symbol_opportunities, candidates) =
+                portfolio_spread_opportunities_for_symbol_with_component(
+                    data,
+                    profile,
+                    from,
+                    to,
+                    SpreadStructure::PutDebitSpread,
+                    "put_debit_primary",
+                );
             candidate_count += candidates;
             opportunities.extend(symbol_opportunities);
         }
@@ -3274,26 +3299,30 @@ fn simulate_portfolio_selector_profile(
                 &data.summary.symbol,
             )
         {
-            let (symbol_opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
-                data,
-                profile,
-                from,
-                to,
-                SpreadStructure::PutDebitSpread,
-            );
+            let (symbol_opportunities, candidates) =
+                portfolio_spread_opportunities_for_symbol_with_component(
+                    data,
+                    profile,
+                    from,
+                    to,
+                    SpreadStructure::PutDebitSpread,
+                    "put_debit_fallback",
+                );
             candidate_count += candidates;
             opportunities.extend(symbol_opportunities);
         }
         if let Some(profile) = &selector_profile.call_debit_profile
             && sleeve_allows_symbol(&selector_profile.call_debit_symbols, &data.summary.symbol)
         {
-            let (symbol_opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
-                data,
-                profile,
-                from,
-                to,
-                SpreadStructure::CallDebitSpread,
-            );
+            let (symbol_opportunities, candidates) =
+                portfolio_spread_opportunities_for_symbol_with_component(
+                    data,
+                    profile,
+                    from,
+                    to,
+                    SpreadStructure::CallDebitSpread,
+                    "call_debit_primary",
+                );
             candidate_count += candidates;
             opportunities.extend(symbol_opportunities);
         }
@@ -3303,13 +3332,15 @@ fn simulate_portfolio_selector_profile(
                 &data.summary.symbol,
             )
         {
-            let (symbol_opportunities, candidates) = portfolio_spread_opportunities_for_symbol(
-                data,
-                profile,
-                from,
-                to,
-                SpreadStructure::CallDebitSpread,
-            );
+            let (symbol_opportunities, candidates) =
+                portfolio_spread_opportunities_for_symbol_with_component(
+                    data,
+                    profile,
+                    from,
+                    to,
+                    SpreadStructure::CallDebitSpread,
+                    "call_debit_fallback",
+                );
             candidate_count += candidates;
             opportunities.extend(symbol_opportunities);
         }
@@ -3341,6 +3372,7 @@ fn portfolio_wheel_opportunities_for_symbol(
     .map(|trade| PortfolioWheelOpportunity {
         symbol: data.summary.symbol.clone(),
         strategy: SpreadStructure::Wheel,
+        selector_component: SpreadStructure::Wheel.as_str().to_owned(),
         capital_at_risk: trade.max_loss,
         trade,
     })
@@ -3349,12 +3381,31 @@ fn portfolio_wheel_opportunities_for_symbol(
     (opportunities, candidates.len())
 }
 
+#[allow(dead_code)]
 fn portfolio_spread_opportunities_for_symbol(
     data: &PortfolioWheelSymbolData,
     profile: &ResearchProfile,
     from: NaiveDate,
     to: NaiveDate,
     strategy: SpreadStructure,
+) -> (Vec<PortfolioWheelOpportunity>, usize) {
+    portfolio_spread_opportunities_for_symbol_with_component(
+        data,
+        profile,
+        from,
+        to,
+        strategy,
+        strategy.as_str(),
+    )
+}
+
+fn portfolio_spread_opportunities_for_symbol_with_component(
+    data: &PortfolioWheelSymbolData,
+    profile: &ResearchProfile,
+    from: NaiveDate,
+    to: NaiveDate,
+    strategy: SpreadStructure,
+    selector_component: &str,
 ) -> (Vec<PortfolioWheelOpportunity>, usize) {
     let rows_by_expiration = match strategy {
         SpreadStructure::PutCreditSpread => &data.put_rows_by_expiration,
@@ -3371,6 +3422,7 @@ fn portfolio_spread_opportunities_for_symbol(
         .map(|trade| PortfolioWheelOpportunity {
             symbol: data.summary.symbol.clone(),
             strategy,
+            selector_component: selector_component.to_owned(),
             capital_at_risk: trade.max_loss,
             trade,
         })
@@ -3522,6 +3574,7 @@ where
         let accepted = PortfolioWheelTrade {
             symbol: opportunity.symbol.clone(),
             strategy: opportunity.strategy,
+            selector_component: opportunity.selector_component.clone(),
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade.clone(),
         };
@@ -3643,6 +3696,80 @@ fn portfolio_strategy_summaries(trades: &[PortfolioWheelTrade]) -> Vec<Portfolio
                     .iter()
                     .filter(|trade| trade.trade.exit_reason.starts_with("stock_marked"))
                     .count(),
+            }
+        })
+        .collect()
+}
+
+fn portfolio_component_summaries(trades: &[PortfolioWheelTrade]) -> Vec<PortfolioComponentSummary> {
+    let mut by_component: BTreeMap<String, Vec<&PortfolioWheelTrade>> = BTreeMap::new();
+    for trade in trades {
+        let component = if trade.selector_component.is_empty() {
+            trade.strategy.as_str().to_owned()
+        } else {
+            trade.selector_component.clone()
+        };
+        by_component.entry(component).or_default().push(trade);
+    }
+
+    by_component
+        .into_iter()
+        .map(|(component, component_trades)| {
+            let trades_count = component_trades.len();
+            let pnl = component_trades
+                .iter()
+                .map(|trade| trade.trade.pnl)
+                .sum::<f64>();
+            let wins = component_trades
+                .iter()
+                .filter(|trade| trade.trade.pnl > 0.0)
+                .count();
+            let gross_profit = component_trades
+                .iter()
+                .map(|trade| trade.trade.pnl.max(0.0))
+                .sum::<f64>();
+            let gross_loss = component_trades
+                .iter()
+                .map(|trade| trade.trade.pnl.min(0.0).abs())
+                .sum::<f64>();
+            let profit_factor = if gross_loss > 0.0 {
+                gross_profit / gross_loss
+            } else if gross_profit > 0.0 {
+                999.0
+            } else {
+                0.0
+            };
+            let strategy = component_trades
+                .first()
+                .map(|trade| trade.strategy.as_str().to_owned())
+                .unwrap_or_default();
+            PortfolioComponentSummary {
+                component,
+                strategy,
+                trades: trades_count,
+                pnl,
+                cost_25_pnl: pnl - (trades_count as f64 * 25.0),
+                win_rate: ratio(wins, trades_count),
+                profit_factor,
+                avg_pnl: average(
+                    component_trades
+                        .iter()
+                        .map(|trade| trade.trade.pnl)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+                avg_days_held: average(
+                    component_trades
+                        .iter()
+                        .map(|trade| trade.trade.days_held as f64)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+                worst_trade_pnl: component_trades
+                    .iter()
+                    .map(|trade| trade.trade.pnl)
+                    .min_by(|a, b| a.total_cmp(b))
+                    .unwrap_or(0.0),
             }
         })
         .collect()
@@ -3914,6 +4041,7 @@ fn portfolio_signal_trades(
         .map(|opportunity| PortfolioWheelTrade {
             symbol: opportunity.symbol.clone(),
             strategy: opportunity.strategy,
+            selector_component: opportunity.selector_component.clone(),
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade.clone(),
         })
@@ -4968,6 +5096,27 @@ fn portfolio_wheel_markdown(report: &PortfolioWheelReport, title: &str) -> Strin
             ));
         }
         out.push('\n');
+
+        if !best.component_summaries.is_empty() {
+            out.push_str("| Component | Strategy | Trades | PnL | $25 PnL | Win Rate | PF | Avg PnL | Avg Hold | Worst Trade |\n");
+            out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+            for summary in &best.component_summaries {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {:.2} | {:.2} | {:.1}% | {:.2} | {:.2} | {:.1} | {:.2} |\n",
+                    summary.component,
+                    summary.strategy,
+                    summary.trades,
+                    summary.pnl,
+                    summary.cost_25_pnl,
+                    summary.win_rate * 100.0,
+                    summary.profit_factor,
+                    summary.avg_pnl,
+                    summary.avg_days_held,
+                    summary.worst_trade_pnl
+                ));
+            }
+            out.push('\n');
+        }
 
         out.push_str("| Symbol | Trades | PnL | Assigned | Called Away | Marked Stock | Wheel | Put Debit | Call Debit |\n");
         out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
@@ -14701,6 +14850,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: opportunity.strategy,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -14751,6 +14901,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: opportunity.strategy,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -14830,6 +14981,11 @@ mod tests {
         assert_eq!(capped_allocation.trades.len(), 1);
         assert_eq!(uncapped_allocation.trades.len(), 3);
         assert!(capped_allocation.rejected_open_positions > 0);
+        assert!(
+            signal_trades
+                .iter()
+                .all(|trade| trade.selector_component == "wheel")
+        );
         assert_eq!(signal_quality.trades, 3);
         assert!((signal_quality.total_pnl - 1_500.0).abs() < 1e-9);
         assert!((signal_quality.cost_25_pnl - 1_425.0).abs() < 1e-9);
@@ -14855,6 +15011,7 @@ mod tests {
             .map(|trade| PortfolioWheelTrade {
                 symbol: "TSLA".to_owned(),
                 strategy: SpreadStructure::PutDebitSpread,
+                selector_component: "put_debit_primary".to_owned(),
                 capital_at_risk: trade.max_loss,
                 trade: trade.clone(),
             })
@@ -14880,6 +15037,7 @@ mod tests {
         let to_trade = |opportunity: PortfolioWheelOpportunity| PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: opportunity.strategy,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15009,6 +15167,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::PutCreditSpread,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15053,6 +15212,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::Wheel,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15093,6 +15253,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::PutDebitSpread,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15133,6 +15294,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::PutDebitSpread,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15173,6 +15335,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::PutDebitSpread,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15217,6 +15380,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: opportunity.symbol,
             strategy: SpreadStructure::PutDebitSpread,
+            selector_component: opportunity.selector_component,
             capital_at_risk: opportunity.capital_at_risk,
             trade: opportunity.trade,
         };
@@ -15270,12 +15434,14 @@ mod tests {
             PortfolioWheelTrade {
                 symbol: tsla.symbol,
                 strategy: SpreadStructure::PutDebitSpread,
+                selector_component: tsla.selector_component,
                 capital_at_risk: tsla.capital_at_risk,
                 trade: tsla.trade,
             },
             PortfolioWheelTrade {
                 symbol: smci.symbol,
                 strategy: SpreadStructure::CallDebitSpread,
+                selector_component: smci.selector_component,
                 capital_at_risk: smci.capital_at_risk,
                 trade: smci.trade,
             },
@@ -15323,6 +15489,7 @@ mod tests {
         let trade = PortfolioWheelTrade {
             symbol: tsla.symbol,
             strategy: SpreadStructure::PutDebitSpread,
+            selector_component: tsla.selector_component,
             capital_at_risk: tsla.capital_at_risk,
             trade: tsla.trade,
         };
@@ -19278,6 +19445,7 @@ mod tests {
             avg_capital_used_on_entry: 0.0,
             symbol_summaries: Vec::new(),
             strategy_summaries: Vec::new(),
+            component_summaries: Vec::new(),
             risk_summary: PortfolioWheelRiskSummary::default(),
             decision_metrics: PortfolioDecisionMetrics::default(),
             recent_regime: PortfolioRecentRegimeMetrics {
@@ -19571,6 +19739,7 @@ mod tests {
         PortfolioWheelOpportunity {
             symbol: symbol.to_owned(),
             strategy: SpreadStructure::Wheel,
+            selector_component: "wheel".to_owned(),
             capital_at_risk: max_loss,
             trade: ResearchTrade {
                 entry_date,
