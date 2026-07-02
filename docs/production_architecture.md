@@ -24,8 +24,9 @@ flowchart LR
   It never produces broker-ready orders. Vertical-spread simulation nets a
   baseline broker friction (`BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD`) out of
   every trade and settles spreads that reach expiration without an exit-rule
-  fill at expiration intrinsic value instead of dropping them; the $5/$10/$25
-  research-gate cost stress is additional headroom on top of that baseline.
+  fill at expiration intrinsic value instead of dropping them; candidate generation
+  rejects one-sided (zero bid or ask) quotes to align with live quote validation.
+  The $5/$10/$25 research-gate cost stress is additional headroom on top of that baseline.
   Remaining known fidelity gap: exits are evaluated on daily EOD quotes, so
   strictly-intraday stop breaches that recover by the close are not observable
   from the current dataset (live management polls intraday and exits earlier,
@@ -38,12 +39,26 @@ flowchart LR
   signal-artifact adapter; direct chain/quote providers can be added behind the
   same boundary without changing execution.
 - `live_signal_artifact`: atomic JSON contract at `var/live_signal.json`; this
-  is the only input the execution worker may trade from.
+  is the only input the execution worker may trade from. Exports record
+  `source_research_from`, `source_gate_pass`, and `detector_research_gate_enforced`
+  so operators can audit short-window detector refreshes against promotion runs.
 - `live_audit_store`: additive DuckDB live tables for provider health, candidate
   decisions, and emitted snapshots. These rows are observability/audit state,
   not an execution order queue.
 - `execution_worker`: always-on service that validates mode, risk, broker state,
-  preview/place results, ledger idempotency, notifications, and health.
+  preview/place results, ledger idempotency, notifications, and health. Vertical
+  spread exit management uses the shared `VerticalSpreadExitRules` evaluator in
+  `execution.rs` (same thresholds as research simulation). New live entries halt
+  when broker day P&L breaches `max_daily_loss_usd` (default 3% of account cash)
+  or open P&L breaches `max_open_loss_usd` (defaults to the daily cap). Live
+  entries also halt when broker P&L telemetry is unavailable or the account
+  snapshot is not `ok`. Malformed risk-cap env values fail startup instead of
+  silently reverting to defaults. Robinhood
+  paths fail closed when `SPREAD_ROBINHOOD_MCP_COMMAND` is unset; unresolved
+  `pending_unknown` ledger entries surface as `submit_unknown` rather than a false
+  `already_submitted`. Ambiguous Tradier place outcomes (HTTP 5xx/408/429) stay `pending_unknown` and
+  are reconcilable; flat broker state with no matching order clears
+  `pending_unknown` to `terminal_unfilled` so retries are not permanently blocked.
 - `execution_decision`: worker output. Mode is separate from status.
 - `canary`: risk tier only, currently represented by `CanaryRiskPolicy`.
 

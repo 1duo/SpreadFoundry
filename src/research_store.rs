@@ -2183,6 +2183,10 @@ mod tests {
             selected_signal: Some(signal),
             source_run_id: "source_run".to_owned(),
             source_report: "source_report".to_owned(),
+            source_research_from: None,
+            source_gate_pass: None,
+            source_gate_reason: None,
+            detector_research_gate_enforced: false,
         }
     }
 

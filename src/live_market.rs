@@ -209,6 +209,18 @@ pub fn build_signal_artifact_live_market_snapshot(
             config.source_live_signal.display(),
             source_report
         ),
+        source_research_from: source_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.source_research_from),
+        source_gate_pass: source_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.source_gate_pass),
+        source_gate_reason: source_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.source_gate_reason.clone()),
+        detector_research_gate_enforced: source_artifact
+            .as_ref()
+            .is_some_and(|artifact| artifact.detector_research_gate_enforced),
     };
     artifact.validate_contract()?;
 
@@ -567,6 +579,10 @@ mod tests {
             selected_signal: Some(signal),
             source_run_id: "source_run".to_owned(),
             source_report: "source_report".to_owned(),
+            source_research_from: None,
+            source_gate_pass: None,
+            source_gate_reason: None,
+            detector_research_gate_enforced: false,
         }
     }
 

@@ -8,13 +8,13 @@ use spreadfoundry::broker::{
     BrokerCapabilities, RobinhoodBrokerAdapter, RobinhoodMcpCommandExecutor,
     RobinhoodMcpToolRequest, RobinhoodMcpToolResponse, TradierClient, TradierConfig,
     TradierMarketClock, TradierMarketClockResponse, TradierOrder, TradierOrderResponse,
-    TradierPosition, TradierQuote, TradierQuotesResponse,
+    TradierPosition, TradierQuote, TradierQuotesResponse, tradier_http_status_is_ambiguous,
 };
 use spreadfoundry::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderLeg, OptionOrderSide, PositionEffect,
-    TimeInForce, cash_secured_put_open_intent, conservative_short_spread_exit_debit_f64,
-    credit_spread_close_intent, credit_spread_open_intent, debit_spread_close_intent,
-    debit_spread_open_intent,
+    TimeInForce, VerticalSpreadExitReason, VerticalSpreadExitRules, cash_secured_put_open_intent,
+    conservative_short_spread_exit_debit_f64, credit_spread_close_intent,
+    credit_spread_open_intent, debit_spread_close_intent, debit_spread_open_intent,
 };
 use spreadfoundry::fixture;
 use spreadfoundry::live_market::{
@@ -1155,6 +1155,12 @@ async fn main() -> Result<()> {
                     wheel_reserve_cap,
                     free_cash_buffer,
                     max_wheel_positions_per_symbol,
+                    max_daily_loss_usd: env_optional_positive_f64(
+                        "SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD",
+                    )?,
+                    max_open_loss_usd: env_optional_positive_f64(
+                        "SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD",
+                    )?,
                 },
                 broker: execution_broker(
                     broker,
@@ -1762,6 +1768,10 @@ fn export_live_signal_with_gate(
         selected_signal,
         source_run_id: report.run_id,
         source_report: report_path.display().to_string(),
+        source_research_from: Some(report.from),
+        source_gate_pass: Some(profile.gate_pass),
+        source_gate_reason: Some(profile.gate_reason.clone()),
+        detector_research_gate_enforced: require_research_gate,
     };
     artifact.validate_contract()?;
     write_json_atomic_value(output, &artifact)
@@ -2465,6 +2475,8 @@ fn run_execution_decision(
         wheel_reserve_cap,
         free_cash_buffer,
         max_wheel_positions_per_symbol,
+        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
+        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
     };
     validate_canary_risk_policy(&risk)?;
     let broker = execution_broker(
@@ -2481,6 +2493,10 @@ fn run_execution_decision(
         &broker,
         mode,
         max_order_age_seconds,
+    );
+    apply_execution_account_halt_to_decision(
+        &mut decision,
+        snapshot_broker_account(broker_kind).as_ref(),
     );
     apply_broker_bridge(
         &mut decision,
@@ -2570,6 +2586,8 @@ fn execution_readiness(
         wheel_reserve_cap,
         free_cash_buffer,
         max_wheel_positions_per_symbol,
+        max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
+        max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
     };
     validate_canary_risk_policy(&risk)?;
     let broker = execution_broker(
@@ -2596,6 +2614,7 @@ fn execution_readiness(
         }
     };
     let live_signal_parse_ok = artifact.is_some();
+    let broker_account = snapshot_broker_account(broker_kind);
     let report = build_execution_readiness_report(
         live_signal,
         live_signal_readable,
@@ -2605,6 +2624,7 @@ fn execution_readiness(
         as_of,
         &risk,
         &broker,
+        broker_account.as_ref(),
         robinhood_mcp_command.is_some(),
         tradier_config_from_env().is_ok(),
         max_order_age_seconds,
@@ -2634,6 +2654,7 @@ fn build_execution_readiness_report(
     as_of: NaiveDate,
     risk: &CanaryRiskPolicy,
     broker: &impl ExecutionBrokerView,
+    broker_account: Option<&BrokerAccountSnapshot>,
     robinhood_mcp_command_configured: bool,
     tradier_credentials_configured: bool,
     max_order_age_seconds: u64,
@@ -2655,7 +2676,7 @@ fn build_execution_readiness_report(
     }
 
     if let Some(artifact) = artifact {
-        let execution_decision = compute_execution_decision(
+        let mut execution_decision = compute_execution_decision(
             artifact,
             as_of,
             risk,
@@ -2663,6 +2684,7 @@ fn build_execution_readiness_report(
             ExecutionMode::Live,
             max_order_age_seconds,
         );
+        apply_execution_account_halt_to_decision(&mut execution_decision, broker_account);
         match execution_decision.status.as_str() {
             "ready" => warnings.push(
                 "broker review/place has not been executed by this read-only readiness command"
@@ -2776,6 +2798,12 @@ struct CanaryRiskPolicy {
     wheel_reserve_cap: f64,
     free_cash_buffer: f64,
     max_wheel_positions_per_symbol: usize,
+    /// When set, blocks new live entries once broker day P&L is at or below
+    /// this loss. Defaults to 3% of account_cash when unset.
+    max_daily_loss_usd: Option<f64>,
+    /// When set, blocks new live entries once broker open P&L is at or below
+    /// this loss. Defaults to max_daily_loss_usd when unset.
+    max_open_loss_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2804,6 +2832,8 @@ struct ExecutionDecision {
     tradier_quote: Option<TradierQuotesResponse>,
     tradier_preview: Option<TradierOrderResponse>,
     tradier_place: Option<TradierOrderResponse>,
+    #[serde(default)]
+    exit_rule_audit: Option<String>,
     #[serde(default)]
     action_kind: Option<ExecutionActionKind>,
     #[serde(default)]
@@ -3342,6 +3372,7 @@ fn execution_decision(
         tradier_quote: None,
         tradier_preview: None,
         tradier_place: None,
+        exit_rule_audit: None,
         action_kind,
         management_signals: Vec::new(),
         selected_signal,
@@ -3990,6 +4021,10 @@ fn apply_robinhood_mcp_bridge(
         return Ok(());
     }
     let Some(command) = robinhood_mcp_command else {
+        decision.status = "blocked".to_owned();
+        decision.reason =
+            "SPREAD_ROBINHOOD_MCP_COMMAND not configured; cannot review or place Robinhood orders"
+                .to_owned();
         return Ok(());
     };
     let Some(action) = decision.selected_signal.clone() else {
@@ -4041,6 +4076,20 @@ fn apply_robinhood_mcp_bridge(
         decision.reason = "live placement requires a local execution order ledger".to_owned();
         return Ok(());
     };
+    if let Some(entry) = execution_order_ledger_blocking_entry(ledger_path, &order_key)? {
+        if entry.status == "pending_unknown" {
+            decision.status = "submit_unknown".to_owned();
+            decision.reason = entry.reason.clone().unwrap_or_else(|| {
+                "matching Robinhood order intent has an unresolved pending_unknown ledger entry; verify broker state before clearing the ledger".to_owned()
+            });
+            return Ok(());
+        }
+        decision.status = "already_submitted".to_owned();
+        decision.reason =
+            "matching Robinhood MCP order intent is already recorded in the local execution ledger"
+                .to_owned();
+        return Ok(());
+    }
     if execution_order_ledger_reserve_pending(
         ledger_path,
         &order_key,
@@ -4701,6 +4750,7 @@ fn apply_tradier_rest_bridge_with_config(
             &order_key,
             &["reviewed", "rejected", "pending_unknown", "submitted"],
         )?
+        && !(entry.status == "rejected" && tradier_ledger_entry_is_reconcilable(&entry))
     {
         apply_tradier_ledger_entry_to_decision(decision, &entry);
         return Ok(());
@@ -4861,7 +4911,7 @@ fn apply_tradier_rest_bridge_with_config(
         }
     };
     let place_result = tradier_place_accepted(&place);
-    decision.tradier_place = Some(place);
+    decision.tradier_place = Some(place.clone());
     match place_result {
         Ok(order_id) => {
             let confirmed_status = match tradier_confirm_order_after_place(&client, &order_id) {
@@ -4901,16 +4951,37 @@ fn apply_tradier_rest_bridge_with_config(
         }
         Err(reason) => {
             if let Some(ledger_path) = live_ledger_path {
+                let reconcilable = !tradier_place_rejection_is_final(&place, &reason);
+                let ledger_status = if reconcilable {
+                    "pending_unknown"
+                } else {
+                    "rejected"
+                };
+                let ledger_reason = if reconcilable {
+                    tradier_ambiguous_ledger_reason(&reason)
+                } else {
+                    reason.clone()
+                };
                 execution_order_ledger_record_status(
                     ledger_path,
                     &order_key,
-                    "rejected",
+                    ledger_status,
                     None,
-                    Some(reason.as_str()),
+                    Some(ledger_reason.as_str()),
                 )?;
             }
-            decision.status = "rejected".to_owned();
-            decision.reason = format!("Tradier place order returned a rejection: {reason}");
+            decision.status = if tradier_place_rejection_is_final(&place, &reason) {
+                "rejected".to_owned()
+            } else {
+                "submit_unknown".to_owned()
+            };
+            decision.reason = if tradier_place_rejection_is_final(&place, &reason) {
+                format!("Tradier place order returned a rejection: {reason}")
+            } else {
+                format!(
+                    "Tradier place order outcome is ambiguous after local ledger reservation; check Tradier before retrying: {reason}"
+                )
+            };
         }
     }
     Ok(())
@@ -5195,6 +5266,7 @@ fn apply_tradier_vertical_spread_management_bridge_with_config(
                             };
                             decision.selected_signal = Some(action.clone());
                             decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                            decision.exit_rule_audit = Some(format!("shared_evaluator:{reason}"));
                             return apply_tradier_payload_preview_and_maybe_place(
                                 decision,
                                 &client,
@@ -5272,6 +5344,7 @@ fn apply_tradier_vertical_spread_management_bridge_with_config(
                         };
                         decision.selected_signal = Some(action.clone());
                         decision.action_kind = Some(ExecutionActionKind::ManageOpen);
+                        decision.exit_rule_audit = Some(format!("shared_evaluator:{reason}"));
                         return apply_tradier_payload_preview_and_maybe_place(
                             decision,
                             &client,
@@ -5729,6 +5802,7 @@ fn apply_tradier_payload_preview_and_maybe_place(
             &order_key,
             &["reviewed", "rejected", "pending_unknown", "submitted"],
         )?
+        && !(entry.status == "rejected" && tradier_ledger_entry_is_reconcilable(&entry))
     {
         apply_tradier_ledger_entry_to_decision(decision, &entry);
         return Ok(());
@@ -5856,7 +5930,7 @@ fn apply_tradier_payload_preview_and_maybe_place(
         }
     };
     let place_result = tradier_place_accepted(&place);
-    decision.tradier_place = Some(place);
+    decision.tradier_place = Some(place.clone());
     match place_result {
         Ok(order_id) => {
             let confirmed_status = match tradier_confirm_order_after_place(client, &order_id) {
@@ -5896,16 +5970,37 @@ fn apply_tradier_payload_preview_and_maybe_place(
         }
         Err(reason) => {
             if let Some(ledger_path) = live_ledger_path {
+                let reconcilable = !tradier_place_rejection_is_final(&place, &reason);
+                let ledger_status = if reconcilable {
+                    "pending_unknown"
+                } else {
+                    "rejected"
+                };
+                let ledger_reason = if reconcilable {
+                    tradier_ambiguous_ledger_reason(&reason)
+                } else {
+                    reason.clone()
+                };
                 execution_order_ledger_record_status(
                     ledger_path,
                     &order_key,
-                    "rejected",
+                    ledger_status,
                     None,
-                    Some(reason.as_str()),
+                    Some(ledger_reason.as_str()),
                 )?;
             }
-            decision.status = "rejected".to_owned();
-            decision.reason = format!("{order_description} returned a rejection: {reason}");
+            decision.status = if tradier_place_rejection_is_final(&place, &reason) {
+                "rejected".to_owned()
+            } else {
+                "submit_unknown".to_owned()
+            };
+            decision.reason = if tradier_place_rejection_is_final(&place, &reason) {
+                format!("{order_description} returned a rejection: {reason}")
+            } else {
+                format!(
+                    "{order_description} outcome is ambiguous after local ledger reservation; check Tradier before retrying: {reason}"
+                )
+            };
         }
     }
     Ok(())
@@ -5992,21 +6087,22 @@ fn live_debit_spread_exit_plan(
             width
         );
     }
-    let max_profit_per_share = width - entry_debit;
-    let take_profit_credit = entry_debit + max_profit_per_share * rules.take_profit_pct;
+    let exit_rules = VerticalSpreadExitRules {
+        take_profit_pct: rules.take_profit_pct,
+        stop_loss_multiple: rules.stop_loss_multiple,
+        force_close_dte: rules.force_close_dte,
+        max_hold_days: rules.max_hold_days,
+    };
+    let take_profit_credit = entry_debit + (width - entry_debit) * rules.take_profit_pct;
     let stop_credit = entry_debit * (1.0 - rules.stop_loss_multiple).max(0.0);
     let close = |reason: &str| DebitSpreadExitPlan::Close {
         reason: reason.to_owned(),
         limit_credit: exit_credit,
     };
-    if exit_credit >= take_profit_credit {
-        return Ok(close("take_profit"));
-    }
-    if exit_credit <= stop_credit {
-        return Ok(close("stop_loss"));
-    }
-    if let Some(reason) = live_debit_spread_time_exit_reason(action, as_of)? {
-        return Ok(close(reason));
+    if let Some(reason) =
+        exit_rules.debit_spread_exit_reason(entry_debit, width, exit_credit, days_held, dte)
+    {
+        return Ok(close(reason.as_str()));
     }
     Ok(DebitSpreadExitPlan::Hold {
         reason: format!(
@@ -6049,20 +6145,22 @@ fn live_credit_spread_exit_plan(
             width
         );
     }
+    let exit_rules = VerticalSpreadExitRules {
+        take_profit_pct: rules.take_profit_pct,
+        stop_loss_multiple: rules.stop_loss_multiple,
+        force_close_dte: rules.force_close_dte,
+        max_hold_days: rules.max_hold_days,
+    };
     let take_profit_debit = entry_credit * (1.0 - rules.take_profit_pct).max(0.0);
     let stop_debit = entry_credit * rules.stop_loss_multiple;
     let close = |reason: &str| CreditSpreadExitPlan::Close {
         reason: reason.to_owned(),
         limit_debit: exit_debit,
     };
-    if exit_debit >= stop_debit {
-        return Ok(close("stop_loss"));
-    }
-    if exit_debit <= take_profit_debit {
-        return Ok(close("take_profit"));
-    }
-    if let Some(reason) = live_credit_spread_time_exit_reason(action, as_of)? {
-        return Ok(close(reason));
+    if let Some(reason) =
+        exit_rules.credit_spread_exit_reason(entry_credit, exit_debit, days_held, dte)
+    {
+        return Ok(close(reason.as_str()));
     }
     Ok(CreditSpreadExitPlan::Hold {
         reason: format!(
@@ -6089,23 +6187,14 @@ fn live_debit_spread_time_exit_reason(
     }
     let days_held = (as_of - entry_date).num_days();
     let dte = (expiration - as_of).num_days();
-    if rules
-        .max_hold_days
-        .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
-    {
-        return Ok(Some("max_hold"));
+    Ok(VerticalSpreadExitRules {
+        take_profit_pct: rules.take_profit_pct,
+        stop_loss_multiple: rules.stop_loss_multiple,
+        force_close_dte: rules.force_close_dte,
+        max_hold_days: rules.max_hold_days,
     }
-    if dte <= rules.force_close_dte {
-        return Ok(Some("force_close"));
-    }
-    Ok(None)
-}
-
-fn live_credit_spread_time_exit_reason(
-    action: &TradeSignal,
-    as_of: NaiveDate,
-) -> Result<Option<&'static str>> {
-    live_debit_spread_time_exit_reason(action, as_of)
+    .time_exit_reason(days_held, dte)
+    .map(VerticalSpreadExitReason::as_str))
 }
 
 fn live_vertical_spread_time_exit_reason(
@@ -6249,6 +6338,43 @@ fn tradier_preview_accepted(response: &TradierOrderResponse) -> std::result::Res
     }
 }
 
+const TRADIER_AMBIGUOUS_LEDGER_PREFIX: &str = "ambiguous:";
+
+fn tradier_place_rejection_is_final(response: &TradierOrderResponse, reason: &str) -> bool {
+    if response
+        .http_status
+        .is_some_and(tradier_http_status_is_ambiguous)
+    {
+        return false;
+    }
+    if let Some(status) = response.http_status
+        && (400..500).contains(&status)
+    {
+        return true;
+    }
+    if !response.ok {
+        return false;
+    }
+    !reason.starts_with(TRADIER_AMBIGUOUS_LEDGER_PREFIX)
+}
+
+fn tradier_ambiguous_ledger_reason(reason: &str) -> String {
+    if reason.starts_with(TRADIER_AMBIGUOUS_LEDGER_PREFIX) {
+        reason.to_owned()
+    } else {
+        format!("{TRADIER_AMBIGUOUS_LEDGER_PREFIX}{reason}")
+    }
+}
+
+fn tradier_ledger_entry_is_reconcilable(entry: &ExecutionOrderLedgerEntry) -> bool {
+    entry.status == "pending_unknown"
+        || (entry.status == "rejected"
+            && entry
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(TRADIER_AMBIGUOUS_LEDGER_PREFIX)))
+}
+
 fn tradier_place_accepted(response: &TradierOrderResponse) -> std::result::Result<String, String> {
     tradier_response_base_ok(response)?;
     let order = tradier_response_order(&response.raw)
@@ -6350,7 +6476,7 @@ fn reconcile_tradier_pending_unknown_ledger_entry(
     payload: &BTreeMap<String, String>,
     action: &TradeSignal,
 ) -> Result<TradierPendingUnknownLedgerResolution> {
-    if entry.status != "pending_unknown" {
+    if entry.status != "pending_unknown" && !tradier_ledger_entry_is_reconcilable(entry) {
         return Ok(TradierPendingUnknownLedgerResolution::NotPendingUnknown);
     }
 
@@ -6399,6 +6525,24 @@ fn reconcile_tradier_pending_unknown_ledger_entry(
     let matches =
         tradier_pending_unknown_matching_orders(entry, expected_tag.as_str(), orders.as_slice());
     let [matched_order] = matches.as_slice() else {
+        if matches.is_empty()
+            && tradier_entry_lifecycle_is_flat_for_retry(
+                action,
+                &positions,
+                &orders,
+                decision.as_of,
+            )?
+        {
+            let reason = "pending_unknown reconciled to flat broker state with no matching order; retry allowed".to_owned();
+            execution_order_ledger_record_status(
+                ledger_path,
+                order_key,
+                "terminal_unfilled",
+                None,
+                Some(reason.as_str()),
+            )?;
+            return Ok(TradierPendingUnknownLedgerResolution::Retry);
+        }
         decision.status = "submit_unknown".to_owned();
         decision.reason = if matches.is_empty() {
             entry.reason.clone().unwrap_or_else(|| {
@@ -9448,6 +9592,8 @@ async fn run_execution_worker_from_env(once_flag: bool) -> Result<()> {
                 "SPREAD_CANARY_RISK_MAX_WHEEL_POSITIONS_PER_SYMBOL",
                 1,
             )?,
+            max_daily_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD")?,
+            max_open_loss_usd: env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_OPEN_LOSS_USD")?,
         },
         broker: execution_broker(
             broker_kind,
@@ -9517,6 +9663,23 @@ fn env_f64(name: &str, default: f64) -> Result<f64> {
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
+}
+
+fn env_optional_positive_f64(name: &str) -> Result<Option<f64>> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            let parsed = value
+                .parse::<f64>()
+                .with_context(|| format!("parse {name}={value} as number"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                anyhow::bail!("{name} must be positive and finite when set");
+            }
+            Ok(Some(parsed))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64> {
@@ -9725,6 +9888,7 @@ fn build_execution_worker_health(
         .as_of
         .unwrap_or_else(|| execution_default_as_of(Utc::now()));
     let live_signal = args.live_signal.display().to_string();
+    let broker_account = snapshot_broker_account(args.broker.kind);
     let signal_body = fs::read_to_string(&args.live_signal);
     let live_signal_readable = signal_body.is_ok();
     let mut error = None;
@@ -9739,6 +9903,10 @@ fn build_execution_worker_health(
                     &args.broker,
                     args.mode,
                     args.max_order_age_seconds,
+                );
+                apply_execution_account_halt_to_decision(
+                    &mut execution_decision,
+                    broker_account.as_ref(),
                 );
                 if apply_broker_side_effects
                     && let Err(err) = apply_broker_bridge(
@@ -9766,7 +9934,6 @@ fn build_execution_worker_health(
             false
         }
     };
-    let broker_account = snapshot_broker_account(args.broker.kind);
     let status = execution_worker_aggregate_status(
         decision.as_ref(),
         error.as_deref(),
@@ -9907,7 +10074,77 @@ fn validate_canary_risk_policy(risk: &CanaryRiskPolicy) -> Result<()> {
     if risk.max_wheel_positions_per_symbol == 0 {
         anyhow::bail!("--max-wheel-positions-per-symbol must be positive");
     }
+    if let Some(max_daily_loss) = risk.max_daily_loss_usd
+        && (!max_daily_loss.is_finite() || max_daily_loss <= 0.0)
+    {
+        anyhow::bail!("--max-daily-loss-usd must be positive when set");
+    }
+    if let Some(max_open_loss) = risk.max_open_loss_usd
+        && (!max_open_loss.is_finite() || max_open_loss <= 0.0)
+    {
+        anyhow::bail!("--max-open-loss-usd must be positive when set");
+    }
     Ok(())
+}
+
+fn execution_account_halt_blocks_new_entry(
+    account: Option<&BrokerAccountSnapshot>,
+    policy: &CanaryRiskPolicy,
+) -> Option<String> {
+    let max_daily_loss = policy
+        .max_daily_loss_usd
+        .unwrap_or(policy.account_cash * 0.03);
+    let max_open_loss = policy.max_open_loss_usd.unwrap_or(max_daily_loss);
+    let account = account?;
+    if account.status != "ok" {
+        return Some(format!(
+            "broker account snapshot status {} prevents P&L risk verification; new entries halted",
+            account.status
+        ));
+    }
+    let missing_telemetry = match (account.day_pnl.is_none(), account.open_pnl.is_none()) {
+        (true, true) => Some("day and open P&L"),
+        (true, false) => Some("day P&L"),
+        (false, true) => Some("open P&L"),
+        (false, false) => None,
+    };
+    if let Some(missing) = missing_telemetry {
+        return Some(format!(
+            "broker account snapshot missing {missing}; new entries halted until telemetry is available"
+        ));
+    }
+    if let Some(day_pnl) = account.day_pnl
+        && day_pnl <= -max_daily_loss
+    {
+        return Some(format!(
+            "account day P&L {day_pnl:.2} breached max daily loss {max_daily_loss:.2}; new entries halted until the next session"
+        ));
+    }
+    if let Some(open_pnl) = account.open_pnl
+        && open_pnl <= -max_open_loss
+    {
+        return Some(format!(
+            "account open P&L {open_pnl:.2} breached max open loss {max_open_loss:.2}; new entries halted until open positions recover or are closed"
+        ));
+    }
+    None
+}
+
+fn apply_execution_account_halt_to_decision(
+    decision: &mut ExecutionDecision,
+    account: Option<&BrokerAccountSnapshot>,
+) -> bool {
+    if let Some(halt_reason) = execution_account_halt_blocks_new_entry(account, &decision.risk)
+        && decision.action_kind == Some(ExecutionActionKind::OpenEntry)
+        && decision.mode == ExecutionMode::Live
+        && decision.status == "ready"
+    {
+        decision.status = "blocked".to_owned();
+        decision.reason = halt_reason;
+        true
+    } else {
+        false
+    }
 }
 
 fn print_option_cache_coverage_report(report: &OptionCacheCoverageReport) {
@@ -12445,6 +12682,8 @@ mod tests {
                 wheel_reserve_cap: 5_000.0,
                 free_cash_buffer: 11_250.0,
                 max_wheel_positions_per_symbol: 1,
+                max_daily_loss_usd: None,
+                max_open_loss_usd: None,
             },
             &broker,
             ExecutionMode::Monitor,
@@ -13818,6 +14057,164 @@ mod tests {
         assert_eq!(first.status, "submitted");
         assert_eq!(second.status, "already_submitted");
         fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn robinhood_bridge_blocks_when_mcp_command_missing() {
+        let ledger = unique_main_test_path("robinhood-mcp-missing.json");
+        let today = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let artifact = test_live_signal_artifact_as_of(
+            Some(today),
+            serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Robinhood, true, false, false, true);
+        let mut decision = compute_execution_decision_at(
+            &artifact,
+            today,
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Review,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            test_market_open_utc(today),
+        );
+        apply_broker_bridge(&mut decision, &broker, None, Some(&ledger)).unwrap();
+        assert_eq!(decision.status, "blocked");
+        assert!(
+            decision
+                .reason
+                .contains("SPREAD_ROBINHOOD_MCP_COMMAND not configured")
+        );
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    fn robinhood_pending_unknown_retry_reports_submit_unknown_not_already_submitted() {
+        let ledger = unique_main_test_path("robinhood-pending-unknown-retry.json");
+        let today = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        let artifact = test_live_signal_artifact_as_of(
+            Some(today),
+            serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"ORCL",
+                "strategy":"call_debit_spread",
+                "entry_date":"2026-06-29",
+                "exit_date":"2026-06-29",
+                "expiration":"2026-07-02",
+                "short_strike":225.0,
+                "long_strike":220.0,
+                "entry_credit":-4.50,
+                "max_loss":450.0
+            }]),
+        );
+        let broker = execution_broker(BrokerKind::Robinhood, true, false, false, true);
+        let mut decision = compute_execution_decision_at(
+            &artifact,
+            today,
+            &test_canary_risk(),
+            &broker,
+            ExecutionMode::Live,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+            test_market_open_utc(today),
+        );
+        let action = decision.selected_signal.clone().unwrap();
+        let order_key = robinhood_mcp_order_key(
+            &robinhood_mcp_option_order_request("review_option_order", &action).unwrap(),
+        );
+        execution_order_ledger_record_status(
+            &ledger,
+            &order_key,
+            "pending_unknown",
+            None,
+            Some("Robinhood MCP place_option_order failed after local ledger reservation"),
+        )
+        .unwrap();
+        let review_response = serde_json::json!({
+            "ok": true,
+            "tool": "review_option_order",
+            "raw": {"order_key": order_key, "broker_preview_verified": true}
+        })
+        .to_string();
+        let command = format!(
+            "body=$(cat); case \"$body\" in *review_option_order*) printf '%s\\n' '{}' ;; esac",
+            review_response
+        );
+        apply_robinhood_mcp_bridge(&mut decision, Some(command.as_str()), Some(&ledger)).unwrap();
+        assert_eq!(decision.status, "submit_unknown");
+        assert_ne!(decision.status, "already_submitted");
+        fs::remove_file(ledger).unwrap();
+    }
+
+    #[test]
+    fn execution_account_halt_blocks_on_open_pnl() {
+        let policy = CanaryRiskPolicy {
+            account_cash: 45_000.0,
+            debit_max_loss: 1_000.0,
+            wheel_reserve_cap: 35_000.0,
+            free_cash_buffer: 11_250.0,
+            max_wheel_positions_per_symbol: 1,
+            max_daily_loss_usd: Some(2_000.0),
+            max_open_loss_usd: Some(1_500.0),
+        };
+        let account = BrokerAccountSnapshot {
+            broker: BrokerKind::Tradier,
+            status: "ok".to_owned(),
+            account: "test".to_owned(),
+            equity: Some(45_000.0),
+            buying_power: Some(45_000.0),
+            cash: Some(45_000.0),
+            day_pnl: Some(-500.0),
+            open_pnl: Some(-1_600.0),
+            close_pnl: None,
+            requirement: None,
+            error: None,
+        };
+        let halt = execution_account_halt_blocks_new_entry(Some(&account), &policy);
+        assert!(halt.is_some());
+        assert!(halt.unwrap().contains("open P&L"));
+    }
+
+    #[test]
+    fn execution_account_halt_blocks_when_pnl_telemetry_missing() {
+        let policy = test_canary_risk();
+        let account = BrokerAccountSnapshot {
+            broker: BrokerKind::Tradier,
+            status: "ok".to_owned(),
+            account: "test".to_owned(),
+            equity: Some(45_000.0),
+            buying_power: Some(45_000.0),
+            cash: Some(45_000.0),
+            day_pnl: None,
+            open_pnl: None,
+            close_pnl: None,
+            requirement: None,
+            error: None,
+        };
+        let halt = execution_account_halt_blocks_new_entry(Some(&account), &policy);
+        assert!(halt.is_some());
+        assert!(halt.unwrap().contains("missing day and open P&L"));
+    }
+
+    #[test]
+    fn env_optional_positive_f64_rejects_malformed_values() {
+        unsafe {
+            std::env::set_var("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD", "not-a-number");
+        }
+        let err = env_optional_positive_f64("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD").unwrap_err();
+        assert!(err.to_string().contains("parse"));
+        unsafe {
+            std::env::remove_var("SPREAD_CANARY_RISK_MAX_DAILY_LOSS_USD");
+        }
     }
 
     #[test]
@@ -15628,9 +16025,70 @@ mod tests {
     }
 
     #[test]
+    fn tradier_pending_unknown_without_id_or_tag_retries_when_broker_is_flat() {
+        let (base_url, requests, handle) =
+            spawn_tradier_mock(tradier_live_debit_flat_pending_unknown_retry_responses());
+        let ledger = unique_main_test_path("tradier-order-ledger-pending-flat-retry.json");
+        let mut decision = tradier_test_decision(ExecutionMode::Live);
+        let config = test_tradier_config(base_url);
+        let payload =
+            tradier_multileg_debit_payload(decision.selected_signal.as_ref().unwrap()).unwrap();
+        let order_key = tradier_order_key(
+            &config,
+            &payload,
+            decision.selected_signal.as_ref().unwrap(),
+        );
+        execution_order_ledger_record_status(
+            &ledger,
+            &order_key,
+            "pending_unknown",
+            None,
+            Some("prior submit unknown"),
+        )
+        .unwrap();
+
+        apply_tradier_rest_bridge_with_config(&mut decision, Some(&ledger), config).unwrap();
+
+        let bodies = collect_mock_requests(requests, handle);
+        let ledger_entries = read_execution_order_ledger(&ledger).unwrap();
+        let entry = ledger_entries.get(&order_key).unwrap();
+        assert_eq!(entry.status, "submitted");
+        assert_eq!(decision.status, "submitted");
+        assert!(decision.reason.contains("accepted order id"));
+        assert_eq!(bodies.len(), 12);
+        fs::remove_file(ledger).unwrap();
+    }
+
+    fn tradier_live_debit_flat_pending_unknown_retry_responses() -> Vec<(u16, String)> {
+        vec![
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (
+                200,
+                r#"{"clock":{"state":"open","description":"Market is open"}}"#.to_owned(),
+            ),
+            (200, tradier_good_balances_response()),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, tradier_good_debit_quote_response()),
+            (
+                200,
+                r#"{"order":{"id":"preview","status":"ok","result":true}}"#.to_owned(),
+            ),
+            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, r#"{"orders":{"order":[]}}"#.to_owned()),
+            (200, r#"{"order":{"id":"placed","status":"ok"}}"#.to_owned()),
+            (
+                200,
+                r#"{"orders":{"order":{"id":"placed","symbol":"ORCL","option_symbol":"ORCL260702C00220000","status":"open","quantity":1}}}"#.to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
     fn tradier_pending_unknown_without_id_or_tag_stays_unknown() {
         let (base_url, requests, handle) = spawn_tradier_mock(vec![
-            (200, r#"{"positions":{"position":[]}}"#.to_owned()),
+            (200, tradier_open_call_debit_positions_response()),
             (200, r#"{"orders":{"order":[]}}"#.to_owned()),
         ]);
         let ledger = unique_main_test_path("tradier-order-ledger-pending-no-match.json");
@@ -16797,6 +17255,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 6, 28).unwrap(),
             &test_canary_risk(),
             &RobinhoodBrokerAdapter::default(),
+            None,
             false,
             false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
@@ -16937,6 +17396,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
+            None,
             true,
             false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
@@ -16997,6 +17457,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
+            None,
             false,
             true,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
@@ -17015,6 +17476,78 @@ mod tests {
             );
         } else {
             assert!(!report.live_worker_ready_to_attempt_order);
+            assert!(
+                report
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("regular options-market window"))
+            );
+        }
+    }
+
+    #[test]
+    fn execution_readiness_blocks_when_account_pnl_breaches_daily_loss_cap() {
+        let today = execution_default_as_of(Utc::now());
+        let today_s = today.to_string();
+        let mut artifact = test_canary_artifact(serde_json::json!([{
+                "status":"new_entry",
+                "symbol":"TSLA",
+                "strategy":"put_debit_spread",
+                "entry_date":today_s,
+                "exit_date":today_s,
+                "expiration":"2026-07-02",
+                "short_strike":350.0,
+                "long_strike":355.0,
+                "entry_credit":-1.00,
+                "max_loss":100.0
+        }]));
+        artifact.generated_at = Utc::now() - chrono::Duration::minutes(1);
+        let broker = execution_broker(BrokerKind::Tradier, false, false, false, true);
+        let account = BrokerAccountSnapshot {
+            broker: BrokerKind::Tradier,
+            status: "ok".to_owned(),
+            account: "test".to_owned(),
+            equity: Some(45_000.0),
+            buying_power: Some(45_000.0),
+            cash: Some(45_000.0),
+            day_pnl: Some(-2_000.0),
+            open_pnl: Some(0.0),
+            close_pnl: None,
+            requirement: None,
+            error: None,
+        };
+
+        let report = build_execution_readiness_report(
+            Path::new("candidates/weekly_selector_canary.json"),
+            true,
+            true,
+            Some(&artifact),
+            None,
+            today,
+            &test_canary_risk(),
+            &broker,
+            Some(&account),
+            false,
+            true,
+            DEFAULT_MAX_ORDER_AGE_SECONDS,
+        );
+
+        assert!(!report.live_worker_ready_to_attempt_order);
+        if execution_market_window_open_at(Utc::now()) {
+            assert!(
+                report
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("breached max daily loss"))
+            );
+            assert_eq!(
+                report
+                    .decision
+                    .as_ref()
+                    .map(|decision| decision.status.as_str()),
+                Some("blocked")
+            );
+        } else {
             assert!(
                 report
                     .blockers
@@ -17061,6 +17594,7 @@ mod tests {
             today,
             &test_canary_risk(),
             &broker,
+            None,
             true,
             false,
             DEFAULT_MAX_ORDER_AGE_SECONDS,
@@ -17217,6 +17751,8 @@ mod tests {
             wheel_reserve_cap: 35_000.0,
             free_cash_buffer: 11_250.0,
             max_wheel_positions_per_symbol: 1,
+            max_daily_loss_usd: None,
+            max_open_loss_usd: None,
         }
     }
 
@@ -17309,6 +17845,10 @@ mod tests {
             selected_signal,
             source_run_id: "test_run".to_owned(),
             source_report: "test_report".to_owned(),
+            source_research_from: None,
+            source_gate_pass: None,
+            source_gate_reason: None,
+            detector_research_gate_enforced: false,
         }
     }
 

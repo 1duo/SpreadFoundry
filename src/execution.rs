@@ -190,6 +190,89 @@ pub fn long_call_spread_expiration_credit_f64(
     (long_intrinsic - short_intrinsic).clamp(0.0, width)
 }
 
+/// Shared take-profit / stop-loss / time-based exit thresholds for vertical
+/// spreads. Research simulation and the live management worker both call these
+/// helpers so exit-rule drift cannot silently reappear across paths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VerticalSpreadExitRules {
+    pub take_profit_pct: f64,
+    pub stop_loss_multiple: f64,
+    pub force_close_dte: i64,
+    pub max_hold_days: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerticalSpreadExitReason {
+    TakeProfit,
+    StopLoss,
+    MaxHold,
+    ForceClose,
+}
+
+impl VerticalSpreadExitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TakeProfit => "take_profit",
+            Self::StopLoss => "stop_loss",
+            Self::MaxHold => "max_hold",
+            Self::ForceClose => "force_close",
+        }
+    }
+}
+
+impl VerticalSpreadExitRules {
+    pub fn credit_spread_exit_reason(
+        self,
+        entry_credit: f64,
+        exit_debit: f64,
+        days_held: i64,
+        dte: i64,
+    ) -> Option<VerticalSpreadExitReason> {
+        let take_profit_debit = entry_credit * (1.0 - self.take_profit_pct);
+        let stop_debit = entry_credit * self.stop_loss_multiple;
+        if exit_debit >= stop_debit {
+            Some(VerticalSpreadExitReason::StopLoss)
+        } else if exit_debit <= take_profit_debit {
+            Some(VerticalSpreadExitReason::TakeProfit)
+        } else {
+            self.time_exit_reason(days_held, dte)
+        }
+    }
+
+    pub fn debit_spread_exit_reason(
+        self,
+        entry_debit: f64,
+        width: f64,
+        exit_credit: f64,
+        days_held: i64,
+        dte: i64,
+    ) -> Option<VerticalSpreadExitReason> {
+        let max_profit_per_share = width - entry_debit;
+        let take_profit_credit = entry_debit + max_profit_per_share * self.take_profit_pct;
+        let stop_credit = entry_debit * (1.0 - self.stop_loss_multiple).max(0.0);
+        if exit_credit >= take_profit_credit {
+            Some(VerticalSpreadExitReason::TakeProfit)
+        } else if exit_credit <= stop_credit {
+            Some(VerticalSpreadExitReason::StopLoss)
+        } else {
+            self.time_exit_reason(days_held, dte)
+        }
+    }
+
+    pub fn time_exit_reason(self, days_held: i64, dte: i64) -> Option<VerticalSpreadExitReason> {
+        if self
+            .max_hold_days
+            .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
+        {
+            Some(VerticalSpreadExitReason::MaxHold)
+        } else if dte <= self.force_close_dte {
+            Some(VerticalSpreadExitReason::ForceClose)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn cash_secured_put_open_intent(
     key: OptionKey,
     quantity: u32,
@@ -475,6 +558,46 @@ mod tests {
             ask_condition: None,
             source: QuoteSource::Fixture,
         }
+    }
+
+    #[test]
+    fn vertical_spread_exit_rules_match_credit_and_debit_paths() {
+        let rules = VerticalSpreadExitRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 0,
+            max_hold_days: None,
+        };
+        assert_eq!(
+            rules.credit_spread_exit_reason(2.40, 1.10, 1, 3),
+            Some(VerticalSpreadExitReason::TakeProfit)
+        );
+        assert_eq!(
+            rules.credit_spread_exit_reason(2.40, 4.90, 1, 3),
+            Some(VerticalSpreadExitReason::StopLoss)
+        );
+        assert_eq!(
+            rules.debit_spread_exit_reason(2.40, 5.0, 4.85, 1, 3),
+            Some(VerticalSpreadExitReason::TakeProfit)
+        );
+        assert_eq!(
+            rules.debit_spread_exit_reason(2.40, 5.0, -0.10, 1, 3),
+            Some(VerticalSpreadExitReason::StopLoss)
+        );
+        let timed = VerticalSpreadExitRules {
+            take_profit_pct: 0.50,
+            stop_loss_multiple: 2.0,
+            force_close_dte: 1,
+            max_hold_days: Some(3),
+        };
+        assert_eq!(
+            timed.credit_spread_exit_reason(2.40, 1.50, 3, 2),
+            Some(VerticalSpreadExitReason::MaxHold)
+        );
+        assert_eq!(
+            timed.credit_spread_exit_reason(2.40, 1.50, 1, 0),
+            Some(VerticalSpreadExitReason::ForceClose)
+        );
     }
 
     #[test]

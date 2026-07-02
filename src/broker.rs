@@ -113,6 +113,8 @@ pub struct TradierConfig {
 pub struct TradierOrderResponse {
     pub ok: bool,
     #[serde(default)]
+    pub http_status: Option<u16>,
+    #[serde(default)]
     pub raw: Value,
     #[serde(default)]
     pub error: Option<String>,
@@ -440,20 +442,27 @@ impl TradierClient {
         let status = response.status();
         let body = response.text()?;
         let raw = parse_json_body(&body);
+        let http_status = Some(status.as_u16());
         if status.is_success() {
             Ok(TradierOrderResponse {
                 ok: true,
+                http_status,
                 raw,
                 error: None,
             })
         } else {
             Ok(TradierOrderResponse {
                 ok: false,
+                http_status,
                 raw,
                 error: Some(format!("Tradier API returned HTTP {status}: {body}")),
             })
         }
     }
+}
+
+pub fn tradier_http_status_is_ambiguous(status: u16) -> bool {
+    status >= 500 || status == 408 || status == 429
 }
 
 fn parse_json_body(body: &str) -> Value {

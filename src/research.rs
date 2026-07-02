@@ -13,17 +13,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout};
 
+use crate::execution::{
+    BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD, VerticalSpreadExitRules,
+    cash_secured_put_max_loss_per_share, conservative_credit_spread_entry_credit_f64,
+    conservative_debit_spread_entry_debit_f64, conservative_long_spread_exit_credit_f64,
+    conservative_short_spread_exit_debit_f64, long_call_spread_expiration_credit_f64,
+    long_put_spread_expiration_credit_f64, short_call_spread_expiration_debit_f64,
+    short_put_spread_expiration_debit_f64,
+};
 #[cfg(test)]
 use crate::execution::{
     OptionOrderEffect, OptionOrderIntent, OptionOrderSide, cash_secured_put_open_intent,
     credit_spread_open_intent, debit_spread_open_intent,
-};
-use crate::execution::{
-    BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD, cash_secured_put_max_loss_per_share,
-    conservative_credit_spread_entry_credit_f64, conservative_debit_spread_entry_debit_f64,
-    conservative_long_spread_exit_credit_f64, conservative_short_spread_exit_debit_f64,
-    long_call_spread_expiration_credit_f64, long_put_spread_expiration_credit_f64,
-    short_call_spread_expiration_debit_f64, short_put_spread_expiration_debit_f64,
 };
 use crate::research_store;
 #[cfg(test)]
@@ -11466,8 +11467,12 @@ fn simulate_put_credit_candidate(
     profile: &ResearchProfile,
     to: NaiveDate,
 ) -> Option<ResearchTrade> {
-    let take_profit_debit = candidate.credit * (1.0 - profile.take_profit_pct);
-    let stop_debit = candidate.credit * profile.stop_loss_multiple;
+    let exit_rules = VerticalSpreadExitRules {
+        take_profit_pct: profile.take_profit_pct,
+        stop_loss_multiple: profile.stop_loss_multiple,
+        force_close_dte: profile.force_close_dte,
+        max_hold_days: profile.max_hold_days,
+    };
 
     for (date, short) in short_rows.range((candidate.entry_date + Duration::days(1))..) {
         let days_held = (*date - candidate.entry_date).num_days();
@@ -11476,22 +11481,10 @@ fn simulate_put_credit_candidate(
             continue;
         };
         let debit = conservative_short_spread_exit_debit_f64(short.ask, long.bid, candidate.width);
-        let reason = if debit >= stop_debit {
-            Some("stop_loss")
-        } else if debit <= take_profit_debit {
-            Some("take_profit")
-        } else if profile
-            .max_hold_days
-            .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
+        if let Some(exit_reason) =
+            exit_rules.credit_spread_exit_reason(candidate.credit, debit, days_held, dte)
         {
-            Some("max_hold")
-        } else if dte <= profile.force_close_dte {
-            Some("force_close")
-        } else {
-            None
-        };
-        if let Some(exit_reason) = reason {
-            return Some(build_trade(candidate, *date, debit, exit_reason));
+            return Some(build_trade(candidate, *date, debit, exit_reason.as_str()));
         }
     }
     settle_vertical_at_expiration(candidate, short_rows, long_rows, to)
@@ -11504,9 +11497,13 @@ fn simulate_put_debit_candidate(
     profile: &ResearchProfile,
     to: NaiveDate,
 ) -> Option<ResearchTrade> {
-    let take_profit_credit =
-        candidate.credit + candidate.max_profit_per_share * profile.take_profit_pct;
-    let stop_credit = candidate.credit * (1.0 - profile.stop_loss_multiple).max(0.0);
+    let exit_rules = VerticalSpreadExitRules {
+        take_profit_pct: profile.take_profit_pct,
+        stop_loss_multiple: profile.stop_loss_multiple,
+        force_close_dte: profile.force_close_dte,
+        max_hold_days: profile.max_hold_days,
+    };
+    let entry_debit = candidate.credit;
 
     for (date, short) in short_rows.range((candidate.entry_date + Duration::days(1))..) {
         let days_held = (*date - candidate.entry_date).num_days();
@@ -11516,22 +11513,19 @@ fn simulate_put_debit_candidate(
         };
         let exit_credit =
             conservative_long_spread_exit_credit_f64(long.bid, short.ask, candidate.width);
-        let reason = if exit_credit >= take_profit_credit {
-            Some("take_profit")
-        } else if exit_credit <= stop_credit {
-            Some("stop_loss")
-        } else if profile
-            .max_hold_days
-            .is_some_and(|max_days| max_days > 0 && days_held >= max_days)
-        {
-            Some("max_hold")
-        } else if dte <= profile.force_close_dte {
-            Some("force_close")
-        } else {
-            None
-        };
-        if let Some(exit_reason) = reason {
-            return Some(build_trade(candidate, *date, exit_credit, exit_reason));
+        if let Some(exit_reason) = exit_rules.debit_spread_exit_reason(
+            entry_debit,
+            candidate.width,
+            exit_credit,
+            days_held,
+            dte,
+        ) {
+            return Some(build_trade(
+                candidate,
+                *date,
+                exit_credit,
+                exit_reason.as_str(),
+            ));
         }
     }
     settle_vertical_at_expiration(candidate, short_rows, long_rows, to)
@@ -11795,6 +11789,9 @@ fn research_decimal_from_f64(value: f64, field: &str) -> Result<Decimal> {
 }
 
 fn quote_width_allowed(row: &OptionDay, profile: &ResearchProfile) -> bool {
+    if row.bid <= 0.0 || row.ask <= 0.0 || row.ask < row.bid {
+        return false;
+    }
     let mid = (row.bid + row.ask) / 2.0;
     if mid <= 0.0 {
         return false;
@@ -17060,8 +17057,12 @@ mod tests {
 
         // A spread whose expiration falls beyond the research window stays
         // open and must not be settled early.
-        let still_open =
-            simulate_candidate(&candidate, &lookup, &profile, expiration - Duration::days(1));
+        let still_open = simulate_candidate(
+            &candidate,
+            &lookup,
+            &profile,
+            expiration - Duration::days(1),
+        );
         assert!(still_open.is_none());
 
         // A worthless expiration settles at zero credit: full loss plus
@@ -17072,19 +17073,19 @@ mod tests {
             .get_mut(&expiration)
             .unwrap()
             .retain(|row| row.date == entry_date);
-        worthless_rows.get_mut(&expiration).unwrap().push(option_day(
-            expiration,
-            100.0,
-            0.0,
-            0.0,
-            -0.01,
-            120.0,
-        ));
+        worthless_rows
+            .get_mut(&expiration)
+            .unwrap()
+            .push(option_day(expiration, 100.0, 0.0, 0.0, -0.01, 120.0));
         worthless_candidate.short_iv = 0.5;
         let worthless_lookup = build_lookup(&worthless_rows);
-        let worthless =
-            simulate_candidate(&worthless_candidate, &worthless_lookup, &profile, expiration)
-                .unwrap();
+        let worthless = simulate_candidate(
+            &worthless_candidate,
+            &worthless_lookup,
+            &profile,
+            expiration,
+        )
+        .unwrap();
         assert_eq!(worthless.exit_reason, "expiration");
         assert!(
             (worthless.pnl + 240.0 + BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD).abs() < 1e-9,

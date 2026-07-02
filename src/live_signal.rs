@@ -132,6 +132,18 @@ pub struct LiveSignalArtifact {
     pub selected_signal: Option<TradeSignal>,
     pub source_run_id: String,
     pub source_report: String,
+    /// Research window start used by the selector run that produced this artifact.
+    #[serde(default)]
+    pub source_research_from: Option<NaiveDate>,
+    /// Whether the source selector run passed the research promotion gate.
+    #[serde(default)]
+    pub source_gate_pass: Option<bool>,
+    #[serde(default)]
+    pub source_gate_reason: Option<String>,
+    /// True when export required gate_pass; false when a short detector window
+    /// allowed export via production approval only.
+    #[serde(default)]
+    pub detector_research_gate_enforced: bool,
 }
 
 impl ApprovedStrategy {
