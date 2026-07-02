@@ -19,9 +19,11 @@ use crate::execution::{
     credit_spread_open_intent, debit_spread_open_intent,
 };
 use crate::execution::{
-    cash_secured_put_max_loss_per_share, conservative_credit_spread_entry_credit_f64,
-    conservative_debit_spread_entry_debit_f64, conservative_long_spread_exit_credit_f64,
-    conservative_short_spread_exit_debit_f64,
+    BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD, cash_secured_put_max_loss_per_share,
+    conservative_credit_spread_entry_credit_f64, conservative_debit_spread_entry_debit_f64,
+    conservative_long_spread_exit_credit_f64, conservative_short_spread_exit_debit_f64,
+    long_call_spread_expiration_credit_f64, long_put_spread_expiration_credit_f64,
+    short_call_spread_expiration_debit_f64, short_put_spread_expiration_debit_f64,
 };
 use crate::research_store;
 #[cfg(test)]
@@ -1644,7 +1646,7 @@ pub async fn run_symbol_research(request: ResearchRequest) -> Result<ResearchRep
                 request.to,
             )
         } else {
-            simulate_non_overlapping(&candidates, &rows_by_expiration, &profile)
+            simulate_non_overlapping(&candidates, &rows_by_expiration, &profile, request.to)
         };
         let metrics = metrics_for_profile(&trades, research_from, request.to, &profile);
         profile_results.push(ProfileResult {
@@ -1878,7 +1880,7 @@ pub async fn audit_weekly_signal_gates(
                 request.to,
             )
         } else {
-            simulate_non_overlapping(&candidates, &rows_by_expiration, &profile)
+            simulate_non_overlapping(&candidates, &rows_by_expiration, &profile, request.to)
         };
         let candidate_entry_days = candidates
             .iter()
@@ -3363,7 +3365,7 @@ fn portfolio_spread_opportunities_for_symbol(
         }
     };
     let candidates = generate_candidates(rows_by_expiration, profile, from, to);
-    let opportunities = simulate_non_overlapping(&candidates, rows_by_expiration, profile)
+    let opportunities = simulate_non_overlapping(&candidates, rows_by_expiration, profile, to)
         .into_iter()
         .map(|trade| PortfolioWheelOpportunity {
             symbol: data.summary.symbol.clone(),
@@ -10941,6 +10943,7 @@ fn simulate_non_overlapping(
     candidates: &[Candidate],
     rows_by_expiration: &BTreeMap<NaiveDate, Vec<OptionDay>>,
     profile: &ResearchProfile,
+    to: NaiveDate,
 ) -> Vec<ResearchTrade> {
     let lookup = build_lookup(rows_by_expiration);
     let mut by_date: BTreeMap<NaiveDate, Vec<&Candidate>> = BTreeMap::new();
@@ -10972,7 +10975,7 @@ fn simulate_non_overlapping(
         }
         day_candidates.sort_by(|a, b| candidate_quality_order(a, b, profile));
         for candidate in day_candidates {
-            if let Some(trade) = simulate_candidate(candidate, &lookup, profile) {
+            if let Some(trade) = simulate_candidate(candidate, &lookup, profile, to) {
                 if profile.max_concurrent_positions > 1 {
                     next_entry_date = date + Duration::days(profile.min_entry_spacing_days.max(1));
                     open_trades.push(trade.clone());
@@ -11129,6 +11132,7 @@ fn simulate_candidate(
     candidate: &Candidate,
     lookup: &HashMap<(NaiveDate, String), BTreeMap<NaiveDate, OptionDay>>,
     profile: &ResearchProfile,
+    to: NaiveDate,
 ) -> Option<ResearchTrade> {
     let short_rows = lookup.get(&(
         candidate.expiration,
@@ -11140,13 +11144,13 @@ fn simulate_candidate(
     ))?;
     match candidate.structure {
         SpreadStructure::PutCreditSpread | SpreadStructure::CallCreditSpread => {
-            simulate_put_credit_candidate(candidate, short_rows, long_rows, profile)
+            simulate_put_credit_candidate(candidate, short_rows, long_rows, profile, to)
         }
         SpreadStructure::PutDebitSpread => {
-            simulate_put_debit_candidate(candidate, short_rows, long_rows, profile)
+            simulate_put_debit_candidate(candidate, short_rows, long_rows, profile, to)
         }
         SpreadStructure::CallDebitSpread => {
-            simulate_put_debit_candidate(candidate, short_rows, long_rows, profile)
+            simulate_put_debit_candidate(candidate, short_rows, long_rows, profile, to)
         }
         SpreadStructure::Wheel => None,
     }
@@ -11460,6 +11464,7 @@ fn simulate_put_credit_candidate(
     short_rows: &BTreeMap<NaiveDate, OptionDay>,
     long_rows: &BTreeMap<NaiveDate, OptionDay>,
     profile: &ResearchProfile,
+    to: NaiveDate,
 ) -> Option<ResearchTrade> {
     let take_profit_debit = candidate.credit * (1.0 - profile.take_profit_pct);
     let stop_debit = candidate.credit * profile.stop_loss_multiple;
@@ -11489,7 +11494,7 @@ fn simulate_put_credit_candidate(
             return Some(build_trade(candidate, *date, debit, exit_reason));
         }
     }
-    None
+    settle_vertical_at_expiration(candidate, short_rows, long_rows, to)
 }
 
 fn simulate_put_debit_candidate(
@@ -11497,6 +11502,7 @@ fn simulate_put_debit_candidate(
     short_rows: &BTreeMap<NaiveDate, OptionDay>,
     long_rows: &BTreeMap<NaiveDate, OptionDay>,
     profile: &ResearchProfile,
+    to: NaiveDate,
 ) -> Option<ResearchTrade> {
     let take_profit_credit =
         candidate.credit + candidate.max_profit_per_share * profile.take_profit_pct;
@@ -11528,7 +11534,85 @@ fn simulate_put_debit_candidate(
             return Some(build_trade(candidate, *date, exit_credit, exit_reason));
         }
     }
-    None
+    settle_vertical_at_expiration(candidate, short_rows, long_rows, to)
+}
+
+/// Settle a vertical spread at expiration intrinsic value when no exit rule
+/// fired before expiry (for example option-quote gaps on every eligible exit
+/// day). Live positions do not disappear in that scenario: the contracts
+/// settle at intrinsic. Dropping the trade instead (the previous behavior)
+/// silently removed exactly the paths with the worst data coverage, which is
+/// survivorship bias in the research PnL. Uses the latest available
+/// underlying observation at or before expiration; spreads whose expiration
+/// falls beyond the research window remain excluded because they are still
+/// open, not settled.
+fn settle_vertical_at_expiration(
+    candidate: &Candidate,
+    short_rows: &BTreeMap<NaiveDate, OptionDay>,
+    long_rows: &BTreeMap<NaiveDate, OptionDay>,
+    to: NaiveDate,
+) -> Option<ResearchTrade> {
+    if candidate.expiration > to {
+        return None;
+    }
+    let underlying = expiration_settlement_underlying(candidate, short_rows, long_rows)?;
+    let exit_value = match candidate.structure {
+        SpreadStructure::PutCreditSpread => short_put_spread_expiration_debit_f64(
+            candidate.short.strike,
+            candidate.long.strike,
+            underlying,
+            candidate.width,
+        ),
+        SpreadStructure::CallCreditSpread => short_call_spread_expiration_debit_f64(
+            candidate.short.strike,
+            candidate.long.strike,
+            underlying,
+            candidate.width,
+        ),
+        SpreadStructure::PutDebitSpread => long_put_spread_expiration_credit_f64(
+            candidate.long.strike,
+            candidate.short.strike,
+            underlying,
+            candidate.width,
+        ),
+        SpreadStructure::CallDebitSpread => long_call_spread_expiration_credit_f64(
+            candidate.long.strike,
+            candidate.short.strike,
+            underlying,
+            candidate.width,
+        ),
+        SpreadStructure::Wheel => return None,
+    };
+    Some(build_trade(
+        candidate,
+        candidate.expiration,
+        exit_value,
+        "expiration",
+    ))
+}
+
+fn expiration_settlement_underlying(
+    candidate: &Candidate,
+    short_rows: &BTreeMap<NaiveDate, OptionDay>,
+    long_rows: &BTreeMap<NaiveDate, OptionDay>,
+) -> Option<f64> {
+    let latest_positive = |rows: &BTreeMap<NaiveDate, OptionDay>| {
+        rows.range(..=candidate.expiration)
+            .rev()
+            .find(|(_, row)| row.underlying_price > 0.0)
+            .map(|(date, row)| (*date, row.underlying_price))
+    };
+    match (latest_positive(short_rows), latest_positive(long_rows)) {
+        (Some((short_date, short_price)), Some((long_date, long_price))) => {
+            Some(if long_date > short_date {
+                long_price
+            } else {
+                short_price
+            })
+        }
+        (Some((_, price)), None) | (None, Some((_, price))) => Some(price),
+        (None, None) => None,
+    }
 }
 
 fn build_trade(
@@ -11553,9 +11637,14 @@ fn build_trade(
         ),
         SpreadStructure::Wheel => (candidate.credit, exit_debit, candidate.credit - exit_debit),
     };
-    let pnl = pnl_per_share * 100.0;
+    // Net out baseline broker friction so ranking and exit tuning see net
+    // PnL. The worst case grows by the friction (a max-loss trade still pays
+    // commissions) and the best case shrinks by it.
+    let friction = BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD;
+    let pnl = pnl_per_share * 100.0 - friction;
     let max_profit = candidate.max_profit_per_share * 100.0;
     let max_loss = candidate.max_loss_per_share * 100.0;
+    let bounded_pnl = pnl.clamp(-(max_loss + friction), max_profit - friction);
     ResearchTrade {
         entry_date: candidate.entry_date,
         exit_date,
@@ -11569,8 +11658,8 @@ fn build_trade(
         exit_debit,
         max_profit,
         max_loss,
-        pnl: pnl.clamp(-max_loss, max_profit),
-        return_on_risk: pnl.clamp(-max_loss, max_profit) / max_loss,
+        pnl: bounded_pnl,
+        return_on_risk: bounded_pnl / max_loss,
         exit_reason: reason.to_owned(),
         short_delta: candidate.short.delta,
         long_delta: candidate.long.delta,
@@ -13555,12 +13644,12 @@ mod tests {
         assert_eq!(intent.legs[1].key.strike.to_string(), "95");
 
         let lookup = build_lookup(&rows_by_expiration);
-        let trade = simulate_candidate(candidate, &lookup, &profile).unwrap();
+        let trade = simulate_candidate(candidate, &lookup, &profile, expiration).unwrap();
 
         assert_eq!(trade.exit_reason, "take_profit");
         assert!((trade.entry_credit + 2.40).abs() < 1e-9);
         assert!((trade.exit_debit + 3.50).abs() < 1e-9);
-        assert!((trade.pnl - 110.0).abs() < 1e-9);
+        assert!((trade.pnl - (110.0 - BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD)).abs() < 1e-9);
         assert!((trade.max_profit - 260.0).abs() < 1e-9);
         assert!((trade.max_loss - 240.0).abs() < 1e-9);
 
@@ -13646,12 +13735,12 @@ mod tests {
         assert!((candidate.max_loss_per_share - 2.40).abs() < 1e-9);
 
         let lookup = build_lookup(&rows_by_expiration);
-        let trade = simulate_candidate(candidate, &lookup, &profile).unwrap();
+        let trade = simulate_candidate(candidate, &lookup, &profile, expiration).unwrap();
 
         assert_eq!(trade.exit_reason, "take_profit");
         assert!((trade.entry_credit + 2.40).abs() < 1e-9);
         assert!((trade.exit_debit + 3.50).abs() < 1e-9);
-        assert!((trade.pnl - 110.0).abs() < 1e-9);
+        assert!((trade.pnl - (110.0 - BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD)).abs() < 1e-9);
         assert!((trade.max_profit - 260.0).abs() < 1e-9);
         assert!((trade.max_loss - 240.0).abs() < 1e-9);
     }
@@ -13704,12 +13793,12 @@ mod tests {
         assert!((candidate.max_loss_per_share - 4.25).abs() < 1e-9);
 
         let lookup = build_lookup(&rows_by_expiration);
-        let trade = simulate_candidate(candidate, &lookup, &profile).unwrap();
+        let trade = simulate_candidate(candidate, &lookup, &profile, expiration).unwrap();
 
         assert_eq!(trade.exit_reason, "take_profit");
         assert!((trade.entry_credit - 0.75).abs() < 1e-9);
         assert!((trade.exit_debit - 0.40).abs() < 1e-9);
-        assert!((trade.pnl - 35.0).abs() < 1e-9);
+        assert!((trade.pnl - (35.0 - BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD)).abs() < 1e-9);
         assert!((trade.max_profit - 75.0).abs() < 1e-9);
         assert!((trade.max_loss - 425.0).abs() < 1e-9);
     }
@@ -14426,7 +14515,10 @@ mod tests {
         assert_eq!(candidates, 1);
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].strategy, SpreadStructure::PutCreditSpread);
-        assert!((opportunities[0].trade.pnl - 35.0).abs() < 1e-9);
+        assert!(
+            (opportunities[0].trade.pnl - (35.0 - BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD)).abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -16904,12 +16996,101 @@ mod tests {
         let mut profile = ResearchProfile::legacy_baseline();
         profile.max_hold_days = Some(3);
 
-        let trade = simulate_candidate(&candidate, &lookup, &profile).unwrap();
+        let trade =
+            simulate_candidate(&candidate, &lookup, &profile, candidate.expiration).unwrap();
 
         assert_eq!(trade.exit_date, entry_date + Duration::days(3));
         assert_eq!(trade.days_held, 3);
         assert_eq!(trade.exit_reason, "max_hold");
         assert!((trade.exit_debit - 1.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vertical_spread_with_no_exit_quotes_settles_at_expiration_intrinsic() {
+        let entry_date = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
+        let expiration = entry_date + Duration::days(4);
+        let mut profile = ResearchProfile::weekly_put_debit_baseline();
+        profile.force_close_dte = 0;
+
+        // Put debit spread: long 100 / short 95, entered for a 2.40 debit.
+        // No post-entry quote rows exist, so before the settlement fix this
+        // trade silently vanished from the backtest. The underlying finishes
+        // at 92.0, so the spread settles at full width (5.0 credit).
+        let mut rows_by_expiration = BTreeMap::new();
+        rows_by_expiration.insert(
+            expiration,
+            vec![
+                option_day(entry_date, 100.0, 4.20, 4.40, -0.45, 105.0),
+                option_day(entry_date, 95.0, 2.00, 2.15, -0.25, 105.0),
+                option_day(expiration, 100.0, 0.0, 0.0, -0.99, 92.0),
+            ],
+        );
+        let lookup = build_lookup(&rows_by_expiration);
+        let candidate = Candidate {
+            structure: SpreadStructure::PutDebitSpread,
+            entry_date,
+            expiration,
+            short: option_day(entry_date, 95.0, 2.00, 2.15, -0.25, 105.0),
+            long: option_day(entry_date, 100.0, 4.20, 4.40, -0.45, 105.0),
+            width: 5.0,
+            credit: 2.40,
+            max_profit_per_share: 2.60,
+            max_loss_per_share: 2.40,
+            return_on_risk: 2.60 / 2.40,
+            short_otm_pct: 0.09,
+            underlying_lookback_return: None,
+            underlying_recent_drawdown: None,
+            underlying_realized_vol: None,
+            short_iv: 0.5,
+            long_iv: 0.5,
+        };
+
+        // Note: the settlement observation comes from the long-strike row at
+        // expiration (underlying 92.0); the short-strike row is absent there.
+        let trade = simulate_candidate(&candidate, &lookup, &profile, expiration).unwrap();
+        assert_eq!(trade.exit_reason, "expiration");
+        assert_eq!(trade.exit_date, expiration);
+        // Full-width win: (5.00 - 2.40) * 100 - friction, capped at
+        // max_profit - friction.
+        assert!(
+            (trade.pnl - (260.0 - BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD)).abs() < 1e-9,
+            "pnl {}",
+            trade.pnl
+        );
+
+        // A spread whose expiration falls beyond the research window stays
+        // open and must not be settled early.
+        let still_open =
+            simulate_candidate(&candidate, &lookup, &profile, expiration - Duration::days(1));
+        assert!(still_open.is_none());
+
+        // A worthless expiration settles at zero credit: full loss plus
+        // friction.
+        let mut worthless_candidate = candidate.clone();
+        let mut worthless_rows = rows_by_expiration.clone();
+        worthless_rows
+            .get_mut(&expiration)
+            .unwrap()
+            .retain(|row| row.date == entry_date);
+        worthless_rows.get_mut(&expiration).unwrap().push(option_day(
+            expiration,
+            100.0,
+            0.0,
+            0.0,
+            -0.01,
+            120.0,
+        ));
+        worthless_candidate.short_iv = 0.5;
+        let worthless_lookup = build_lookup(&worthless_rows);
+        let worthless =
+            simulate_candidate(&worthless_candidate, &worthless_lookup, &profile, expiration)
+                .unwrap();
+        assert_eq!(worthless.exit_reason, "expiration");
+        assert!(
+            (worthless.pnl + 240.0 + BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD).abs() < 1e-9,
+            "pnl {}",
+            worthless.pnl
+        );
     }
 
     #[test]
@@ -18935,9 +19116,11 @@ mod tests {
         let rows_by_expiration =
             rows_for_take_profit_candidates(&candidates, first_date + Duration::days(20));
 
+        let sim_to = first_date + Duration::days(60);
         let mut single = ResearchProfile::legacy_baseline();
         single.prefer_farther_otm = true;
-        let single_trades = simulate_non_overlapping(&candidates, &rows_by_expiration, &single);
+        let single_trades =
+            simulate_non_overlapping(&candidates, &rows_by_expiration, &single, sim_to);
         assert_eq!(single_trades.len(), 1);
         assert_eq!(single_trades[0].entry_date, first_date);
 
@@ -18945,7 +19128,7 @@ mod tests {
         capped_overlap.max_concurrent_positions = 2;
         capped_overlap.min_entry_spacing_days = 1;
         let overlap_trades =
-            simulate_non_overlapping(&candidates, &rows_by_expiration, &capped_overlap);
+            simulate_non_overlapping(&candidates, &rows_by_expiration, &capped_overlap, sim_to);
 
         assert_eq!(
             overlap_trades

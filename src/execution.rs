@@ -137,6 +137,59 @@ pub fn short_put_spread_expiration_debit(
         .min(width)
 }
 
+/// Baseline broker friction for a one-contract, two-leg vertical spread round
+/// trip (open + close): roughly Tradier's $0.35/contract commission across
+/// four contract executions plus regulatory/clearing fees. Research
+/// simulation subtracts this from every simulated spread trade so ranking and
+/// exit-rule tuning happen on net rather than frictionless PnL; the research
+/// gate cost stress ($5/$10/$25 per trade) remains additional headroom on top
+/// of this baseline.
+pub const BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD: f64 = 2.0;
+
+pub fn short_put_spread_expiration_debit_f64(
+    short_strike: f64,
+    long_strike: f64,
+    underlying_close: f64,
+    width: f64,
+) -> f64 {
+    let short_intrinsic = (short_strike - underlying_close).max(0.0);
+    let long_intrinsic = (long_strike - underlying_close).max(0.0);
+    (short_intrinsic - long_intrinsic).clamp(0.0, width)
+}
+
+pub fn short_call_spread_expiration_debit_f64(
+    short_strike: f64,
+    long_strike: f64,
+    underlying_close: f64,
+    width: f64,
+) -> f64 {
+    let short_intrinsic = (underlying_close - short_strike).max(0.0);
+    let long_intrinsic = (underlying_close - long_strike).max(0.0);
+    (short_intrinsic - long_intrinsic).clamp(0.0, width)
+}
+
+pub fn long_put_spread_expiration_credit_f64(
+    long_strike: f64,
+    short_strike: f64,
+    underlying_close: f64,
+    width: f64,
+) -> f64 {
+    let long_intrinsic = (long_strike - underlying_close).max(0.0);
+    let short_intrinsic = (short_strike - underlying_close).max(0.0);
+    (long_intrinsic - short_intrinsic).clamp(0.0, width)
+}
+
+pub fn long_call_spread_expiration_credit_f64(
+    long_strike: f64,
+    short_strike: f64,
+    underlying_close: f64,
+    width: f64,
+) -> f64 {
+    let long_intrinsic = (underlying_close - long_strike).max(0.0);
+    let short_intrinsic = (underlying_close - short_strike).max(0.0);
+    (long_intrinsic - short_intrinsic).clamp(0.0, width)
+}
+
 pub fn cash_secured_put_open_intent(
     key: OptionKey,
     quantity: u32,
@@ -447,6 +500,62 @@ mod tests {
         assert!((conservative_debit_spread_entry_debit_f64(5.30, 0.70) - 4.60).abs() < 1e-9);
         assert!((conservative_short_spread_exit_debit_f64(2.70, 0.40, 5.00) - 2.30).abs() < 1e-9);
         assert!((conservative_long_spread_exit_credit_f64(5.60, 2.10, 5.00) - 3.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expiration_intrinsic_f64_matches_all_vertical_structures() {
+        // Put credit spread (short 200 / long 190): deep ITM, partial, OTM.
+        assert_eq!(
+            short_put_spread_expiration_debit_f64(200.0, 190.0, 185.0, 10.0),
+            10.0
+        );
+        assert_eq!(
+            short_put_spread_expiration_debit_f64(200.0, 190.0, 195.0, 10.0),
+            5.0
+        );
+        assert_eq!(
+            short_put_spread_expiration_debit_f64(200.0, 190.0, 205.0, 10.0),
+            0.0
+        );
+        // Call credit spread (short 200 / long 210).
+        assert_eq!(
+            short_call_spread_expiration_debit_f64(200.0, 210.0, 215.0, 10.0),
+            10.0
+        );
+        assert_eq!(
+            short_call_spread_expiration_debit_f64(200.0, 210.0, 205.0, 10.0),
+            5.0
+        );
+        assert_eq!(
+            short_call_spread_expiration_debit_f64(200.0, 210.0, 195.0, 10.0),
+            0.0
+        );
+        // Put debit spread (long 200 / short 190).
+        assert_eq!(
+            long_put_spread_expiration_credit_f64(200.0, 190.0, 185.0, 10.0),
+            10.0
+        );
+        assert_eq!(
+            long_put_spread_expiration_credit_f64(200.0, 190.0, 195.0, 10.0),
+            5.0
+        );
+        assert_eq!(
+            long_put_spread_expiration_credit_f64(200.0, 190.0, 205.0, 10.0),
+            0.0
+        );
+        // Call debit spread (long 200 / short 210).
+        assert_eq!(
+            long_call_spread_expiration_credit_f64(200.0, 210.0, 215.0, 10.0),
+            10.0
+        );
+        assert_eq!(
+            long_call_spread_expiration_credit_f64(200.0, 210.0, 205.0, 10.0),
+            5.0
+        );
+        assert_eq!(
+            long_call_spread_expiration_credit_f64(200.0, 210.0, 195.0, 10.0),
+            0.0
+        );
     }
 
     #[test]

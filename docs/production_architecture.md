@@ -21,7 +21,15 @@ flowchart LR
 ## Canonical Layers
 
 - `strategy_research`: offline backtests, ranking, diagnostics, and reports.
-  It never produces broker-ready orders.
+  It never produces broker-ready orders. Vertical-spread simulation nets a
+  baseline broker friction (`BASELINE_SPREAD_ROUND_TRIP_FRICTION_USD`) out of
+  every trade and settles spreads that reach expiration without an exit-rule
+  fill at expiration intrinsic value instead of dropping them; the $5/$10/$25
+  research-gate cost stress is additional headroom on top of that baseline.
+  Remaining known fidelity gap: exits are evaluated on daily EOD quotes, so
+  strictly-intraday stop breaches that recover by the close are not observable
+  from the current dataset (live management polls intraday and exits earlier,
+  which is strictly more protective).
 - `approved_strategy`: frozen detector/profile config in
   `configs/approved_strategy.json`.
 - `live_market_engine`: always-on market-session detector loop. It consumes a
@@ -59,7 +67,10 @@ approval/research runs, so production does not silently drift onto a different
 research window. Live signal refresh may also set `live_detector_lookback_days`;
 when present, each market refresh loads only that recent detector window while
 relying on the approved strategy's production approval instead of re-running the
-multi-year promotion gate every interval. A selected live entry must have either
+multi-year promotion gate every interval. The live engine also rejects a same-day
+new entry whose source `market_data_through` is older than the engine `as_of`,
+so a stale detection artifact cannot become a selected signal even before the
+execution worker re-checks the same rule. A selected live entry must have either
 canary approval or an explicit operator risk override with an auditable reason.
 When an override includes `max_order_max_loss`, the live signal contract rejects
 selected entries above that cap.

@@ -116,6 +116,9 @@ pub fn build_signal_artifact_live_market_snapshot(
         .as_ref()
         .map(|artifact| artifact.market_data_through)
         .unwrap_or(config.as_of);
+    let source_market_data_current = source_artifact
+        .as_ref()
+        .is_some_and(|artifact| artifact.market_data_through >= config.as_of);
     let source_run_id = source_artifact
         .as_ref()
         .map(|artifact| artifact.source_run_id.clone())
@@ -132,6 +135,7 @@ pub fn build_signal_artifact_live_market_snapshot(
         source_fresh,
         source_strategy_matches,
         source_profile_matches,
+        source_market_data_current,
         provider_reason: provider_health.reason.as_str(),
     };
     let mut retained_signals = Vec::new();
@@ -329,6 +333,7 @@ struct CandidateGateContext<'a> {
     source_fresh: bool,
     source_strategy_matches: bool,
     source_profile_matches: bool,
+    source_market_data_current: bool,
     provider_reason: &'a str,
 }
 
@@ -409,6 +414,20 @@ fn candidate_decision_reason(
             "rejected".to_owned(),
             format!(
                 "entry_date does not match live engine as_of {}",
+                context.as_of
+            ),
+        );
+    }
+    // Defense in depth against stale detection data: a same-day entry must be
+    // backed by market data through the live engine's session date. The
+    // execution worker enforces the same rule, but the engine is the
+    // production artifact writer and should not emit a selected entry it
+    // already knows is stale.
+    if !context.source_market_data_current {
+        return (
+            "rejected".to_owned(),
+            format!(
+                "new entry requires source market_data_through >= live engine as_of {}",
                 context.as_of
             ),
         );
@@ -623,6 +642,44 @@ mod tests {
         assert!(record.artifact.signals.is_empty());
         assert_eq!(record.provider_health.status, "source_stale");
         assert_eq!(record.candidates[0].decision_status, "rejected");
+        let _ = fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn live_market_snapshot_rejects_stale_market_data_for_new_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("spreadfoundry-live-market-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("source-stale-market-data.json");
+        let output_path = dir.join("output-stale-market-data.json");
+        let now = NaiveDate::from_ymd_opt(2026, 6, 30)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap()
+            .and_utc();
+        let approved = approved_strategy();
+        let mut source = source_artifact(
+            approved.clone(),
+            now,
+            trade_signal("2026-06-30", "put_debit_spread", 100.0),
+        );
+        source.market_data_through = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+        fs::write(&source_path, serde_json::to_string(&source).unwrap()).unwrap();
+
+        let record = build_signal_artifact_live_market_snapshot(LiveMarketEngineConfig {
+            approved_strategy: approved,
+            source_live_signal: &source_path,
+            output: &output_path,
+            as_of: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            max_source_age_seconds: 45,
+            now,
+        })
+        .unwrap();
+
+        assert_eq!(record.decision.status, "no_signal");
+        assert!(record.artifact.selected_signal.is_none());
+        assert_eq!(record.candidates[0].decision_status, "rejected");
+        assert!(record.candidates[0].reason.contains("market_data_through"));
         let _ = fs::remove_file(source_path);
     }
 
